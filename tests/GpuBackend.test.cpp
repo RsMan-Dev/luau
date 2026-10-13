@@ -49,14 +49,27 @@ std::unique_ptr<VulkanBackend> createBackend(const VulkanOptions& options = Vulk
     return backend;
 }
 
+// stops the script after this many interrupts, like a host enforcing a script timeout
+int interruptsLeft = 0;
+
 // runs the chunk with the backend installed and returns the error it raised, if any; the caller enables LuauGpuKernels
-std::string run(VulkanBackend& backend, const std::string& source)
+std::string run(VulkanBackend& backend, const std::string& source, int interruptLimit = 0)
 {
     lua_State* L = luaL_newstate();
     luaL_openlibs(L);
     luaopen_gpu(L);
     lua_pop(L, 1);
     backend.install(L);
+
+    if (interruptLimit > 0)
+    {
+        interruptsLeft = interruptLimit;
+        lua_callbacks(L)->interrupt = [](lua_State* L, int gc)
+        {
+            if (gc < 0 && --interruptsLeft <= 0)
+                luaL_error(L, "script timed out");
+        };
+    }
 
     size_t bytecodeSize = 0;
     char* bytecode = luau_compile(source.data(), source.size(), nullptr, &bytecodeSize);
@@ -288,6 +301,37 @@ gpu.dispatch(outOfBounds, 4, b)
 )");
 
     CHECK(error.find("out of bounds") != std::string::npos);
+    CHECK(backend->stats().fallbacks == 1);
+    CHECK(backend->stats().gpuDispatches == 0);
+}
+
+TEST_CASE("infinite_loops_stop_on_the_gpu_and_are_left_to_the_host_in_the_vm")
+{
+    ScopedFastFlag sff{FFlag::LuauGpuKernels, true};
+
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    const char* source = R"(
+@gpu
+local function spin(i: number, out: buffer)
+    local n = 0
+    while true do
+        n += 1
+        buffer.writeu32(out, i * 4, n)
+    end
+end
+
+gpu.dispatch(spin, 64, buffer.create(256))
+)";
+
+    std::vector<Kernel> kernels = load(*backend, source);
+    REQUIRE(kernels.size() == 1);
+    REQUIRE(kernels[0].reason.empty());
+
+    // the GPU gives up once the loop budget is spent, then the VM reruns the dispatch and the host's interrupt stops it
+    CHECK(run(*backend, source, 100000).find("script timed out") != std::string::npos);
     CHECK(backend->stats().fallbacks == 1);
     CHECK(backend->stats().gpuDispatches == 0);
 }
