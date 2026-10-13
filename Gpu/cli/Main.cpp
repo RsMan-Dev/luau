@@ -6,7 +6,7 @@
 #include "lua.h"
 #include "lualib.h"
 #include "luacode.h"
-#include "luacodegen.h"
+#include "Luau/CodeGen.h"
 
 #include "Luau/Common.h"
 
@@ -295,34 +295,44 @@ int main(int argc, char** argv)
         gBackend->install(L);
     }
 
+    // like the luau REPL, run the script in a sandboxed thread; besides isolating it, a sandboxed environment lets the VM
+    // use its fast paths for builtins, which kernels running in the VM depend on
+    luaL_sandbox(L);
+    lua_State* T = lua_newthread(L);
+    luaL_sandboxthread(T);
+
     lua_CompileOptions options = {};
     options.optimizationLevel = 1;
     options.debugLevel = 1;
+    options.typeInfoLevel = 1; // lets native code use type annotations, as in the luau REPL
     size_t bytecodeSize = 0;
     char* bytecode = luau_compile(source.data(), source.size(), &options, &bytecodeSize);
-    int status = luau_load(L, chunkname.c_str(), bytecode, bytecodeSize, 0);
+    int status = luau_load(T, chunkname.c_str(), bytecode, bytecodeSize, 0);
     free(bytecode);
 
     if (status != 0)
     {
-        fprintf(stderr, "%s\n", lua_tostring(L, -1));
+        fprintf(stderr, "%s\n", lua_tostring(T, -1));
         return 1;
     }
 
-    if (useNative && luau_codegen_supported())
+    // kernels usually have no loops, so cold functions are compiled too
+    if (useNative && Luau::CodeGen::isSupported())
     {
-        luau_codegen_create(L);
-        luau_codegen_compile(L, -1);
+        Luau::CodeGen::create(L);
+        Luau::CodeGen::CompilationOptions nativeOptions;
+        nativeOptions.flags = Luau::CodeGen::CodeGen_ColdFunctions;
+        Luau::CodeGen::compile(T, -1, nativeOptions);
     }
 
-    lua_pushcfunction(L, traceback, "traceback");
-    lua_insert(L, -2);
-    status = lua_pcall(L, 0, 0, -2);
+    lua_pushcfunction(T, traceback, "traceback");
+    lua_insert(T, -2);
+    status = lua_pcall(T, 0, 0, -2);
 
     int code = 0;
     if (status != 0)
     {
-        fprintf(stderr, "%s\n", lua_tostring(L, -1));
+        fprintf(stderr, "%s\n", lua_tostring(T, -1));
         code = 1;
     }
 
