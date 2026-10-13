@@ -104,6 +104,15 @@ target_sources(Luau.Gpu PRIVATE
     Gpu/src/GpuTranslate.cpp
 )
 
+if(TARGET Luau.Gpu.Shaders)
+    # Luau.Gpu.Shaders Sources
+    target_sources(Luau.Gpu.Shaders PRIVATE
+        Gpu/include/Luau/GpuShaderCompiler.h
+
+        Gpu/src/GpuShaderCompiler.cpp
+    )
+endif()
+
 if(TARGET Luau.Gpu.Vulkan)
     # Luau.Gpu.Vulkan Sources
     target_sources(Luau.Gpu.Vulkan PRIVATE
@@ -705,4 +714,11 @@ if(TARGET Luau.Bytecode.CLI)
     # Luau.Bytecode.CLI Sources
     target_sources(Luau.Bytecode.CLI PRIVATE
         CLI/src/Bytecode.cpp)
+endif()
+
+if(TARGET Luau.UnitTest AND TARGET Luau.Gpu.Vulkan)
+    # Luau.UnitTest Sources that need the Vulkan backend
+    target_sources(Luau.UnitTest PRIVATE
+        tests/GpuBackend.test.cpp
+    )
 endif()

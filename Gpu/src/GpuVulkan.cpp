@@ -1,17 +1,17 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/GpuVulkan.h"
 
+#include "Luau/GpuShaderCompiler.h"
+
 #include "lua.h"
 #include "lualib.h"
 
-#include <shaderc/shaderc.h>
 #include <vulkan/vulkan.h>
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include <map>
+#include <mutex>
 #include <unordered_map>
 
 namespace Luau
@@ -22,7 +22,6 @@ namespace Gpu
 namespace
 {
 
-constexpr uint32_t kMaxGroupsX = 65535;
 constexpr uint64_t kEvictAfterDispatches = 2000;
 
 struct KernelEntry
@@ -53,10 +52,41 @@ struct BufferEntry
     uint64_t lastUsed = 0;
 };
 
+// a Luau buffer bound to a dispatch; a buffer passed several times is transferred once
+struct Transfer
+{
+    BufferEntry* entry;
+    void* data;
+    bool written;
+};
+
+struct Limits
+{
+    uint32_t storageBuffers;
+    uint64_t storageRange;
+    uint32_t groupsX;
+    uint32_t groupsY;
+    uint32_t pushConstants;
+};
+
+// limits every Vulkan implementation guarantees
+constexpr Limits kMinimumLimits = {4, 1u << 27, 65535, 65535, 128};
+
+void barrier(VkCommandBuffer cb, VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage, VkAccessFlags dstAccess)
+{
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = srcAccess;
+    mb.dstAccessMask = dstAccess;
+    vkCmdPipelineBarrier(cb, srcStage, dstStage, 0, 1, &mb, 0, nullptr, 0, nullptr);
+}
+
 } // namespace
 
 struct VulkanBackend::Impl
 {
+    VulkanOptions options;
+    Limits limits = kMinimumLimits;
+
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
@@ -71,11 +101,15 @@ struct VulkanBackend::Impl
 
     BufferEntry status;
 
-    shaderc_compiler_t compiler = nullptr;
+    ShaderCompiler shaders;
 
     std::string deviceName;
     DispatchStats stats;
     uint64_t dispatchCounter = 0;
+
+    // set when the device stopped responding or was lost; every dispatch then runs in the VM
+    std::string disabledReason;
+    bool deviceBusy = false;
 
     std::map<std::pair<std::string, int>, KernelEntry> kernels;
     std::unordered_map<const void*, BufferEntry> buffers;
@@ -83,18 +117,33 @@ struct VulkanBackend::Impl
     lua_GpuBackend hooks = {};
     std::function<void(const std::string&)> fallbackHandler;
 
+    mutable std::mutex mutex;
+
     ~Impl();
 
     bool init(std::string& error);
     int findMemory(uint32_t typeBits, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred);
-    bool createBuffer(BufferEntry& entry, size_t size, bool deviceLocal);
+    bool createBuffer(BufferEntry& entry, bool deviceLocal);
     void destroyBuffer(BufferEntry& entry);
+    void destroyPipeline(KernelEntry& entry);
     BufferEntry* bufferFor(const void* data, size_t size);
     void evict();
 
     std::string buildPipeline(KernelEntry& entry, const Kernel& kernel);
     KernelEntry* lookup(lua_State* L, int fnidx);
+
     int dispatch(lua_State* L, int fnidx, int n, int argidx, int nargs);
+    int dispatchLocked(lua_State* L, int fnidx, int n, int argidx, int nargs, std::string& fallback);
+    std::string prepare(
+        lua_State* L,
+        const KernelEntry& kernel,
+        int argidx,
+        std::vector<BufferEntry*>& bound,
+        std::vector<Transfer>& transfers,
+        PushConstants& push
+    );
+    void record(const KernelEntry& kernel, const std::vector<BufferEntry*>& bound, const std::vector<Transfer>& transfers, const PushConstants& push);
+    std::string execute(const std::vector<Transfer>& transfers, bool& discarded);
 };
 
 #define VK_CHECK(expr) \
@@ -112,7 +161,7 @@ bool VulkanBackend::Impl::init(std::string& error)
 {
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "Luau";
-    app.apiVersion = VK_API_VERSION_1_2;
+    app.apiVersion = VK_API_VERSION_1_0;
 
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
@@ -125,6 +174,7 @@ bool VulkanBackend::Impl::init(std::string& error)
 
     // prefer discrete GPUs, then integrated ones; software rasterizers are a last resort
     int bestScore = -1;
+    VkPhysicalDeviceLimits deviceLimits = {};
     for (VkPhysicalDevice pd : devices)
     {
         VkPhysicalDeviceProperties props;
@@ -150,6 +200,7 @@ bool VulkanBackend::Impl::init(std::string& error)
                 physical = pd;
                 queueFamily = q;
                 deviceName = props.deviceName;
+                deviceLimits = props.limits;
             }
             break;
         }
@@ -159,6 +210,15 @@ bool VulkanBackend::Impl::init(std::string& error)
     {
         error = "no Vulkan device with a compute queue";
         return false;
+    }
+
+    if (!options.minimumLimits)
+    {
+        limits.storageBuffers = deviceLimits.maxPerStageDescriptorStorageBuffers;
+        limits.storageRange = deviceLimits.maxStorageBufferRange;
+        limits.groupsX = deviceLimits.maxComputeWorkGroupCount[0];
+        limits.groupsY = deviceLimits.maxComputeWorkGroupCount[1];
+        limits.pushConstants = deviceLimits.maxPushConstantsSize;
     }
 
     vkGetPhysicalDeviceMemoryProperties(physical, &memory);
@@ -216,13 +276,6 @@ bool VulkanBackend::Impl::init(std::string& error)
     VK_CHECK(vkBindBufferMemory(device, status.device, status.deviceMemory, 0));
     VK_CHECK(vkMapMemory(device, status.deviceMemory, 0, 4, 0, &status.mapped));
 
-    compiler = shaderc_compiler_initialize();
-    if (!compiler)
-    {
-        error = "failed to initialize shaderc";
-        return false;
-    }
-
     hooks.context = this;
     hooks.dispatch = [](void* context, lua_State* L, int fnidx, int n, int argidx, int nargs)
     {
@@ -231,11 +284,15 @@ bool VulkanBackend::Impl::init(std::string& error)
     hooks.status = [](void* context, lua_State* L, int fnidx)
     {
         Impl* self = static_cast<Impl*>(context);
+        std::lock_guard<std::mutex> lock(self->mutex);
+
         KernelEntry* entry = self->lookup(L, fnidx);
         if (!entry)
             lua_pushstring(L, "function is not marked @gpu or its chunk wasn't registered with the GPU backend");
         else if (!entry->reason.empty())
             lua_pushstring(L, entry->reason.c_str());
+        else if (!self->disabledReason.empty())
+            lua_pushstring(L, self->disabledReason.c_str());
         else
             lua_pushnil(L);
     };
@@ -247,16 +304,13 @@ bool VulkanBackend::Impl::init(std::string& error)
 
 VulkanBackend::Impl::~Impl()
 {
-    if (device)
+    // a device that may still be executing a dispatch can't be waited for or have its resources destroyed; leak them instead
+    if (device && !deviceBusy)
     {
         vkDeviceWaitIdle(device);
 
         for (auto& [key, entry] : kernels)
-        {
-            vkDestroyPipeline(device, entry.pipeline, nullptr);
-            vkDestroyPipelineLayout(device, entry.pipelineLayout, nullptr);
-            vkDestroyDescriptorSetLayout(device, entry.setLayout, nullptr);
-        }
+            destroyPipeline(entry);
         for (auto& [key, entry] : buffers)
             destroyBuffer(entry);
 
@@ -269,11 +323,8 @@ VulkanBackend::Impl::~Impl()
         vkDestroyDevice(device, nullptr);
     }
 
-    if (instance)
+    if (instance && !deviceBusy)
         vkDestroyInstance(instance, nullptr);
-
-    if (compiler)
-        shaderc_compiler_release(compiler);
 }
 
 int VulkanBackend::Impl::findMemory(uint32_t typeBits, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred)
@@ -290,15 +341,14 @@ int VulkanBackend::Impl::findMemory(uint32_t typeBits, VkMemoryPropertyFlags req
     return -1;
 }
 
-bool VulkanBackend::Impl::createBuffer(BufferEntry& entry, size_t size, bool deviceLocal)
+bool VulkanBackend::Impl::createBuffer(BufferEntry& entry, bool deviceLocal)
 {
     VkBuffer& buffer = deviceLocal ? entry.device : entry.staging;
     VkDeviceMemory& mem = deviceLocal ? entry.deviceMemory : entry.stagingMemory;
 
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = entry.deviceSize;
-    bci.usage = deviceLocal ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
-                            : VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | (deviceLocal ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT : 0);
     if (vkCreateBuffer(device, &bci, nullptr, &buffer) != VK_SUCCESS)
         return false;
 
@@ -323,10 +373,7 @@ bool VulkanBackend::Impl::createBuffer(BufferEntry& entry, size_t size, bool dev
     if (vkBindBufferMemory(device, buffer, mem, 0) != VK_SUCCESS)
         return false;
 
-    if (!deviceLocal && vkMapMemory(device, mem, 0, entry.deviceSize, 0, &entry.mapped) != VK_SUCCESS)
-        return false;
-
-    return true;
+    return deviceLocal || vkMapMemory(device, mem, 0, entry.deviceSize, 0, &entry.mapped) == VK_SUCCESS;
 }
 
 void VulkanBackend::Impl::destroyBuffer(BufferEntry& entry)
@@ -338,6 +385,16 @@ void VulkanBackend::Impl::destroyBuffer(BufferEntry& entry)
     vkDestroyBuffer(device, entry.staging, nullptr);
     vkFreeMemory(device, entry.stagingMemory, nullptr);
     entry = BufferEntry();
+}
+
+void VulkanBackend::Impl::destroyPipeline(KernelEntry& entry)
+{
+    vkDestroyPipeline(device, entry.pipeline, nullptr);
+    vkDestroyPipelineLayout(device, entry.pipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device, entry.setLayout, nullptr);
+    entry.pipeline = VK_NULL_HANDLE;
+    entry.pipelineLayout = VK_NULL_HANDLE;
+    entry.setLayout = VK_NULL_HANDLE;
 }
 
 // Luau buffers are identified by their data pointer; a recycled address is harmless since contents are always compared
@@ -355,11 +412,9 @@ BufferEntry* VulkanBackend::Impl::bufferFor(const void* data, size_t size)
     {
         BufferEntry entry;
         entry.size = size;
-        entry.deviceSize = (size + 3) & ~size_t(3);
-        if (entry.deviceSize == 0)
-            entry.deviceSize = 4;
+        entry.deviceSize = size == 0 ? 4 : (size + 3) & ~size_t(3);
 
-        if (!createBuffer(entry, size, true) || !createBuffer(entry, size, false))
+        if (!createBuffer(entry, true) || !createBuffer(entry, false))
         {
             destroyBuffer(entry);
             return nullptr;
@@ -390,31 +445,25 @@ void VulkanBackend::Impl::evict()
 
 std::string VulkanBackend::Impl::buildPipeline(KernelEntry& entry, const Kernel& kernel)
 {
-    shaderc_compile_options_t options = shaderc_compile_options_initialize();
-    shaderc_compile_options_set_optimization_level(options, shaderc_optimization_level_performance);
-    shaderc_compile_options_set_target_env(options, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_2);
+    uint32_t bindings = uint32_t(kernel.bufferWritten.size()) + 1;
+    if (bindings > limits.storageBuffers)
+        return "kernel uses " + std::to_string(bindings) + " storage buffers (its buffers and a status word), the device supports " +
+               std::to_string(limits.storageBuffers);
+    if (sizeof(PushConstants) > limits.pushConstants)
+        return "device doesn't support " + std::to_string(sizeof(PushConstants)) + " bytes of push constants";
 
-    shaderc_compilation_result_t result =
-        shaderc_compile_into_spv(compiler, kernel.glsl.data(), kernel.glsl.size(), shaderc_compute_shader, kernel.name.c_str(), "main", options);
-    shaderc_compile_options_release(options);
-
-    if (shaderc_result_get_compilation_status(result) != shaderc_compilation_status_success)
-    {
-        std::string message = std::string("internal error, generated shader doesn't compile: ") + shaderc_result_get_error_message(result);
-        shaderc_result_release(result);
-        return message;
-    }
+    std::vector<uint32_t> spirv;
+    std::string error;
+    if (!shaders.compileSpirv(kernel, spirv, error))
+        return "internal error, " + error;
 
     VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smci.codeSize = shaderc_result_get_length(result);
-    smci.pCode = reinterpret_cast<const uint32_t*>(shaderc_result_get_bytes(result));
+    smci.codeSize = spirv.size() * sizeof(uint32_t);
+    smci.pCode = spirv.data();
     VkShaderModule module;
-    VkResult res = vkCreateShaderModule(device, &smci, nullptr, &module);
-    shaderc_result_release(result);
-    if (res != VK_SUCCESS)
+    if (vkCreateShaderModule(device, &smci, nullptr, &module) != VK_SUCCESS)
         return "vkCreateShaderModule failed";
 
-    uint32_t bindings = uint32_t(kernel.bufferWritten.size()) + 1;
     std::vector<VkDescriptorSetLayoutBinding> layoutBindings(bindings);
     for (uint32_t i = 0; i < bindings; ++i)
     {
@@ -427,7 +476,6 @@ std::string VulkanBackend::Impl::buildPipeline(KernelEntry& entry, const Kernel&
     VkDescriptorSetLayoutCreateInfo dslci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dslci.bindingCount = bindings;
     dslci.pBindings = layoutBindings.data();
-    vkCreateDescriptorSetLayout(device, &dslci, nullptr, &entry.setLayout);
 
     VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, uint32_t(sizeof(PushConstants))};
     VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -435,19 +483,24 @@ std::string VulkanBackend::Impl::buildPipeline(KernelEntry& entry, const Kernel&
     plci.pSetLayouts = &entry.setLayout;
     plci.pushConstantRangeCount = 1;
     plci.pPushConstantRanges = &range;
-    vkCreatePipelineLayout(device, &plci, nullptr, &entry.pipelineLayout);
 
     VkComputePipelineCreateInfo cpci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     cpci.stage.module = module;
     cpci.stage.pName = "main";
+
+    bool ok = vkCreateDescriptorSetLayout(device, &dslci, nullptr, &entry.setLayout) == VK_SUCCESS &&
+              vkCreatePipelineLayout(device, &plci, nullptr, &entry.pipelineLayout) == VK_SUCCESS;
     cpci.layout = entry.pipelineLayout;
-    res = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci, nullptr, &entry.pipeline);
+    ok = ok && vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci, nullptr, &entry.pipeline) == VK_SUCCESS;
     vkDestroyShaderModule(device, module, nullptr);
 
-    if (res != VK_SUCCESS)
-        return "vkCreateComputePipelines failed";
+    if (!ok)
+    {
+        destroyPipeline(entry);
+        return "failed to create the compute pipeline";
+    }
 
     return "";
 }
@@ -468,101 +521,173 @@ KernelEntry* VulkanBackend::Impl::lookup(lua_State* L, int fnidx)
 
 int VulkanBackend::Impl::dispatch(lua_State* L, int fnidx, int n, int argidx, int nargs)
 {
+    std::string fallback;
+    std::function<void(const std::string&)> handler;
+    int result;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        result = dispatchLocked(L, fnidx, n, argidx, nargs, fallback);
+        handler = fallbackHandler;
+    }
+
+    // outside of the lock, so the handler can use the backend
+    if (!fallback.empty() && handler)
+        handler(fallback);
+
+    return result;
+}
+
+int VulkanBackend::Impl::dispatchLocked(lua_State* L, int fnidx, int n, int argidx, int nargs, std::string& fallback)
+{
     stats.dispatches++;
 
     KernelEntry* kernel = lookup(L, fnidx);
     if (!kernel)
         return 0;
 
-    if (!kernel->reason.empty())
+    std::string reason = !kernel->reason.empty() ? kernel->reason : disabledReason;
+
+    if (reason.empty())
     {
-        // reported on first use rather than at load, since @gpu helpers aren't meant to be dispatched
-        if (!kernel->warned && fallbackHandler)
-            fallbackHandler("@gpu function '" + kernel->name + "' runs in the VM: " + kernel->reason);
+        if (size_t(nargs) < kernel->written.size())
+            return 0; // missing buffers; the VM raises the error the script expects
+        if (n == 0)
+            return 1;
+    }
+
+    std::vector<BufferEntry*> bound;
+    std::vector<Transfer> transfers;
+    PushConstants push = {};
+    push.count = uint32_t(n);
+    push.loopBudget = options.loopBudget;
+
+    if (reason.empty())
+        reason = prepare(L, *kernel, argidx, bound, transfers, push);
+
+    bool discarded = false;
+    if (reason.empty())
+    {
+        record(*kernel, bound, transfers, push);
+        reason = execute(transfers, discarded);
+    }
+
+    if (!reason.empty())
+    {
+        // reported once per kernel, and on dispatch rather than at load since @gpu helpers aren't meant to be dispatched
+        if (!kernel->warned)
+            fallback = "@gpu function '" + kernel->name + "' runs in the VM: " + reason;
         kernel->warned = true;
         return 0;
     }
 
-    size_t nbuffers = kernel->written.size();
-    if (size_t(nargs) < nbuffers)
-        return 0; // missing buffers; the VM raises the error the script expects
+    if (discarded)
+        return 0;
 
-    if (n == 0)
-        return 1;
+    stats.gpuDispatches++;
+    if (dispatchCounter % 256 == 0)
+        evict();
+
+    return 1;
+}
+
+// checks the device limits for this dispatch and gets the device copy of every buffer
+std::string VulkanBackend::Impl::prepare(
+    lua_State* L,
+    const KernelEntry& kernel,
+    int argidx,
+    std::vector<BufferEntry*>& bound,
+    std::vector<Transfer>& transfers,
+    PushConstants& push
+)
+{
+    uint64_t groups = (uint64_t(push.count) + kWorkgroupSize - 1) / kWorkgroupSize;
+    uint64_t groupsX = groups < limits.groupsX ? groups : limits.groupsX;
+    if ((groups + groupsX - 1) / groupsX > limits.groupsY)
+        return std::to_string(push.count) + " invocations exceed the device's workgroup limits";
 
     dispatchCounter++;
 
-    std::vector<BufferEntry*> entries(nbuffers);
-    std::vector<void*> datas(nbuffers);
-    uint32_t lengths[kMaxKernelBuffers] = {};
+    for (size_t i = 0; i < kernel.written.size(); ++i)
+    {
+        size_t len = 0;
+        void* data = lua_tobuffer(L, argidx + int(i), &len);
 
+        if (len > limits.storageRange)
+            return "a buffer of " + std::to_string(len) + " bytes exceeds the device's storage buffer range of " +
+                   std::to_string(limits.storageRange) + " bytes";
+
+        BufferEntry* entry = bufferFor(data, len);
+        if (!entry)
+            return "not enough device memory for a buffer of " + std::to_string(len) + " bytes";
+
+        push.lengths[i] = uint32_t(len);
+        bound.push_back(entry);
+
+        bool seen = false;
+        for (Transfer& t : transfers)
+        {
+            if (t.entry == entry)
+            {
+                t.written |= kernel.written[i];
+                seen = true;
+            }
+        }
+        if (!seen)
+            transfers.push_back({entry, data, kernel.written[i]});
+    }
+
+    return "";
+}
+
+void VulkanBackend::Impl::record(
+    const KernelEntry& kernel,
+    const std::vector<BufferEntry*>& bound,
+    const std::vector<Transfer>& transfers,
+    const PushConstants& push
+)
+{
     VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkResetCommandBuffer(commandBuffer, 0);
     vkBeginCommandBuffer(commandBuffer, &begin);
 
-    for (size_t i = 0; i < nbuffers; ++i)
+    for (const Transfer& t : transfers)
     {
-        size_t len = 0;
-        void* data = lua_tobuffer(L, argidx + int(i), &len);
-        BufferEntry* entry = bufferFor(data, len);
-        if (!entry)
-        {
-            vkEndCommandBuffer(commandBuffer);
-            return 0;
-        }
-
-        entries[i] = entry;
-        datas[i] = data;
-        lengths[i] = uint32_t(len);
-
-        // the same buffer can be passed twice; upload it once
-        bool seen = false;
-        for (size_t j = 0; j < i; ++j)
-            seen |= entries[j] == entry;
-        if (seen)
+        BufferEntry* entry = t.entry;
+        if (entry->valid && memcmp(entry->mapped, t.data, entry->size) == 0)
             continue;
 
-        if (!entry->valid || memcmp(entry->mapped, data, len) != 0)
-        {
-            memcpy(entry->mapped, data, len);
-            VkBufferCopy copy = {0, 0, entry->deviceSize};
-            vkCmdCopyBuffer(commandBuffer, entry->staging, entry->device, 1, &copy);
-            entry->valid = true;
-            stats.uploadedBytes += len;
-        }
+        memcpy(entry->mapped, t.data, entry->size);
+        VkBufferCopy copy = {0, 0, entry->deviceSize};
+        vkCmdCopyBuffer(commandBuffer, entry->staging, entry->device, 1, &copy);
+        entry->valid = true;
+        stats.uploadedBytes += entry->size;
     }
 
-    VkMemoryBarrier toCompute = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    toCompute.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
-    toCompute.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    vkCmdPipelineBarrier(
+    barrier(
         commandBuffer,
         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0,
-        1,
-        &toCompute,
-        0,
-        nullptr,
-        0,
-        nullptr
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
     );
 
     vkResetDescriptorPool(device, descriptorPool, 0);
     VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dsai.descriptorPool = descriptorPool;
     dsai.descriptorSetCount = 1;
-    dsai.pSetLayouts = &kernel->setLayout;
+    dsai.pSetLayouts = &kernel.setLayout;
     VkDescriptorSet set;
     vkAllocateDescriptorSets(device, &dsai, &set);
 
-    std::vector<VkDescriptorBufferInfo> infos(nbuffers + 1);
-    std::vector<VkWriteDescriptorSet> writes(nbuffers + 1);
-    for (size_t i = 0; i <= nbuffers; ++i)
+    // bindings follow the argument order, so a buffer passed twice is bound twice; the status word comes last
+    size_t bindings = bound.size() + 1;
+    std::vector<VkDescriptorBufferInfo> infos(bindings);
+    std::vector<VkWriteDescriptorSet> writes(bindings);
+    for (size_t i = 0; i < bindings; ++i)
     {
-        infos[i].buffer = i < nbuffers ? entries[i]->device : status.device;
-        infos[i].offset = 0;
+        infos[i].buffer = i < bound.size() ? bound[i]->device : status.device;
         infos[i].range = VK_WHOLE_SIZE;
 
         writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -574,55 +699,49 @@ int VulkanBackend::Impl::dispatch(lua_State* L, int fnidx, int n, int argidx, in
     }
     vkUpdateDescriptorSets(device, uint32_t(writes.size()), writes.data(), 0, nullptr);
 
-    PushConstants push = {};
-    push.count = uint32_t(n);
-    memcpy(push.lengths, lengths, sizeof(lengths));
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipelineLayout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(commandBuffer, kernel.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
 
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, kernel->pipeline);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, kernel->pipelineLayout, 0, 1, &set, 0, nullptr);
-    vkCmdPushConstants(commandBuffer, kernel->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    uint32_t groups = uint32_t((uint64_t(push.count) + kWorkgroupSize - 1) / kWorkgroupSize);
+    uint32_t groupsX = groups < limits.groupsX ? groups : limits.groupsX;
+    vkCmdDispatch(commandBuffer, groupsX, (groups + groupsX - 1) / groupsX, 1);
 
-    uint32_t groups = (uint32_t(n) + kWorkgroupSize - 1) / kWorkgroupSize;
-    uint32_t gx = groups < kMaxGroupsX ? groups : kMaxGroupsX;
-    uint32_t gy = (groups + gx - 1) / gx;
-    vkCmdDispatch(commandBuffer, gx, gy, 1);
-
-    VkMemoryBarrier toTransfer = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    toTransfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    vkCmdPipelineBarrier(
-        commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &toTransfer, 0, nullptr, 0, nullptr
+    barrier(
+        commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT
     );
 
-    for (size_t i = 0; i < nbuffers; ++i)
+    for (const Transfer& t : transfers)
     {
-        bool seen = false;
-        for (size_t j = 0; j < i; ++j)
-            seen |= entries[j] == entries[i] && kernel->written[j];
-        if (!kernel->written[i] || seen)
+        if (!t.written)
             continue;
-
-        VkBufferCopy copy = {0, 0, entries[i]->deviceSize};
-        vkCmdCopyBuffer(commandBuffer, entries[i]->device, entries[i]->staging, 1, &copy);
+        VkBufferCopy copy = {0, 0, t.entry->deviceSize};
+        vkCmdCopyBuffer(commandBuffer, t.entry->device, t.entry->staging, 1, &copy);
     }
 
-    VkMemoryBarrier toHost = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    toHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(
+    barrier(
         commandBuffer,
         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
         VK_PIPELINE_STAGE_HOST_BIT,
-        0,
-        1,
-        &toHost,
-        0,
-        nullptr,
-        0,
-        nullptr
+        VK_ACCESS_HOST_READ_BIT
     );
 
     vkEndCommandBuffer(commandBuffer);
+}
+
+// runs the recorded dispatch and copies the results back unless the GPU reported an error, in which case 'discarded' is set
+// and the VM reruns the dispatch to raise the error Luau would
+std::string VulkanBackend::Impl::execute(const std::vector<Transfer>& transfers, bool& discarded)
+{
+    auto invalidateWritten = [&]()
+    {
+        for (const Transfer& t : transfers)
+        {
+            if (t.written)
+                t.entry->valid = false;
+        }
+    };
 
     *(volatile uint32_t*)status.mapped = 0;
 
@@ -630,46 +749,44 @@ int VulkanBackend::Impl::dispatch(lua_State* L, int fnidx, int n, int argidx, in
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &commandBuffer;
     vkResetFences(device, 1, &fence);
-    if (vkQueueSubmit(queue, 1, &submit, fence) != VK_SUCCESS || vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+
+    VkResult res = vkQueueSubmit(queue, 1, &submit, fence);
+    if (res == VK_SUCCESS)
+        res = vkWaitForFences(device, 1, &fence, VK_TRUE, uint64_t(options.timeoutMs) * 1000000);
+
+    if (res != VK_SUCCESS)
     {
-        for (BufferEntry* entry : entries)
-            entry->valid = false;
-        return 0;
+        invalidateWritten();
+        deviceBusy = res == VK_TIMEOUT;
+        disabledReason = res == VK_TIMEOUT ? "the GPU backend was disabled after a dispatch exceeded " + std::to_string(options.timeoutMs) + " ms"
+                                           : "the GPU backend was disabled after a device error (" + std::to_string(res) + ")";
+        return disabledReason;
     }
 
-    // an error on the GPU (out of bounds or unaligned access, integer division by zero) discards the results;
-    // the VM then reruns the whole dispatch and raises the error Luau would
     if (*(volatile uint32_t*)status.mapped != 0)
     {
-        for (size_t i = 0; i < nbuffers; ++i)
-        {
-            if (kernel->written[i])
-                entries[i]->valid = false;
-        }
+        invalidateWritten();
         stats.fallbacks++;
-        return 0;
+        discarded = true;
+        return "";
     }
 
-    for (size_t i = 0; i < nbuffers; ++i)
+    for (const Transfer& t : transfers)
     {
-        if (!kernel->written[i])
+        if (!t.written)
             continue;
-        memcpy(datas[i], entries[i]->mapped, entries[i]->size);
-        stats.downloadedBytes += entries[i]->size;
+        memcpy(t.data, t.entry->mapped, t.entry->size);
+        stats.downloadedBytes += t.entry->size;
     }
 
-    stats.gpuDispatches++;
-
-    if (dispatchCounter % 256 == 0)
-        evict();
-
-    return 1;
+    return "";
 }
 
-std::unique_ptr<VulkanBackend> VulkanBackend::create(std::string& error)
+std::unique_ptr<VulkanBackend> VulkanBackend::create(std::string& error, const VulkanOptions& options)
 {
     std::unique_ptr<VulkanBackend> backend(new VulkanBackend());
     backend->impl = std::make_unique<Impl>();
+    backend->impl->options = options;
     if (!backend->impl->init(error))
         return nullptr;
     return backend;
@@ -680,45 +797,36 @@ VulkanBackend::~VulkanBackend() = default;
 std::vector<Kernel> VulkanBackend::load(const std::string& chunkname, const char* source, size_t size)
 {
     std::vector<Kernel> kernels = translate(source, size);
+    loadKernels(chunkname, kernels);
+    return kernels;
+}
+
+void VulkanBackend::loadKernels(const std::string& chunkname, std::vector<Kernel>& kernels)
+{
+    std::lock_guard<std::mutex> lock(impl->mutex);
 
     for (Kernel& kernel : kernels)
     {
-        KernelEntry& entry = impl->kernels[{chunkname, kernel.line}];
-
         // reloading a chunk replaces its kernels
-        vkDestroyPipeline(impl->device, entry.pipeline, nullptr);
-        vkDestroyPipelineLayout(impl->device, entry.pipelineLayout, nullptr);
-        vkDestroyDescriptorSetLayout(impl->device, entry.setLayout, nullptr);
+        KernelEntry& entry = impl->kernels[{chunkname, kernel.line}];
+        impl->destroyPipeline(entry);
         entry = KernelEntry();
 
         entry.name = kernel.name;
         entry.written = kernel.bufferWritten;
+
         if (!kernel.reason.empty())
             entry.reason = "line " + std::to_string(kernel.reasonLocation.begin.line + 1) + ": " + kernel.reason;
-
-        if (entry.reason.empty())
+        else
             entry.reason = impl->buildPipeline(entry, kernel);
 
-        if (!entry.reason.empty())
-            kernel.reason = entry.reason;
-
-        if (getenv("LUAU_GPU_DUMP"))
-            fprintf(
-                stderr,
-                "// kernel %s (line %d)%s%s\n%s\n",
-                kernel.name.c_str(),
-                kernel.line,
-                kernel.reason.empty() ? "" : ": ",
-                kernel.reason.c_str(),
-                kernel.glsl.c_str()
-            );
+        kernel.reason = entry.reason;
     }
-
-    return kernels;
 }
 
 void VulkanBackend::setFallbackHandler(std::function<void(const std::string& message)> handler)
 {
+    std::lock_guard<std::mutex> lock(impl->mutex);
     impl->fallbackHandler = std::move(handler);
 }
 
@@ -732,8 +840,9 @@ const std::string& VulkanBackend::deviceName() const
     return impl->deviceName;
 }
 
-DispatchStats& VulkanBackend::stats()
+DispatchStats VulkanBackend::stats() const
 {
+    std::lock_guard<std::mutex> lock(impl->mutex);
     return impl->stats;
 }
 

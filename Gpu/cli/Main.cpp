@@ -1,6 +1,7 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 
 // luau-gpu: runs a script with the gpu library backed by Vulkan, plus a small 'host' and 'window' library for demos and tests
+#include "Luau/GpuShaderCompiler.h"
 #include "Luau/GpuVulkan.h"
 
 #include "lua.h"
@@ -21,6 +22,8 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 LUAU_FASTFLAG(LuauGpuKernels)
 LUAU_FASTFLAG(LuauGpuLibrary)
@@ -71,7 +74,7 @@ static int host_stats(lua_State* L)
     lua_createtable(L, 0, 5);
     if (gBackend)
     {
-        Luau::Gpu::DispatchStats& s = gBackend->stats();
+        Luau::Gpu::DispatchStats s = gBackend->stats();
         lua_pushnumber(L, double(s.dispatches));
         lua_setfield(L, -2, "dispatches");
         lua_pushnumber(L, double(s.gpuDispatches));
@@ -212,6 +215,68 @@ static const luaL_Reg windowlib[] = {
     {NULL, NULL},
 };
 
+// prints the shader of every @gpu function for a target, without running the script
+static int emit(const std::string& source, const char* target)
+{
+    using Luau::Gpu::ShaderTarget;
+
+    static const std::pair<const char*, ShaderTarget> kTargets[] = {
+        {"spirv", ShaderTarget::SpirvVulkan},
+        {"msl-ios", ShaderTarget::MslIos},
+        {"msl-macos", ShaderTarget::MslMacos},
+        {"gles", ShaderTarget::GlslEs},
+    };
+
+    bool glsl = strcmp(target, "glsl") == 0;
+    ShaderTarget shaderTarget = ShaderTarget::SpirvVulkan;
+    bool known = glsl;
+    for (const auto& [name, t] : kTargets)
+    {
+        if (strcmp(target, name) == 0)
+        {
+            shaderTarget = t;
+            known = true;
+        }
+    }
+
+    if (!known)
+    {
+        fprintf(stderr, "unknown target '%s'; expected glsl, spirv, msl-ios, msl-macos or gles\n", target);
+        return 1;
+    }
+
+    Luau::Gpu::ShaderCompiler compiler;
+    int code = 0;
+
+    for (const Luau::Gpu::Kernel& kernel : Luau::Gpu::translate(source.data(), source.size()))
+    {
+        printf("// @gpu %s (line %d)\n", kernel.name.c_str(), kernel.line);
+
+        if (!kernel.reason.empty())
+        {
+            printf("// runs in the VM: line %d: %s\n\n", kernel.reasonLocation.begin.line + 1, kernel.reason.c_str());
+            continue;
+        }
+
+        std::string output = kernel.glsl;
+        std::string error;
+        std::vector<uint32_t> spirv;
+        bool ok = glsl || (compiler.compileSpirv(kernel, spirv, error) && compiler.crossCompile(spirv, shaderTarget, output, error));
+
+        if (ok)
+        {
+            printf("%s\n", output.c_str());
+        }
+        else
+        {
+            printf("// internal error: %s\n\n", error.c_str());
+            code = 1;
+        }
+    }
+
+    return code;
+}
+
 static int traceback(lua_State* L)
 {
     const char* msg = lua_tostring(L, 1);
@@ -226,6 +291,7 @@ int main(int argc, char** argv)
 
     bool useGpu = true;
     bool useNative = true;
+    const char* emitTarget = nullptr;
     const char* path = nullptr;
     int scriptArg = argc;
 
@@ -235,6 +301,8 @@ int main(int argc, char** argv)
             useGpu = false;
         else if (strcmp(argv[i], "--no-native") == 0)
             useNative = false;
+        else if (strncmp(argv[i], "--emit=", 7) == 0)
+            emitTarget = argv[i] + 7;
         else
         {
             path = argv[i];
@@ -246,6 +314,8 @@ int main(int argc, char** argv)
     if (!path)
     {
         fprintf(stderr, "usage: luau-gpu [--vm] [--no-native] script.luau [args...]\n");
+        fprintf(stderr, "       luau-gpu --emit=<glsl|spirv|msl-ios|msl-macos|gles> script.luau\n");
+        fprintf(stderr, "         prints the shader of every @gpu function for that target to stdout, without running the script\n");
         return 1;
     }
 
@@ -259,6 +329,9 @@ int main(int argc, char** argv)
     ss << file.rdbuf();
     std::string source = ss.str();
     std::string chunkname = std::string("@") + path;
+
+    if (emitTarget)
+        return emit(source, emitTarget);
 
     lua_State* L = luaL_newstate();
     luaL_openlibs(L);
