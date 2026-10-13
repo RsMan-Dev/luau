@@ -61,6 +61,13 @@ static int host_gpuname(lua_State* L)
     return 1;
 }
 
+// runs a full garbage collection cycle, like collectgarbage("collect") in the luau REPL
+static int host_collect(lua_State* L)
+{
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    return 0;
+}
+
 static int host_clock(lua_State* L)
 {
     using namespace std::chrono;
@@ -85,6 +92,10 @@ static int host_stats(lua_State* L)
         lua_setfield(L, -2, "uploadedBytes");
         lua_pushnumber(L, double(s.downloadedBytes));
         lua_setfield(L, -2, "downloadedBytes");
+        lua_pushnumber(L, double(s.cachedBytes));
+        lua_setfield(L, -2, "cachedBytes");
+        lua_pushnumber(L, double(s.kernels));
+        lua_setfield(L, -2, "kernels");
     }
     return 1;
 }
@@ -105,6 +116,7 @@ static int host_writefile(lua_State* L)
 
 static const luaL_Reg hostlib[] = {
     {"writefile", host_writefile},
+    {"collect", host_collect},
     {"setgpu", host_setgpu},
     {"gpuname", host_gpuname},
     {"clock", host_clock},

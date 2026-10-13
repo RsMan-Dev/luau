@@ -10,6 +10,7 @@
 
 #include <string.h>
 
+#include <list>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -28,6 +29,10 @@ const char* const kBuffersKey = "_GPUBUFFERS";
 
 struct KernelEntry
 {
+    std::string key;
+    // functions using the kernel, in every state; it's freed with the last one
+    int users = 0;
+
     std::string name;
     std::string reason;
     bool warned = false;
@@ -38,10 +43,9 @@ struct KernelEntry
     VkPipeline pipeline = VK_NULL_HANDLE;
 };
 
-// device copy of a Luau buffer
-struct BufferEntry
+// device memory for a Luau buffer and the host memory mirroring it
+struct Allocation
 {
-    size_t size = 0;
     VkDeviceSize deviceSize = 0;
 
     VkBuffer device = VK_NULL_HANDLE;
@@ -49,6 +53,12 @@ struct BufferEntry
     VkBuffer staging = VK_NULL_HANDLE;
     VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
     void* mapped = nullptr;
+};
+
+// device copy of a Luau buffer
+struct BufferEntry : Allocation
+{
+    size_t size = 0;
 
     // contents of a dirty copy before the dispatch that is running, to restore them if it fails
     VkBuffer backup = VK_NULL_HANDLE;
@@ -59,13 +69,25 @@ struct BufferEntry
     // the device contents are newer than the Luau buffer's (written by a batch that didn't list the buffer as an output)
     bool dirty = false;
     uint64_t lastUsed = 0;
+
+    // position in the least recently used list, which dirty copies leave since they can't be evicted
+    bool listed = false;
+    std::list<uint64_t>::iterator lru;
 };
 
-// lives in the registry table of buffers; when the Luau buffer is collected, so is this, and the device copy is freed
+// lives in the registry table of buffers; once the Luau buffer is collected, so is this (in the next GC cycle, since weak
+// tables mark their values), and the device copy is freed
 struct BufferHandle
 {
     VulkanBackend::Impl* impl;
     uint64_t id;
+};
+
+// the same for functions and their kernels
+struct KernelHandle
+{
+    VulkanBackend::Impl* impl;
+    KernelEntry* kernel;
 };
 
 // a buffer used by a dispatch, once however many times it's bound
@@ -157,12 +179,16 @@ struct VulkanBackend::Impl
     std::unordered_map<std::string, std::unique_ptr<KernelEntry>> kernels;
 
     std::unordered_map<uint64_t, BufferEntry> buffers;
+    std::list<uint64_t> lru;
     uint64_t nextBufferId = 0;
     uint64_t cachedBytes = 0;
 
-    // buffers collected by the GC; their copies are freed on the next dispatch, since the GC may run during one
+
+    // buffers and functions collected by the GC; what they hold is freed on the next call into the backend, since the GC
+    // may run during one
     std::mutex deadMutex;
     std::vector<uint64_t> deadBuffers;
+    std::vector<KernelEntry*> deadKernels;
 
     // reused by every dispatch
     std::vector<KernelEntry*> stepKernels;
@@ -179,7 +205,9 @@ struct VulkanBackend::Impl
     bool init(std::string& error);
     int findMemory(uint32_t typeBits, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred);
     bool createBuffer(VkDeviceSize size, bool deviceLocal, VkBuffer& buffer, VkDeviceMemory& mem, void** mapped);
+    void destroyAllocation(Allocation& alloc);
     void destroyBuffer(BufferEntry& entry);
+
     void destroyPipeline(KernelEntry& entry);
     bool evictLeastRecent();
     void freeDeadBuffers();
@@ -329,6 +357,7 @@ bool VulkanBackend::Impl::init(std::string& error)
     {
         Impl* self = static_cast<Impl*>(context);
         std::lock_guard<std::mutex> lock(self->mutex);
+        self->freeDeadBuffers();
 
         KernelEntry* entry = self->kernelFor(L, fn);
         if (!entry->reason.empty())
@@ -425,20 +454,28 @@ bool VulkanBackend::Impl::createBuffer(VkDeviceSize size, bool deviceLocal, VkBu
     return !mapped || vkMapMemory(device, mem, 0, size, 0, mapped) == VK_SUCCESS;
 }
 
+void VulkanBackend::Impl::destroyAllocation(Allocation& alloc)
+{
+    if (alloc.deviceMemory)
+        cachedBytes -= alloc.deviceSize;
+    if (alloc.mapped)
+        vkUnmapMemory(device, alloc.stagingMemory);
+    vkDestroyBuffer(device, alloc.device, nullptr);
+    vkFreeMemory(device, alloc.deviceMemory, nullptr);
+    vkDestroyBuffer(device, alloc.staging, nullptr);
+    vkFreeMemory(device, alloc.stagingMemory, nullptr);
+    alloc = Allocation();
+}
+
 void VulkanBackend::Impl::destroyBuffer(BufferEntry& entry)
 {
-    if (entry.deviceMemory)
-        cachedBytes -= entry.deviceSize;
+    if (entry.listed)
+        lru.erase(entry.lru);
     if (entry.backupMemory)
         cachedBytes -= entry.deviceSize;
-    if (entry.mapped)
-        vkUnmapMemory(device, entry.stagingMemory);
-    vkDestroyBuffer(device, entry.device, nullptr);
-    vkFreeMemory(device, entry.deviceMemory, nullptr);
-    vkDestroyBuffer(device, entry.staging, nullptr);
-    vkFreeMemory(device, entry.stagingMemory, nullptr);
     vkDestroyBuffer(device, entry.backup, nullptr);
     vkFreeMemory(device, entry.backupMemory, nullptr);
+    destroyAllocation(entry);
     entry = BufferEntry();
 }
 
@@ -452,30 +489,48 @@ void VulkanBackend::Impl::destroyPipeline(KernelEntry& entry)
     entry.setLayout = VK_NULL_HANDLE;
 }
 
-// frees the least recently used copy that the current dispatch doesn't use and that holds nothing the Luau buffer lacks
+// frees the least recently used copy that the current dispatch doesn't use and that holds nothing the Luau buffer lacks;
+// buffers are moved to the back of the list when used, so the ones the current dispatch uses are at the back
 bool VulkanBackend::Impl::evictLeastRecent()
 {
-    auto victim = buffers.end();
-    for (auto it = buffers.begin(); it != buffers.end(); ++it)
+    while (!lru.empty())
     {
-        const BufferEntry& e = it->second;
-        if (e.deviceMemory && !e.dirty && e.lastUsed != dispatchCounter && (victim == buffers.end() || e.lastUsed < victim->second.lastUsed))
-            victim = it;
+        BufferEntry& e = buffers[lru.front()];
+        if (e.lastUsed == dispatchCounter)
+            return false;
+
+        lru.pop_front();
+        e.listed = false;
+
+        // dirty copies come back to the list when they are used again
+        if (e.dirty || !e.deviceMemory)
+            continue;
+
+        destroyBuffer(e);
+        return true;
     }
 
-    if (victim == buffers.end())
-        return false;
-
-    destroyBuffer(victim->second);
-    return true;
+    return false;
 }
 
 void VulkanBackend::Impl::freeDeadBuffers()
 {
     std::vector<uint64_t> dead;
+    std::vector<KernelEntry*> deadUsers;
     {
         std::lock_guard<std::mutex> lock(deadMutex);
         dead.swap(deadBuffers);
+        deadUsers.swap(deadKernels);
+    }
+
+    for (KernelEntry* kernel : deadUsers)
+    {
+        if (--kernel->users > 0)
+            continue;
+
+        if (!deviceBusy)
+            destroyPipeline(*kernel);
+        kernels.erase(kernel->key);
     }
 
     for (uint64_t id : dead)
@@ -485,6 +540,8 @@ void VulkanBackend::Impl::freeDeadBuffers()
             continue;
         if (!deviceBusy)
             destroyBuffer(it->second);
+        else if (it->second.listed)
+            lru.erase(it->second.lru);
         buffers.erase(it);
     }
 }
@@ -560,11 +617,11 @@ KernelEntry* VulkanBackend::Impl::kernelFor(lua_State* L, int fn)
     pushWeakTable(L, kKernelsKey);
     lua_pushvalue(L, fn);
     lua_rawget(L, -2);
-    KernelEntry* cached = static_cast<KernelEntry*>(lua_tolightuserdata(L, -1));
+    KernelHandle* cached = static_cast<KernelHandle*>(lua_touserdata(L, -1));
     lua_settop(L, top);
 
     if (cached)
-        return cached;
+        return cached->kernel;
 
     CodeGen::GpuKernel kernel = lowering(L, fn);
 
@@ -574,6 +631,7 @@ KernelEntry* VulkanBackend::Impl::kernelFor(lua_State* L, int fn)
     if (!entry)
     {
         entry = std::make_unique<KernelEntry>();
+        entry->key = key;
         entry->name = kernel.name;
         entry->written = kernel.bufferWritten;
 
@@ -585,13 +643,27 @@ KernelEntry* VulkanBackend::Impl::kernelFor(lua_State* L, int fn)
             entry->reason = buildPipeline(*entry, kernel.glsl);
     }
 
+    KernelEntry* result = entry.get();
+    result->users++;
+
     pushWeakTable(L, kKernelsKey);
     lua_pushvalue(L, fn);
-    lua_pushlightuserdata(L, entry.get());
+    KernelHandle* handle = static_cast<KernelHandle*>(lua_newuserdatadtor(
+        L,
+        sizeof(KernelHandle),
+        [](lua_State*, void* ud)
+        {
+            KernelHandle* h = static_cast<KernelHandle*>(ud);
+            std::lock_guard<std::mutex> lock(h->impl->deadMutex);
+            h->impl->deadKernels.push_back(h->kernel);
+        }
+    ));
+    handle->impl = this;
+    handle->kernel = result;
     lua_rawset(L, -3);
     lua_settop(L, top);
 
-    return entry.get();
+    return result;
 }
 
 // the device copy of the buffer at stack index idx, allocated when needed if 'create' is set
@@ -634,32 +706,42 @@ BufferEntry* VulkanBackend::Impl::bufferFor(lua_State* L, int idx, bool create)
     if (!handle)
         return nullptr;
 
-    BufferEntry& entry = buffers[handle->id];
-    entry.lastUsed = dispatchCounter;
+    uint64_t id = handle->id;
+    BufferEntry& entry = buffers[id];
 
-    if (entry.deviceMemory || !create)
-        return entry.deviceMemory ? &entry : nullptr;
+    if (!entry.deviceMemory && !create)
+        return nullptr;
+
+    entry.lastUsed = dispatchCounter;
+    if (entry.listed)
+        lru.splice(lru.end(), lru, entry.lru);
+    else
+        entry.lru = lru.insert(lru.end(), id);
+    entry.listed = true;
+
+    if (entry.deviceMemory)
+        return &entry;
 
     entry.size = size;
-    entry.deviceSize = size == 0 ? 4 : (size + 3) & ~size_t(3);
     entry.valid = false;
     entry.dirty = false;
 
-    // stay within the cache budget; if allocation still fails, free every copy this dispatch doesn't need and retry
+    VkDeviceSize deviceSize = size == 0 ? 4 : (size + 3) & ~size_t(3);
+
+    // copies of collected buffers are freed with them; the budget only bounds copies of live buffers. If allocation still
+    // fails, free every copy this dispatch doesn't need and retry
     for (int attempt = 0; attempt < 2; ++attempt)
     {
-        while ((attempt > 0 || cachedBytes + entry.deviceSize > options.cacheBytes) && evictLeastRecent())
+        while ((attempt > 0 || cachedBytes + deviceSize > options.cacheBytes) && evictLeastRecent())
         {
         }
 
-        if (createBuffer(entry.deviceSize, true, entry.device, entry.deviceMemory, nullptr) &&
-            createBuffer(entry.deviceSize, false, entry.staging, entry.stagingMemory, &entry.mapped))
+        entry.deviceSize = deviceSize;
+        if (createBuffer(deviceSize, true, entry.device, entry.deviceMemory, nullptr) &&
+            createBuffer(deviceSize, false, entry.staging, entry.stagingMemory, &entry.mapped))
             return &entry;
 
-        destroyBuffer(entry);
-        entry.size = size;
-        entry.deviceSize = size == 0 ? 4 : (size + 3) & ~size_t(3);
-        entry.lastUsed = dispatchCounter;
+        destroyAllocation(entry);
     }
 
     return nullptr;
@@ -1145,6 +1227,7 @@ DispatchStats VulkanBackend::stats() const
     std::lock_guard<std::mutex> lock(impl->mutex);
     DispatchStats s = impl->stats;
     s.cachedBytes = impl->cachedBytes;
+    s.kernels = impl->kernels.size();
     return s;
 }
 

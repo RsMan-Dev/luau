@@ -60,6 +60,33 @@ std::string run(VulkanBackend& backend, const std::string& source, int interrupt
 
     lua_State* L = luaL_newstate();
     luaL_openlibs(L);
+
+    // backendstats() returns the device memory and the kernels the backend keeps; collect() runs a full GC cycle
+    lua_pushlightuserdata(L, &backend);
+    lua_pushcclosure(
+        L,
+        [](lua_State* L)
+        {
+            DispatchStats stats = static_cast<VulkanBackend*>(lua_tolightuserdata(L, lua_upvalueindex(1)))->stats();
+            lua_pushnumber(L, double(stats.cachedBytes));
+            lua_pushnumber(L, double(stats.kernels));
+            return 2;
+        },
+        "backendstats",
+        1
+    );
+    lua_setglobal(L, "backendstats");
+    lua_pushcfunction(
+        L,
+        [](lua_State* L)
+        {
+            lua_gc(L, LUA_GCCOLLECT, 0);
+            return 0;
+        },
+        "collect"
+    );
+    lua_setglobal(L, "collect");
+
     luaL_sandbox(L);
     backend.install(L);
 
@@ -703,6 +730,86 @@ end
     for (const std::string& error : errors)
         CHECK(error == "");
     CHECK_MESSAGE(backend->stats().gpuDispatches == 200, fallback);
+}
+
+TEST_CASE("collected_buffers_and_functions_release_what_the_backend_holds_for_them")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    CHECK(run(*backend, R"(
+local function makeKernel()
+    return @gpu function(i: number, out: buffer)
+        buffer.writeu32(out, i * 4, i)
+    end
+end
+
+-- in a function, so that nothing on the stack keeps the buffer and the kernel alive once it returns
+local function use()
+    local big = buffer.create(1024 * 1024)
+    gpu.dispatch(makeKernel(), 4, big)
+    local cached, kernels = backendstats()
+    assert(cached >= 1024 * 1024 and kernels == 1, `{cached} {kernels}`)
+end
+use()
+
+-- the GC collects the buffer and the function, then the sentinels of the weak tables, whose values it still marks in the
+-- cycle where their keys die; the next call into the backend frees the copy and the kernel
+collect()
+collect()
+gpu.status(print)
+local cached = backendstats()
+assert(cached == 0, `{cached}`)
+)") == "");
+
+    // a function without upvalues lives as long as its prototype, so kernels are released with the state; the next call into
+    // the backend frees them, leaving only the kernel of the function it is called with
+    CHECK(run(*backend, "gpu.status(print)") == "");
+    CHECK(backend->stats().kernels == 1);
+}
+
+TEST_CASE("fresh_buffers_every_iteration_keep_a_flat_cost_and_bounded_memory")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    CHECK(run(*backend, R"(
+@gpu
+local function fill(i: number, out: buffer)
+    buffer.writeu32(out, i * 4, i)
+end
+
+local n = 3000
+local times = table.create(n)
+local maxCached = 0
+for k = 1, n do
+    local b = buffer.create(64 * 1024 + (k % 7) * 1024)
+    local t = os.clock()
+    gpu.dispatch(fill, 1024, b)
+    times[k] = os.clock() - t
+    assert(buffer.readu32(b, 4092) == 1023)
+    if k % 100 == 0 then
+        collect()
+    end
+    maxCached = math.max(maxCached, (backendstats()))
+end
+
+local function mean(a, b)
+    local s = 0
+    for k = a, b do
+        s += times[k]
+    end
+    return s / (b - a + 1)
+end
+
+-- what is alive between two collections, not everything that was ever dispatched
+assert(maxCached < 101 * 72 * 1024, `{maxCached}`)
+-- the cost of a dispatch doesn't grow with the number of buffers that came before
+local first, last = mean(1, n // 10), mean(n - n // 10 + 1, n)
+assert(last < first * 1.5 + 0.0002, `{first} {last}`)
+)") == "");
 }
 
 TEST_CASE("a_batch_is_the_steps_in_order_and_downloads_only_its_outputs")
