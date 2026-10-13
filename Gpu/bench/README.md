@@ -35,18 +35,23 @@ on rounding, and n-body sums 4096 terms.
 
 ## Results
 
-2026-10-13, NVIDIA GeForce RTX 4080, AMD Ryzen 9 9950X3D, Release build:
+2026-10-13, NVIDIA GeForce RTX 4080, AMD Ryzen 9 9950X3D, RelWithDebInfo build, scripts sandboxed with native code
+generation (as `luau --codegen` runs them):
 
 | Scenario | Size | Native loop ms | VM ms | GPU ms | GPU median ms | Speedup vs native | Match |
 |---|---|---:|---:|---:|---:|---:|---|
-| saxpy | 1000000 floats | 15.320 | 21.730 | 2.240 | 2.390 | 6.8x | yes |
-| tiny saxpy | 64 floats | 0.001 | 0.001 | 0.318 | 0.334 | 0.003x | yes |
-| mandelbrot | 1024x1024, 256 iterations | 254.478 | 256.236 | 1.471 | 1.551 | 173.0x | yes |
-| n-body | 4096 bodies | 343.154 | 343.510 | 1.233 | 1.360 | 278.3x | yes |
-| game of life | 1024x1024, 10 steps | 412.688 | 472.797 | 8.179 | 9.515 | 50.5x | yes |
-| histogram | 4000000 values, 256 bins | 117.109 | 137.034 | 4.552 | 4.856 | 25.7x | yes |
-| particles | 1000000 particles | 28.390 | 33.186 | 6.180 | 7.393 | 4.6x | yes |
-| blur 5x5 | 1024x1024 | 115.955 | 126.279 | 1.125 | 2.396 | 103.1x | yes |
+| saxpy | 1000000 floats | 13.869 | 20.940 | 2.259 | 2.451 | 6.1x | yes |
+| tiny saxpy | 64 floats | 0.001 | 0.002 | 0.325 | 0.344 | 0.003x | yes |
+| mandelbrot | 1024x1024, 256 iterations | 254.070 | 255.843 | 1.280 | 1.388 | 198.5x | yes |
+| n-body | 4096 bodies | 340.848 | 340.907 | 1.375 | 1.423 | 248.0x | yes |
+| game of life | 1024x1024, 10 steps | 407.947 | 476.978 | 7.443 | 8.180 | 54.8x | yes |
+| histogram | 4000000 values, 256 bins | 119.356 | 140.967 | 4.465 | 4.932 | 26.7x | yes |
+| particles | 1000000 particles | 28.704 | 33.443 | 6.391 | 6.763 | 4.5x | yes |
+| blur 5x5 | 1024x1024 | 118.971 | 127.215 | 2.186 | 2.225 | 54.4x | yes |
+
+The native loop calls the kernel once per element, like a script that keeps its code in a function. For kernels whose
+body is tiny, the call dominates: the same saxpy written inline in the loop takes about 2.9 ms, so the GPU is only about
+1.3x faster on it. Kernels doing real work per invocation (Mandelbrot, n-body, blur) aren't affected.
 
 What it shows:
 

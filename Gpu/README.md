@@ -53,6 +53,41 @@ results from several invocations: counters, histograms, reductions, depth tests.
 - An out of bounds or unaligned buffer access, or an integer division by zero, discards the GPU results and reruns the
   whole dispatch in the VM, which raises the error Luau would.
 
+## Safety
+
+A kernel can only touch the buffers it is given, and a dispatch either completes cleanly on the GPU or runs in the VM:
+
+- every buffer access and atomic is bounds and alignment checked against the real buffer size; a bad access, an
+  integer division by zero, `INT_MIN // -1` or another operation that is undefined on the GPU sets the status word, the
+  GPU results are discarded and the VM reruns the dispatch, raising the error Luau would
+- every loop iteration counts against a per-invocation budget (`VulkanOptions::loopBudget`, 2^24 by default); a kernel
+  that runs away is discarded the same way, and in the VM the host's interrupt callback applies as for any script
+- generated identifiers never come from user names, so nothing in a script can inject code or clash with reserved words
+  of GLSL, GLSL ES, MSL or HLSL
+- the GPU path is all or nothing: translation, GLSL to SPIR-V compilation, SPIR-V validation, pipeline creation, device
+  limits (storage buffers per stage, storage buffer range, workgroup count, push constant size), allocation, submission
+  and a zero status word must all succeed, otherwise the VM runs the dispatch and `gpu.status` says why
+- a dispatch that doesn't finish within `VulkanOptions::timeoutMs` (5 s by default) or a lost device disables the backend
+  for good: its results are never copied back and every later dispatch runs in the VM
+- the backend is thread-safe
+
+## Other platforms
+
+Kernels are compiled once to SPIR-V, which is then cross-compiled with SPIRV-Cross. `ShaderCompiler`
+(`Gpu/include/Luau/GpuShaderCompiler.h`) produces:
+
+| Target | Output | Validated here |
+|---|---|---|
+| Vulkan 1.0 (desktop, Android) | SPIR-V 1.0 | SPIRV-Tools validator |
+| OpenGL ES 3.1 (Android) | GLSL ES 3.10 compute shader | recompiled with glslang |
+| Metal (iOS 13+, macOS 10.15+) | MSL 2.2, entry point `main0` | no: Apple's Metal compiler only exists on Apple platforms |
+
+Resources follow `Gpu/include/Luau/GpuAbi.h` on every target; on Metal, buffer *i* is `[[buffer(i)]]`, the status word
+follows the buffers and the push constants are `[[buffer(16)]]`. Only the Vulkan backend exists; a Metal or OpenGL ES
+backend implements `lua_GpuBackend` with these shaders. `VulkanOptions::minimumLimits` simulates a device that only has
+the limits Vulkan guarantees, as on low-end Android hardware: kernels that need more storage buffers or larger buffers
+then run in the VM.
+
 ## Supported subset
 
 Inside `@gpu` functions:
@@ -117,13 +152,16 @@ Any other backend can implement `lua_GpuBackend` (`lualib.h`) and install it wit
 - `Gpu/cli/Main.cpp`: `luau-gpu`, a host that runs a script with the backend and a small window library (SDL2)
 - `Gpu/examples/selftest.luau`: runs kernels on the GPU and in the VM and compares the results
 - `Gpu/examples/rasterizer.luau`: a software rasterizer drawing a 1M triangle model in real time
+- `Gpu/src/GpuShaderCompiler.cpp`: SPIR-V compilation, validation and cross-compilation (`Luau.Gpu.Shaders`)
+- `Gpu/bench/`: native Luau against GPU benchmarks, see [Gpu/bench/README.md](bench/README.md)
 - `tests/GpuTranslate.test.cpp`: translator tests that don't need a GPU (part of `Luau.UnitTest`)
+- `tests/GpuBackend.test.cpp`: shader compilation for every target, fallbacks, limits, threads (only with `LUAU_BUILD_GPU`)
 
 ## Building
 
-The Vulkan backend and `luau-gpu` are behind `LUAU_BUILD_GPU` (off by default) and need Vulkan, shaderc and SDL2;
-the translator, lint and tests build everywhere, with CMake or the Makefile. On NixOS,
-`Gpu/shell.nix` provides them:
+The Vulkan backend, the shader compilers and `luau-gpu` are behind `LUAU_BUILD_GPU` (off by default) and need Vulkan,
+shaderc, SPIRV-Tools, SPIRV-Cross, glslang and SDL2; the translator, lint and tests build everywhere, with CMake or the
+Makefile. On NixOS, `Gpu/shell.nix` provides them:
 
 ```sh
 nix-shell Gpu/shell.nix --run 'cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLUAU_BUILD_GPU=ON && ninja -C build luau-gpu'
@@ -132,10 +170,12 @@ nix-shell Gpu/shell.nix --run 'cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=R
 ./build/luau-gpu --vm script.luau                  # run every kernel in the VM
 ```
 
-`LUAU_GPU_DUMP=1` prints the generated GLSL of every kernel.
+`luau-gpu --emit=<glsl|spirv|msl-ios|msl-macos|gles> script.luau` prints the shaders of every kernel for a target
+without running the script (see [Other platforms](#other-platforms)).
 
 On an RTX 4080, the rasterizer draws 1M triangles at 1280x720 in about 5 ms per frame on the GPU, against about
-2.9 s per frame in the VM with native code generation. 99.8% of the pixels are identical between both.
+760 ms per frame in the VM with native code generation. 99.8% of the pixels are identical between both. See
+[Gpu/bench/README.md](bench/README.md) for more workloads, including the ones where the GPU doesn't win.
 
 ## Known limitations
 
