@@ -96,6 +96,29 @@ target_sources(Luau.Compiler PRIVATE
     Compiler/src/ValueTracking.h
 )
 
+# Luau.Gpu Sources
+target_sources(Luau.Gpu PRIVATE
+    Gpu/include/Luau/GpuTranslate.h
+
+    Gpu/src/GpuTranslate.cpp
+)
+
+if(TARGET Luau.Gpu.Vulkan)
+    # Luau.Gpu.Vulkan Sources
+    target_sources(Luau.Gpu.Vulkan PRIVATE
+        Gpu/include/Luau/GpuVulkan.h
+
+        Gpu/src/GpuVulkan.cpp
+    )
+endif()
+
+if(TARGET Luau.Gpu.CLI)
+    # Luau.Gpu.CLI Sources
+    target_sources(Luau.Gpu.CLI PRIVATE
+        Gpu/cli/Main.cpp
+    )
+endif()
+
 # Luau.Config Sources
 target_sources(Luau.Config PRIVATE
     Config/include/Luau/Config.h
@@ -521,6 +544,7 @@ if(TARGET Luau.UnitTest)
         tests/Fixture.h
         tests/FragmentAutocomplete.test.cpp
         tests/Frontend.test.cpp
+        tests/GpuTranslate.test.cpp
         tests/Generalization.test.cpp
         tests/InsertionOrderedMap.test.cpp
         tests/IostreamOptional.h

@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -38,6 +39,9 @@ public:
 
     // makes gpu.dispatch use this backend in the given state; the backend must outlive the state
     void install(lua_State* L);
+
+    // called once per kernel the first time it is dispatched but has to run in the VM
+    void setFallbackHandler(std::function<void(const std::string& message)> handler);
 
     const std::string& deviceName() const;
     DispatchStats& stats();

@@ -285,6 +285,12 @@ int main(int argc, char** argv)
 
     if (gBackend)
     {
+        gBackend->setFallbackHandler(
+            [](const std::string& message)
+            {
+                fprintf(stderr, "luau-gpu: %s\n", message.c_str());
+            }
+        );
         gBackend->load(chunkname, source.data(), source.size());
         gBackend->install(L);
     }

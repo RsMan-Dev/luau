@@ -82,6 +82,7 @@ struct VulkanBackend::Impl
     std::unordered_map<const void*, BufferEntry> buffers;
 
     lua_GpuBackend hooks = {};
+    std::function<void(const std::string&)> fallbackHandler;
 
     ~Impl();
 
@@ -477,8 +478,8 @@ int VulkanBackend::Impl::dispatch(lua_State* L, int fnidx, int n, int argidx, in
     if (!kernel->reason.empty())
     {
         // reported on first use rather than at load, since @gpu helpers aren't meant to be dispatched
-        if (!kernel->warned)
-            fprintf(stderr, "luau-gpu: @gpu %s runs in the VM: %s\n", kernel->name.c_str(), kernel->reason.c_str());
+        if (!kernel->warned && fallbackHandler)
+            fallbackHandler("@gpu function '" + kernel->name + "' runs in the VM: " + kernel->reason);
         kernel->warned = true;
         return 0;
     }
@@ -683,9 +684,17 @@ std::vector<Kernel> VulkanBackend::load(const std::string& chunkname, const char
     for (Kernel& kernel : kernels)
     {
         KernelEntry& entry = impl->kernels[{chunkname, kernel.line}];
+
+        // reloading a chunk replaces its kernels
+        vkDestroyPipeline(impl->device, entry.pipeline, nullptr);
+        vkDestroyPipelineLayout(impl->device, entry.pipelineLayout, nullptr);
+        vkDestroyDescriptorSetLayout(impl->device, entry.setLayout, nullptr);
+        entry = KernelEntry();
+
         entry.name = kernel.name;
         entry.written = kernel.bufferWritten;
-        entry.reason = kernel.reason;
+        if (!kernel.reason.empty())
+            entry.reason = "line " + std::to_string(kernel.reasonLocation.begin.line + 1) + ": " + kernel.reason;
 
         if (entry.reason.empty())
             entry.reason = impl->buildPipeline(entry, kernel);
@@ -706,6 +715,11 @@ std::vector<Kernel> VulkanBackend::load(const std::string& chunkname, const char
     }
 
     return kernels;
+}
+
+void VulkanBackend::setFallbackHandler(std::function<void(const std::string& message)> handler)
+{
+    impl->fallbackHandler = std::move(handler);
 }
 
 void VulkanBackend::install(lua_State* L)

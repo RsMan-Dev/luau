@@ -172,6 +172,8 @@ struct ChunkInfo : AstVisitor
     std::unordered_map<AstLocal*, AstExprFunction*> localFunctions;
     std::unordered_map<std::string, AstExprFunction*> globalFunctions;
     std::vector<AstExprFunction*> gpuFunctions;
+    std::vector<AstExpr*> callees;
+    std::set<AstExprFunction*> called;
 
     std::unordered_map<AstLocal*, double> constants;
 
@@ -215,6 +217,12 @@ struct ChunkInfo : AstVisitor
         return true;
     }
 
+    bool visit(AstExprCall* node) override
+    {
+        callees.push_back(node->func);
+        return true;
+    }
+
     static bool constantValue(AstExpr* expr, double& value)
     {
         if (AstExprConstantNumber* n = expr->as<AstExprConstantNumber>())
@@ -235,14 +243,17 @@ struct ChunkInfo : AstVisitor
         return false;
     }
 
-    void analyze(AstStatBlock* root)
+    void analyze(AstStat* root)
     {
-        for (AstStat* stat : root->body)
+        if (AstStatBlock* block = root->as<AstStatBlock>())
         {
-            if (AstStatLocal* local = stat->as<AstStatLocal>())
+            for (AstStat* stat : block->body)
             {
-                for (size_t i = 0; i < local->vars.size && i < local->values.size; ++i)
-                    topLevelLocals.emplace_back(local->vars.data[i], local->values.data[i]);
+                if (AstStatLocal* local = stat->as<AstStatLocal>())
+                {
+                    for (size_t i = 0; i < local->vars.size && i < local->values.size; ++i)
+                        topLevelLocals.emplace_back(local->vars.data[i], local->values.data[i]);
+                }
             }
         }
 
@@ -261,6 +272,20 @@ struct ChunkInfo : AstVisitor
                 it = localFunctions.erase(it);
             else
                 ++it;
+        }
+
+        for (AstExpr* callee : callees)
+        {
+            if (AstExprLocal* l = callee->as<AstExprLocal>())
+            {
+                if (auto it = localFunctions.find(l->local); it != localFunctions.end())
+                    called.insert(it->second);
+            }
+            else if (AstExprGlobal* g = callee->as<AstExprGlobal>())
+            {
+                if (auto it = globalFunctions.find(g->name.value); it != globalFunctions.end())
+                    called.insert(it->second);
+            }
         }
     }
 };
@@ -1388,7 +1413,9 @@ Kernel translateKernel(ChunkInfo& info, AstExprFunction* func)
 {
     Kernel kernel;
     kernel.name = func->debugname.value ? func->debugname.value : "anonymous";
+    kernel.location = func->location;
     kernel.line = func->location.begin.line + 1;
+    kernel.isCalled = info.called.count(func) != 0;
 
     try
     {
@@ -1455,7 +1482,8 @@ Kernel translateKernel(ChunkInfo& info, AstExprFunction* func)
     }
     catch (TranslateError& e)
     {
-        kernel.reason = "line " + std::to_string(e.location.begin.line + 1) + ": " + e.message;
+        kernel.reason = e.message;
+        kernel.reasonLocation = e.location;
         kernel.glsl.clear();
     }
 
@@ -1464,23 +1492,42 @@ Kernel translateKernel(ChunkInfo& info, AstExprFunction* func)
 
 } // namespace
 
+std::vector<Kernel> translate(AstStat* root)
+{
+    ChunkInfo info;
+    info.analyze(root);
+
+    std::vector<Kernel> kernels;
+    for (AstExprFunction* func : info.gpuFunctions)
+        kernels.push_back(translateKernel(info, func));
+
+    // compiled functions are matched to kernels by line, which has to be unambiguous
+    for (Kernel& k : kernels)
+    {
+        for (const Kernel& other : kernels)
+        {
+            if (&k != &other && k.line == other.line)
+            {
+                k.reason = "another @gpu function starts on the same line, kernels are identified by their line";
+                k.reasonLocation = k.location;
+                k.glsl.clear();
+            }
+        }
+    }
+
+    return kernels;
+}
+
 std::vector<Kernel> translate(const char* source, size_t size)
 {
     Allocator allocator;
     AstNameTable names(allocator);
     ParseResult result = Parser::parse(source, size, names, allocator);
 
-    std::vector<Kernel> kernels;
     if (!result.errors.empty())
-        return kernels;
+        return {};
 
-    ChunkInfo info;
-    info.analyze(result.root);
-
-    for (AstExprFunction* func : info.gpuFunctions)
-        kernels.push_back(translateKernel(info, func));
-
-    return kernels;
+    return translate(result.root);
 }
 
 } // namespace Gpu
