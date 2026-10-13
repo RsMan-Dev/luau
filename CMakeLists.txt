@@ -15,6 +15,7 @@ option(LUAU_EXTERN_C "Use extern C for all APIs" OFF)
 option(LUAU_BUILD_SHARED "Build as a shared library" OFF)
 
 # Compile time options for Luau features
+option(LUAU_BUILD_GPU "Build the GPU kernel translator, Vulkan backend and luau-gpu host (needs Vulkan, shaderc, SDL2)" OFF)
 option(LUAU_VECTOR_DOUBLE "Use 64-bit doubles for vector components" OFF)
 option(LUAU_VECTOR_FOUR_WIDE "Enable 4-wide mode for vectors, adding a 'w' component" OFF)
 
@@ -367,6 +368,30 @@ if(LUAU_BUILD_WEB)
 
     # the output is a single .js file with an embedded wasm blob
     target_link_options(Luau.Web PRIVATE -sSINGLE_FILE=1)
+endif()
+
+if(LUAU_BUILD_GPU)
+    find_package(Vulkan REQUIRED)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SHADERC REQUIRED IMPORTED_TARGET shaderc)
+    pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
+
+    add_library(Luau.Gpu STATIC
+        Gpu/include/Luau/GpuTranslate.h
+        Gpu/include/Luau/GpuVulkan.h
+        Gpu/src/GpuTranslate.cpp
+        Gpu/src/GpuVulkan.cpp
+    )
+    target_compile_features(Luau.Gpu PUBLIC cxx_std_17)
+    target_include_directories(Luau.Gpu PUBLIC Gpu/include)
+    target_link_libraries(Luau.Gpu PUBLIC Luau.Ast Luau.VM PRIVATE Vulkan::Vulkan PkgConfig::SHADERC)
+    target_compile_options(Luau.Gpu PRIVATE ${LUAU_OPTIONS})
+
+    add_executable(Luau.Gpu.CLI Gpu/cli/Main.cpp)
+    set_target_properties(Luau.Gpu.CLI PROPERTIES OUTPUT_NAME luau-gpu)
+    target_compile_features(Luau.Gpu.CLI PRIVATE cxx_std_17)
+    target_link_libraries(Luau.Gpu.CLI PRIVATE Luau.Gpu Luau.Compiler Luau.CodeGen Luau.VM PkgConfig::SDL2)
+    target_compile_options(Luau.Gpu.CLI PRIVATE ${LUAU_OPTIONS})
 endif()
 
 # validate dependencies for internal libraries
