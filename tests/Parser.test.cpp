@@ -5183,6 +5183,27 @@ void checkFirstErrorForAttributes(const std::vector<ParseError>& errors, const s
     CHECK_EQ(errors[0].getMessage(), message);
 }
 
+TEST_CASE_FIXTURE(Fixture, "parse_gpu_attribute_on_local_function")
+{
+    AstStatBlock* stat = parse(R"(
+@gpu
+local function kernel(i: number, b: buffer)
+    buffer.writeu32(b, i * 4, i)
+end)");
+
+    LUAU_ASSERT(stat != nullptr);
+
+    AstStatLocalFunction* statFun = stat->body.data[0]->as<AstStatLocalFunction>();
+    LUAU_ASSERT(statFun != nullptr);
+
+    AstArray<AstAttr*> attributes = statFun->func->attributes;
+
+    CHECK_EQ(attributes.size, 1);
+
+    checkAttribute(attributes.data[0], AstAttr::Type::Gpu, Location(Position(1, 0), Position(1, 4)));
+    CHECK(statFun->func->hasAttribute(AstAttr::Type::Gpu));
+}
+
 TEST_CASE_FIXTURE(Fixture, "parse_attribute_on_function_stat")
 {
 

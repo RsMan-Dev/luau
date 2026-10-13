@@ -99,6 +99,7 @@ AttributeEntry kAttributeEntries[] = {
     {"checked", AstAttr::Type::Checked, {}},
     {"native", AstAttr::Type::Native, {}},
     {"deprecated", AstAttr::Type::Deprecated, deprecatedArgsValidator},
+    {"gpu", AstAttr::Type::Gpu, {}},
     {nullptr, AstAttr::Type::Checked, {}}
 };
 

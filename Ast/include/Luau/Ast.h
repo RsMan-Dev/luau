@@ -219,6 +219,7 @@ public:
         Native,
         Deprecated,
         DebugNoinline,
+        Gpu,
         Unknown
     };
 
