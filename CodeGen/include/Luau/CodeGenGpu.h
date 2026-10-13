@@ -19,6 +19,10 @@ struct GpuKernel
 {
     CodeGenCompilationResult result = CodeGenCompilationResult::Success;
 
+    // debug name and first line of the function
+    std::string name;
+    int line = 0;
+
     // when the function can't run on the GPU: the IR command or construct responsible and its source line
     std::string reason;
 
@@ -30,6 +34,9 @@ struct GpuKernel
 
 // Lowers the Luau function at stack index idx, which must have the gpu attribute
 GpuKernel compileGpu(lua_State* L, int idx);
+
+// Lowers every function with the gpu attribute defined in the module whose main function is at stack index idx
+std::vector<GpuKernel> compileGpuModule(lua_State* L, int idx);
 
 } // namespace CodeGen
 } // namespace Luau
