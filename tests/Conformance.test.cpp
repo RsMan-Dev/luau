@@ -1288,6 +1288,18 @@ TEST_CASE("Buffers")
     );
 }
 
+TEST_CASE("Gpu")
+{
+    runConformance(
+        "gpu.luau",
+        [](lua_State* L)
+        {
+            luaopen_gpu(L);
+            lua_pop(L, 1);
+        }
+    );
+}
+
 #ifdef LUAU_BUFFER_CAGE_SUPPORTED
 static BufferCage* bufferCage;
 

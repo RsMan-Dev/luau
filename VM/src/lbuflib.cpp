@@ -12,11 +12,6 @@ LUAU_FASTFLAG(LuauIntegerLibrary)
 
 #include <string.h>
 
-// while C API returns 'size_t' for binary compatibility in case of future extensions,
-// in the current implementation, length and offset are limited to 31 bits
-// because offset is limited to an integer, a single 64bit comparison can be used and will not overflow
-#define isoutofbounds(offset, len, accessize) (uint64_t(unsigned(offset)) + (accessize) > uint64_t(len))
-
 static_assert(MAX_BUFFER_SIZE <= INT_MAX, "current implementation can't handle a larger limit");
 
 #if defined(LUAU_BIG_ENDIAN)

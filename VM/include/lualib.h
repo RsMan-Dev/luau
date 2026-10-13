@@ -154,6 +154,25 @@ LUALIB_API int luaopen_vector(lua_State* L);
 #define LUA_INTLIBNAME "integer"
 LUALIB_API int luaopen_integer(lua_State* L);
 
+#define LUA_GPULIBNAME "gpu"
+LUALIB_API int luaopen_gpu(lua_State* L);
+
+// hooks used by the gpu library to run kernels on a GPU; without a backend, gpu.dispatch runs kernels in the VM
+typedef struct lua_GpuBackend
+{
+    void* context;
+
+    // runs the function at stack index fnidx for invocations 0..n-1 with nargs buffers starting at stack index argidx
+    // returns 1 if the dispatch ran on the GPU, 0 if it must run in the VM instead
+    int (*dispatch)(void* context, lua_State* L, int fnidx, int n, int argidx, int nargs);
+
+    // pushes a string explaining why the function at stack index fnidx can't run on the GPU, or nil if it can
+    void (*status)(void* context, lua_State* L, int fnidx);
+} lua_GpuBackend;
+
+// installs the backend (which must outlive the state) or removes it if NULL
+LUALIB_API void lua_setgpubackend(lua_State* L, const lua_GpuBackend* backend);
+
 // open all builtin libraries
 LUALIB_API void luaL_openlibs(lua_State* L);
 
