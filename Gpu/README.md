@@ -70,20 +70,59 @@ Inside `@gpu` functions:
 Not supported (the function then runs in the VM): tables, strings, closures and upvalues other than numeric constants,
 multiple return values, generic `for`, 8/16-bit and f64 buffer accesses.
 
+## Tooling
+
+Like the `integer` library, the feature is split between two flags, off by default in the libraries (the Luau command
+line tools turn `Luau*` flags on by default):
+
+- `LuauGpuKernels` (language): the parser accepts `@gpu`, and the `GpuKernel` lint runs
+- `LuauGpuLibrary` (runtime): `luaL_openlibs` opens the `gpu` library
+- with both, the type checker knows the `gpu` library
+
+The `GpuKernel` lint reports `@gpu` functions that will run in the VM, with the reason and the location of the
+unsupported code:
+
+```
+selftest.luau(223,15): GpuKernel: @gpu function 'usesTable' will run in the VM: tables are not supported on the GPU
+```
+
+Functions called by other `@gpu` functions are helpers; their unsupported code is reported through the kernels that
+call them.
+
+Since `luau` has the `gpu` library without a GPU backend, scripts written for `luau-gpu` also run there, in the VM.
+
+## Embedding
+
+The translator (`Luau.Gpu`) only depends on `Luau.Ast` and is always built. A host that wants GPU dispatches links
+`Luau.Gpu.Vulkan`, enables both flags (or calls `luaopen_gpu`), and registers each chunk before running it:
+
+```cpp
+std::string error;
+auto backend = Luau::Gpu::VulkanBackend::create(error); // nullptr if there is no usable device
+backend->setFallbackHandler([](const std::string& message) { fprintf(stderr, "%s\n", message.c_str()); });
+backend->load(chunkname, source.data(), source.size()); // chunkname as passed to luau_load
+backend->install(L);
+```
+
+Any other backend can implement `lua_GpuBackend` (`lualib.h`) and install it with `lua_setgpubackend`.
+
 ## Layout
 
 - `Ast`: the `@gpu` attribute
 - `VM/src/lgpulib.cpp`: the `gpu` library, the VM implementation and the `lua_GpuBackend` hooks (`lualib.h`)
-- `Gpu/src/GpuTranslate.cpp`: translates `@gpu` functions from the AST to GLSL compute shaders
-- `Gpu/src/GpuVulkan.cpp`: Vulkan backend; keeps a device copy of each buffer, uploads only buffers whose contents
+- `Gpu/src/GpuTranslate.cpp`: translates `@gpu` functions from the AST to GLSL compute shaders (`Luau.Gpu`)
+- `Analysis`: `gpu` type definitions and the `GpuKernel` lint
+- `Gpu/src/GpuVulkan.cpp`: Vulkan backend (`Luau.Gpu.Vulkan`); keeps a device copy of each buffer, uploads only buffers whose contents
   changed and downloads only buffers the kernel writes
 - `Gpu/cli/Main.cpp`: `luau-gpu`, a host that runs a script with the backend and a small window library (SDL2)
 - `Gpu/examples/selftest.luau`: runs kernels on the GPU and in the VM and compares the results
 - `Gpu/examples/rasterizer.luau`: a software rasterizer drawing a 1M triangle model in real time
+- `tests/GpuTranslate.test.cpp`: translator tests that don't need a GPU (part of `Luau.UnitTest`)
 
 ## Building
 
-The GPU parts are behind `LUAU_BUILD_GPU` (off by default) and need Vulkan, shaderc and SDL2. On NixOS,
+The Vulkan backend and `luau-gpu` are behind `LUAU_BUILD_GPU` (off by default) and need Vulkan, shaderc and SDL2;
+the translator, lint and tests build everywhere, with CMake or the Makefile. On NixOS,
 `Gpu/shell.nix` provides them:
 
 ```sh
@@ -103,5 +142,6 @@ On an RTX 4080, the rasterizer draws 1M triangles at 1280x720 in about 5 ms per 
 - Every dispatch is synchronous and copies the buffers it writes back to the CPU; chaining dispatches without round
   trips needs data that stays on the GPU between dispatches.
 - Kernels are translated from source when the host loads a chunk (`VulkanBackend::load`), and matched to compiled
-  functions by chunk name and line.
+  functions by chunk name and line; two `@gpu` functions starting on the same line can't be told apart and stay in
+  the VM.
 - Tools built on the upstream parser (luau-lsp, StyLua, selene) report `@gpu` as an invalid attribute.
