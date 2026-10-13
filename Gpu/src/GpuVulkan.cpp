@@ -10,6 +10,7 @@
 
 #include <string.h>
 
+#include <chrono>
 #include <list>
 #include <mutex>
 #include <unordered_map>
@@ -361,14 +362,17 @@ bool VulkanBackend::Impl::init(std::string& error)
     VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VK_CHECK(vkCreateFence(device, &fci, nullptr, &fence));
 
-    // the status word is small and rarely written, so it lives in host memory the GPU writes to directly
+    // the status words are read by every invocation and written by the host while a dispatch runs, so they live in device
+    // memory the host can map when there is some (resizable BAR), and in host memory otherwise
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bci.size = 4;
+    bci.size = 12;
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     VK_CHECK(vkCreateBuffer(device, &bci, nullptr, &status.device));
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(device, status.device, &req);
-    int type = findMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+    int type = findMemory(
+        req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+    );
     if (type < 0)
     {
         error = "no host visible memory";
@@ -379,7 +383,7 @@ bool VulkanBackend::Impl::init(std::string& error)
     mai.memoryTypeIndex = type;
     VK_CHECK(vkAllocateMemory(device, &mai, nullptr, &status.deviceMemory));
     VK_CHECK(vkBindBufferMemory(device, status.device, status.deviceMemory, 0));
-    VK_CHECK(vkMapMemory(device, status.deviceMemory, 0, 4, 0, &status.mapped));
+    VK_CHECK(vkMapMemory(device, status.deviceMemory, 0, 12, 0, &status.mapped));
 
     hooks.context = this;
     hooks.dispatch = [](void* context, lua_State* L, const lua_GpuStep* steps, int nsteps, int outputs, int changed)
@@ -1138,16 +1142,43 @@ void VulkanBackend::Impl::record(const lua_GpuStep* steps, int nsteps, bool batc
 // runs the recorded commands; a timeout or a device error disables the backend
 std::string VulkanBackend::Impl::submit()
 {
-    *(volatile uint32_t*)status.mapped = 0;
+    volatile uint32_t* words = static_cast<volatile uint32_t*>(status.mapped);
+    words[0] = 0;
+    words[1] = 0;
+    words[2] = 0;
 
     VkSubmitInfo info = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     info.commandBufferCount = 1;
     info.pCommandBuffers = &commandBuffer;
     vkResetFences(device, 1, &fence);
 
+    // a dispatch still running abortMs after it started is asked to stop, which its loops check, and then completes with an
+    // error status; time spent waiting for other work on the GPU doesn't count, which the third word tells
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point submitted = Clock::now(), started = {};
+    bool running = false;
+
     VkResult res = vkQueueSubmit(queue, 1, &info, fence);
-    if (res == VK_SUCCESS)
-        res = vkWaitForFences(device, 1, &fence, VK_TRUE, uint64_t(options.timeoutMs) * 1000000);
+    while (res == VK_SUCCESS)
+    {
+        res = vkWaitForFences(device, 1, &fence, VK_TRUE, 1000000);
+        if (res != VK_TIMEOUT)
+            break;
+
+        Clock::time_point now = Clock::now();
+        if (!running && words[2] != 0)
+        {
+            running = true;
+            started = now;
+        }
+
+        if (running && words[1] == 0 && now - started > std::chrono::milliseconds(options.abortMs))
+            words[1] = 1;
+
+        if (now - submitted > std::chrono::milliseconds(options.timeoutMs))
+            break;
+        res = VK_SUCCESS;
+    }
 
     if (res == VK_SUCCESS)
         return "";

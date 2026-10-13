@@ -1145,7 +1145,8 @@ struct GlslLowering
         }
         case IrCmd::INTERRUPT:
             // native code checks for interrupts here, at every loop iteration and before returning
-            line("if (pc.budget != 0u && ++l_steps > pc.budget) { l_fail(); return; }");
+            // and every 256 iterations, whether the host asked a dispatch that runs for too long to stop
+            line("if ((++l_steps > pc.budget && pc.budget != 0u) || ((l_steps & 255u) == 0u && st.stop != 0)) { l_fail(); return; }");
             break;
         case IrCmd::RETURN:
             line("return;");
@@ -1462,7 +1463,10 @@ struct GlslLowering
         for (int i = 0; i < buffers; i++)
             glsl += "layout(std430, set = 0, binding = " + std::to_string(i) + ") buffer B" + std::to_string(i) + " { uint d[]; } b" +
                     std::to_string(i) + ";\n";
-        glsl += "layout(std430, set = 0, binding = " + std::to_string(buffers) + ") buffer BS { uint err; } st;\n";
+        // 'stop' is an int so that the block doesn't have the structure of the result of umulExtended, which SPIR-V would make
+        // the same type and SPIRV-Cross would then declare with the block's name
+        glsl += "layout(std430, set = 0, binding = " + std::to_string(buffers) +
+                ") coherent volatile buffer BS { uint err; int stop; uint started; } st;\n";
         glsl += "layout(push_constant) uniform PC { uint n; uint budget; uint len[" + std::to_string(kGpuMaxBuffers) + "]; } pc;\n";
         glsl += kPrelude;
 
@@ -1494,7 +1498,9 @@ struct GlslLowering
         glsl += "void main()\n{\n";
         glsl +=
             "    uint gid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * " + std::to_string(kGpuWorkgroupSize) + "u;\n";
-        glsl += "    if (gid >= pc.n) return;\n    l_kernel(int(gid));\n}\n";
+        // invocations that start after the host asked the dispatch to stop give up at once
+        glsl += "    if (gid >= pc.n) return;\n    if (gid == 0u) st.started = 1u;\n    if (st.stop != 0) { l_fail(); return; }\n"
+                "    l_kernel(int(gid));\n}\n";
 
         return true;
     }

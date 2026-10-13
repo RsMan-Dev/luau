@@ -33,7 +33,11 @@ struct VulkanOptions
     // loop iterations allowed per invocation before the dispatch is discarded and rerun in the VM, 0 for no limit
     uint32_t loopBudget = 1u << 24;
 
-    // a dispatch that takes longer disables the backend, since the device can't be trusted afterwards
+    // a dispatch that runs for longer is asked to stop: its loops give up, and the VM reruns it; counted from when the
+    // dispatch starts on the GPU, so that waiting for other work on the device doesn't count
+    uint32_t abortMs = 100;
+
+    // a dispatch that takes longer, even after being asked to stop, disables the backend, since the device can't be trusted
     uint32_t timeoutMs = 5000;
 
     // uses the minimum limits guaranteed by Vulkan instead of the device's, to behave like low-end mobile devices

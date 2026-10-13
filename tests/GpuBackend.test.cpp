@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -762,6 +763,46 @@ assert(buffer.readu32(b, 4) == 0xfffffff1)
     DispatchStats stats = backend->stats();
     CHECK(stats.gpuDispatches == 1);
     CHECK(stats.fallbacks == 0);
+}
+
+TEST_CASE("a_runaway_dispatch_gives_the_gpu_back_quickly")
+{
+    // no loop budget: only the request to stop bounds the GPU time
+    VulkanOptions options;
+    options.loopBudget = 0;
+    std::unique_ptr<VulkanBackend> backend = createBackend(options);
+    if (!backend)
+        return;
+
+    const char* source = R"(
+@gpu
+local function spin(i: number, out: buffer)
+    local n = 0
+    while true do
+        n += 1
+        buffer.writeu32(out, (i % 64) * 4, n)
+    end
+end
+
+gpu.dispatch(spin, 1000000, buffer.create(256))
+)";
+
+    // the GPU attempt stops shortly after abortMs, then the VM reruns the dispatch and the host's interrupt stops it
+    auto start = std::chrono::steady_clock::now();
+    CHECK(run(*backend, source, 1000).find("script timed out") != std::string::npos);
+    double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+
+    MESSAGE("runaway dispatch and VM rerun took " << seconds * 1000 << " ms");
+    CHECK(seconds < 0.25);
+    DispatchStats stats = backend->stats();
+    CHECK(stats.fallbacks == 1);
+
+    // the backend is still usable
+    CHECK(run(*backend, std::string(kSquare) + R"(
+local b = buffer.create(16)
+gpu.dispatch(square, 4, b)
+assert(buffer.readu32(b, 12) == 9 and gpu.status(square) == "gpu")
+)") == "");
 }
 
 TEST_CASE("kernels_keep_nan_infinities_and_signed_zeros")

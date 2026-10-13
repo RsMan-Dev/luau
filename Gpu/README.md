@@ -60,8 +60,10 @@ A kernel can only touch the buffers it is given, and a dispatch either completes
 - every buffer access and atomic is bounds and alignment checked against the real buffer size; a bad access, an
   integer division by zero, `INT_MIN // -1` or another operation that is undefined on the GPU sets the status word, the
   GPU results are discarded and the VM reruns the dispatch, raising the error Luau would
-- every loop iteration counts against a per-invocation budget (`VulkanOptions::loopBudget`, 2^24 by default); a kernel
-  that runs away is discarded the same way, and in the VM the host's interrupt callback applies as for any script
+- a dispatch that runs for more than `VulkanOptions::abortMs` (100 ms by default, counted from when it starts on the GPU)
+  is asked to stop: invocations that start afterwards give up at once and loops within 256 iterations, so a runaway kernel
+  gives the GPU back quickly; it is then discarded like an error, and in the VM the host's interrupt callback applies as for
+  any script. Loops also count against a per-invocation budget (`VulkanOptions::loopBudget`, 2^24 by default)
 - generated identifiers never come from user names, so nothing in a script can inject code or clash with reserved words
   of GLSL, GLSL ES, MSL or HLSL
 - the GPU path is all or nothing: translation, GLSL to SPIR-V compilation, SPIR-V validation, pipeline creation, device

@@ -79,7 +79,7 @@ return scale
     REQUIRE_MESSAGE(kernel.reason.empty(), kernel.reason);
     CHECK(kernel.result == CodeGenCompilationResult::Success);
     CHECK(kernel.bufferWritten == std::vector<bool>{false, true});
-    CHECK(contains(kernel.glsl, "layout(std430, set = 0, binding = 2) buffer BS { uint err; } st;"));
+    CHECK(contains(kernel.glsl, "layout(std430, set = 0, binding = 2) coherent volatile buffer BS { uint err; int stop; uint started; } st;"));
     CHECK(contains(kernel.glsl, "uint budget;"));
 
     // offsets computed from the invocation index stay exact integers
