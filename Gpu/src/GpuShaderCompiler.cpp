@@ -48,7 +48,9 @@ bool ShaderCompiler::compileSpirv(const std::string& glsl, const std::string& na
     }
 
     shaderc_compile_options_t options = shaderc_compile_options_initialize();
-    shaderc_compile_options_set_optimization_level(options, shaderc_optimization_level_performance);
+    // the SPIR-V optimizer is left out: it crashes on some valid shaders (folding of nested float multiplications and
+    // divisions), and drivers optimize the SPIR-V they receive anyway
+    shaderc_compile_options_set_optimization_level(options, shaderc_optimization_level_zero);
     shaderc_compile_options_set_target_env(options, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_0);
     shaderc_compile_options_set_target_spirv(options, shaderc_spirv_version_1_0);
     // keeps names, which the OpenGL ES output needs to find its uniforms

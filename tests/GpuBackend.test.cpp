@@ -732,6 +732,33 @@ end
     CHECK_MESSAGE(backend->stats().gpuDispatches == 200, fallback);
 }
 
+TEST_CASE("kernels_that_crashed_the_spirv_optimizer_run_on_the_gpu")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // folding nested float multiplications and divisions crashed the SPIR-V optimizer, which is no longer used
+    CHECK(run(*backend, R"(
+@gpu
+local function k(i: number, src: buffer, out: buffer)
+    local s = buffer.readf32(src, 0)
+    local r = vector.create(s, s, s)
+    local w0 = (r * -2) / (vector.create(1, -2, 0.5) * r)
+    buffer.writef32(out, i * 4, w0.x + w0.y + w0.z)
+end
+
+local src, gpuOut, vmOut = buffer.create(4), buffer.create(16), buffer.create(16)
+buffer.writef32(src, 0, 3)
+gpu.dispatch(k, 4, src, gpuOut)
+assert(gpu.status(k) == "gpu")
+for i = 0, 3 do k(i, src, vmOut) end
+assert(buffer.readf32(gpuOut, 12) == buffer.readf32(vmOut, 12), buffer.readf32(gpuOut, 12))
+)") == "");
+
+    CHECK(backend->stats().gpuDispatches == 1);
+}
+
 TEST_CASE("collected_buffers_and_functions_release_what_the_backend_holds_for_them")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();
