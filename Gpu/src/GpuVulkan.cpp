@@ -113,6 +113,7 @@ struct VulkanBackend::Impl
 
     std::map<std::pair<std::string, int>, KernelEntry> kernels;
     std::unordered_map<const void*, BufferEntry> buffers;
+    uint64_t cachedBytes = 0;
 
     lua_GpuBackend hooks = {};
     std::function<void(const std::string&)> fallbackHandler;
@@ -127,6 +128,7 @@ struct VulkanBackend::Impl
     void destroyBuffer(BufferEntry& entry);
     void destroyPipeline(KernelEntry& entry);
     BufferEntry* bufferFor(const void* data, size_t size);
+    bool evictLeastRecent();
     void evict();
 
     std::string buildPipeline(KernelEntry& entry, const Kernel& kernel);
@@ -288,7 +290,7 @@ bool VulkanBackend::Impl::init(std::string& error)
 
         KernelEntry* entry = self->lookup(L, fnidx);
         if (!entry)
-            lua_pushstring(L, "function is not marked @gpu or its chunk wasn't registered with the GPU backend");
+            lua_pushstring(L, "function is not marked @gpu, or its chunk wasn't registered with the GPU backend from the same source");
         else if (!entry->reason.empty())
             lua_pushstring(L, entry->reason.c_str());
         else if (!self->disabledReason.empty())
@@ -350,7 +352,10 @@ bool VulkanBackend::Impl::createBuffer(BufferEntry& entry, bool deviceLocal)
     bci.size = entry.deviceSize;
     bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | (deviceLocal ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT : 0);
     if (vkCreateBuffer(device, &bci, nullptr, &buffer) != VK_SUCCESS)
+    {
+        buffer = VK_NULL_HANDLE;
         return false;
+    }
 
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(device, buffer, &req);
@@ -369,7 +374,14 @@ bool VulkanBackend::Impl::createBuffer(BufferEntry& entry, bool deviceLocal)
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = type;
     if (vkAllocateMemory(device, &mai, nullptr, &mem) != VK_SUCCESS)
+    {
+        mem = VK_NULL_HANDLE;
         return false;
+    }
+
+    if (deviceLocal)
+        cachedBytes += entry.deviceSize;
+
     if (vkBindBufferMemory(device, buffer, mem, 0) != VK_SUCCESS)
         return false;
 
@@ -378,6 +390,8 @@ bool VulkanBackend::Impl::createBuffer(BufferEntry& entry, bool deviceLocal)
 
 void VulkanBackend::Impl::destroyBuffer(BufferEntry& entry)
 {
+    if (entry.deviceMemory)
+        cachedBytes -= entry.deviceSize;
     if (entry.mapped)
         vkUnmapMemory(device, entry.stagingMemory);
     vkDestroyBuffer(device, entry.device, nullptr);
@@ -414,7 +428,22 @@ BufferEntry* VulkanBackend::Impl::bufferFor(const void* data, size_t size)
         entry.size = size;
         entry.deviceSize = size == 0 ? 4 : (size + 3) & ~size_t(3);
 
-        if (!createBuffer(entry, true) || !createBuffer(entry, false))
+        // stay within the cache budget; if allocation still fails, free every copy this dispatch doesn't use and retry
+        while (cachedBytes + entry.deviceSize > options.cacheBytes && evictLeastRecent())
+        {
+        }
+
+        bool created = createBuffer(entry, true) && createBuffer(entry, false);
+        if (!created)
+        {
+            destroyBuffer(entry);
+            while (evictLeastRecent())
+            {
+            }
+            created = createBuffer(entry, true) && createBuffer(entry, false);
+        }
+
+        if (!created)
         {
             destroyBuffer(entry);
             return nullptr;
@@ -425,6 +454,24 @@ BufferEntry* VulkanBackend::Impl::bufferFor(const void* data, size_t size)
 
     it->second.lastUsed = dispatchCounter;
     return &it->second;
+}
+
+// frees the least recently used copy that the current dispatch doesn't use
+bool VulkanBackend::Impl::evictLeastRecent()
+{
+    auto victim = buffers.end();
+    for (auto it = buffers.begin(); it != buffers.end(); ++it)
+    {
+        if (it->second.lastUsed != dispatchCounter && (victim == buffers.end() || it->second.lastUsed < victim->second.lastUsed))
+            victim = it;
+    }
+
+    if (victim == buffers.end())
+        return false;
+
+    destroyBuffer(victim->second);
+    buffers.erase(victim);
+    return true;
 }
 
 void VulkanBackend::Impl::evict()
@@ -509,14 +556,22 @@ KernelEntry* VulkanBackend::Impl::lookup(lua_State* L, int fnidx)
 {
     lua_pushvalue(L, fnidx);
     lua_Debug ar = {};
-    int ok = lua_getinfo(L, -1, "s", &ar);
+    int ok = lua_getinfo(L, -1, "sa", &ar);
     lua_pop(L, 1);
 
     if (!ok || !ar.source || ar.linedefined <= 0)
         return nullptr;
 
     auto it = kernels.find({ar.source, ar.linedefined});
-    return it == kernels.end() ? nullptr : &it->second;
+    if (it == kernels.end())
+        return nullptr;
+
+    // kernels are found by line, so a function compiled from another source than the one registered must not run the shader;
+    // kernels that run in the VM anyway keep reporting their own reason
+    if (it->second.reason.empty() && (ar.isvararg || size_t(ar.nparams) != it->second.written.size() + 1))
+        return nullptr;
+
+    return &it->second;
 }
 
 int VulkanBackend::Impl::dispatch(lua_State* L, int fnidx, int n, int argidx, int nargs)
@@ -531,9 +586,17 @@ int VulkanBackend::Impl::dispatch(lua_State* L, int fnidx, int n, int argidx, in
         handler = fallbackHandler;
     }
 
-    // outside of the lock, so the handler can use the backend
+    // outside of the lock, so the handler can use the backend; it only reports, so its failures don't affect the dispatch
     if (!fallback.empty() && handler)
-        handler(fallback);
+    {
+        try
+        {
+            handler(fallback);
+        }
+        catch (...)
+        {
+        }
+    }
 
     return result;
 }
@@ -613,7 +676,7 @@ std::string VulkanBackend::Impl::prepare(
         size_t len = 0;
         void* data = lua_tobuffer(L, argidx + int(i), &len);
 
-        if (len > limits.storageRange)
+        if (((uint64_t(len) + 3) & ~uint64_t(3)) > limits.storageRange)
             return "a buffer of " + std::to_string(len) + " bytes exceeds the device's storage buffer range of " +
                    std::to_string(limits.storageRange) + " bytes";
 
@@ -805,18 +868,32 @@ void VulkanBackend::loadKernels(const std::string& chunkname, std::vector<Kernel
 {
     std::lock_guard<std::mutex> lock(impl->mutex);
 
+    // reloading a chunk replaces all of its kernels, so that a function now at the line of a former kernel doesn't run it;
+    // pipelines a hung device may still use are leaked rather than destroyed
+    for (auto it = impl->kernels.begin(); it != impl->kernels.end();)
+    {
+        if (it->first.first == chunkname)
+        {
+            if (!impl->deviceBusy)
+                impl->destroyPipeline(it->second);
+            it = impl->kernels.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
     for (Kernel& kernel : kernels)
     {
-        // reloading a chunk replaces its kernels
         KernelEntry& entry = impl->kernels[{chunkname, kernel.line}];
-        impl->destroyPipeline(entry);
-        entry = KernelEntry();
-
         entry.name = kernel.name;
         entry.written = kernel.bufferWritten;
 
         if (!kernel.reason.empty())
             entry.reason = "line " + std::to_string(kernel.reasonLocation.begin.line + 1) + ": " + kernel.reason;
+        else if (!impl->disabledReason.empty())
+            entry.reason = impl->disabledReason;
         else
             entry.reason = impl->buildPipeline(entry, kernel);
 
@@ -843,7 +920,9 @@ const std::string& VulkanBackend::deviceName() const
 DispatchStats VulkanBackend::stats() const
 {
     std::lock_guard<std::mutex> lock(impl->mutex);
-    return impl->stats;
+    DispatchStats s = impl->stats;
+    s.cachedBytes = impl->cachedBytes;
+    return s;
 }
 
 } // namespace Gpu

@@ -118,6 +118,9 @@ static int window_open(lua_State* L)
     int h = luaL_checkinteger(L, 2);
     const char* title = luaL_optstring(L, 3, "luau-gpu");
 
+    luaL_argcheck(L, w > 0 && w <= 16384, 1, "width must be between 1 and 16384");
+    luaL_argcheck(L, h > 0 && h <= 16384, 2, "height must be between 1 and 16384");
+
     if (gWindow.window)
         luaL_error(L, "window is already open");
 
@@ -135,6 +138,8 @@ static int window_open(lua_State* L)
         luaL_error(L, "SDL_CreateRenderer failed: %s", SDL_GetError());
 
     gWindow.texture = SDL_CreateTexture(gWindow.renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
+    if (!gWindow.texture)
+        luaL_error(L, "SDL_CreateTexture failed: %s", SDL_GetError());
     gWindow.width = w;
     gWindow.height = h;
     return 0;

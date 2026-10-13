@@ -24,6 +24,7 @@ struct DispatchStats
     uint64_t fallbacks = 0; // GPU runs that hit an error and were rerun in the VM
     uint64_t uploadedBytes = 0;
     uint64_t downloadedBytes = 0;
+    uint64_t cachedBytes = 0; // device memory currently holding copies of Luau buffers
 };
 
 struct VulkanOptions
@@ -36,6 +37,10 @@ struct VulkanOptions
 
     // uses the minimum limits guaranteed by Vulkan instead of the device's, to behave like low-end mobile devices
     bool minimumLimits = false;
+
+    // device memory kept for copies of Luau buffers (host memory of the same size mirrors it); the least recently used
+    // copies are freed beyond it, but a single dispatch can use more
+    uint64_t cacheBytes = uint64_t(1) << 30;
 };
 
 // runs gpu.dispatch on a Vulkan device; kernels come from chunks registered with load()
@@ -53,13 +58,14 @@ public:
     // translates the @gpu functions of a chunk that is (or will be) loaded with this chunk name and builds their pipelines
     std::vector<Kernel> load(const std::string& chunkname, const char* source, size_t size);
 
-    // registers already translated kernels; their reason is set when they can't run on this device
+    // registers already translated kernels, replacing every kernel previously registered for the chunk; their reason is set
+    // when they can't run on this device
     void loadKernels(const std::string& chunkname, std::vector<Kernel>& kernels);
 
     // makes gpu.dispatch use this backend in the given state; the backend must outlive the state
     void install(lua_State* L);
 
-    // called once per kernel the first time it is dispatched but has to run in the VM
+    // called once per kernel the first time it is dispatched but has to run in the VM; exceptions it throws are ignored
     void setFallbackHandler(std::function<void(const std::string& message)> handler);
 
     const std::string& deviceName() const;
