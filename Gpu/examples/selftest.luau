@@ -236,6 +236,196 @@ do
     assert(buffer.readu32(b, 0) == 1)
 end
 
+---------------------------------------------------------------------------------------------------
+-- safety: whatever a kernel does, the dispatch either completes on the GPU with the VM's results, or is discarded and
+-- rerun in the VM
+
+-- runs fn on both paths and checks the results are identical; 'path' is "gpu" if the dispatch must complete on the GPU,
+-- "fallback" if it must be discarded and rerun in the VM; with 'alias', the first buffer is passed twice
+local function samePaths(name: string, path: "gpu" | "fallback", fn, n: number, inputs: { buffer }, alias: boolean?)
+    local onGpu, inVm = {}, {}
+    for i, b in inputs do
+        onGpu[i] = copy(b)
+        inVm[i] = copy(b)
+    end
+
+    local function args(list: { buffer })
+        if alias then
+            return list[1], list[1], table.unpack(list, 2)
+        end
+        return table.unpack(list)
+    end
+
+    local before = host.stats()
+    host.setgpu(true)
+    local okGpu, errGpu = pcall(gpu.dispatch, fn, n, args(onGpu))
+    local after = host.stats()
+    host.setgpu(false)
+    local okVm, errVm = pcall(gpu.dispatch, fn, n, args(inVm))
+    host.setgpu(true)
+
+    local ranOnGpu = after.gpuDispatches > before.gpuDispatches
+    local fellBack = after.fallbacks > before.fallbacks
+
+    local problem = nil
+    if path == "gpu" and not ranOnGpu then
+        problem = "did not complete on the GPU"
+    elseif path == "fallback" and not fellBack then
+        problem = "was not discarded and rerun in the VM"
+    elseif okGpu ~= okVm then
+        problem = `errors differ: {tostring(errGpu)} / {tostring(errVm)}`
+    else
+        for i = 1, #inputs do
+            if buffer.tostring(onGpu[i]) ~= buffer.tostring(inVm[i]) then
+                problem = `buffer {i} differs from the VM`
+                break
+            end
+        end
+    end
+
+    if problem then
+        print(string.format("FAIL %-22s %s", name, problem))
+        failures += 1
+    else
+        print(string.format("ok   %s", name))
+    end
+end
+
+-- a loop far longer than a frame: the GPU stops once the loop budget is spent and the VM reruns the dispatch
+-- (2^28 iterations per invocation; the VM finishes in under a second, and so does the GPU when there is no budget)
+local LONG_LOOP = 268435456
+
+@gpu
+local function longLoop(i: number, out: buffer)
+    local acc = 0
+    for k = 1, LONG_LOOP do
+        acc += 1
+    end
+    buffer.writei32(out, i * 4, acc + i)
+end
+samePaths("long loop is discarded", "fallback", longLoop, 4, { buffer.create(16) })
+
+-- integer edge cases where 32-bit GPU arithmetic and Luau's doubles could disagree
+@gpu
+local function integerEdges(i: number, src: buffer, out: buffer)
+    local a = buffer.readi32(src, 0) -- -2147483648
+    local m = buffer.readi32(src, 4) -- -1
+    local s = buffer.readi32(src, 8) -- -7
+    local o = i * 48
+    buffer.writei32(out, o, s // 2)
+    buffer.writei32(out, o + 4, s % 2)
+    buffer.writei32(out, o + 8, 7 % (s + 5))
+    buffer.writei32(out, o + 12, s % (s + 5))
+    buffer.writei32(out, o + 16, math.floor(s / 14))
+    buffer.writei32(out, o + 20, math.round(s / 2.8))
+    buffer.writeu32(out, o + 24, bit32.rshift(0xffffffff, 32 + i))
+    buffer.writeu32(out, o + 28, bit32.lshift(1, 31))
+    buffer.writeu32(out, o + 32, bit32.arshift(0x80000000, 31))
+    buffer.writeu32(out, o + 36, bit32.lshift(1, 40))
+    buffer.writei32(out, o + 40, a - m)
+    buffer.writei32(out, o + 44, a + s * m)
+end
+do
+    local src = buffer.create(12)
+    buffer.writei32(src, 0, -2147483648)
+    buffer.writei32(src, 4, -1)
+    buffer.writei32(src, 8, -7)
+    samePaths("integer edge cases", "gpu", integerEdges, 2, { src, buffer.create(96) })
+end
+
+-- -2147483648 // -1 doesn't fit 32 bits: the GPU must not produce its own answer
+@gpu
+local function overflowingDivision(i: number, src: buffer, out: buffer)
+    buffer.writef32(out, i * 4, buffer.readi32(src, 0) // buffer.readi32(src, 4))
+end
+do
+    local src = buffer.create(8)
+    buffer.writei32(src, 0, -2147483648)
+    buffer.writei32(src, 4, -1)
+    samePaths("INT_MIN // -1", "fallback", overflowingDivision, 1, { src, buffer.create(4) })
+end
+
+-- the same buffer passed twice, read through one parameter and written through the other
+@gpu
+local function inPlace(i: number, src: buffer, dst: buffer)
+    buffer.writeu32(dst, i * 4, buffer.readu32(src, i * 4) * 2 + 1)
+end
+samePaths("aliased buffers", "gpu", inPlace, N, { filled(N, function(i) return i end) }, true)
+
+-- zero length buffers: unused ones are fine, any access to them is out of bounds
+@gpu
+local function ignoresEmpty(i: number, empty: buffer, out: buffer)
+    buffer.writeu32(out, i * 4, buffer.len(empty) + i)
+end
+samePaths("unused empty buffer", "gpu", ignoresEmpty, 8, { buffer.create(0), buffer.create(32) })
+
+@gpu
+local function readsEmpty(i: number, empty: buffer, out: buffer)
+    buffer.writeu32(out, i * 4, buffer.readu32(empty, 0))
+end
+samePaths("reading an empty buffer", "fallback", readsEmpty, 8, { buffer.create(0), buffer.create(32) })
+
+-- kernels can't reach anything but their buffers: other APIs keep them in the VM
+@gpu
+local function dispatchesAgain(i: number, out: buffer)
+    gpu.dispatch(dispatchesAgain, 0, out)
+end
+
+@gpu
+local function readsClock(i: number, out: buffer)
+    buffer.writef32(out, i * 4, os.clock())
+end
+
+@gpu
+local function prints(i: number, out: buffer)
+    print(i)
+end
+
+for _, case in
+    {
+        { dispatchesAgain, "gpu.dispatch can't be called from a kernel" },
+        { readsClock, "os.clock is not supported" },
+        { prints, "'print' is not a @gpu function" },
+    }
+do
+    local where, why = gpu.status(case[1])
+    if where == "vm" and why and string.find(why, case[2], 1, true) then
+        print("ok   stays in the VM: " .. why)
+    else
+        print("FAIL expected the VM", where, why)
+        failures += 1
+    end
+end
+do
+    -- and still runs there
+    local out = buffer.create(4)
+    gpu.dispatch(readsClock, 1, out)
+    assert(buffer.readf32(out, 0) > 0)
+end
+
+-- 50M invocations contending on 1024 counters, checked against the exact counts (the VM would take seconds)
+@gpu
+local function manyInvocations(i: number, bins: buffer)
+    gpu.atomicadd(bins, (i % 1024) * 4, 1)
+end
+do
+    local INVOCATIONS = 50_000_000
+    local bins = buffer.create(1024 * 4)
+    local before = host.stats().gpuDispatches
+    gpu.dispatch(manyInvocations, INVOCATIONS, bins)
+    local ok = host.stats().gpuDispatches > before
+    for b = 0, 1023 do
+        local expected = INVOCATIONS // 1024 + (if b < INVOCATIONS % 1024 then 1 else 0)
+        ok = ok and buffer.readu32(bins, b * 4) == expected
+    end
+    if ok then
+        print("ok   50M invocations")
+    else
+        print("FAIL 50M invocations")
+        failures += 1
+    end
+end
+
 print(if failures == 0 then "all tests passed" else `{failures} failures`)
 if failures > 0 then
     error("selftest failed")
