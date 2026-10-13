@@ -1453,7 +1453,11 @@ struct GlslLowering
         }
 
         std::string& glsl = build.glsl;
-        glsl = "#version 450\nlayout(local_size_x = " + std::to_string(kGpuWorkgroupSize) + ") in;\n\n";
+        // like the VM, shaders keep NaN, infinities and signed zeros (SignedZeroInfNanPreserve for 32-bit floats)
+        glsl = "#version 450\n#extension GL_EXT_spirv_intrinsics : require\n"
+               "spirv_execution_mode(extensions = [\"SPV_KHR_float_controls\"], capabilities = [4466], 4461, 32);\n"
+               "layout(local_size_x = " +
+               std::to_string(kGpuWorkgroupSize) + ") in;\n\n";
 
         for (int i = 0; i < buffers; i++)
             glsl += "layout(std430, set = 0, binding = " + std::to_string(i) + ") buffer B" + std::to_string(i) + " { uint d[]; } b" +

@@ -185,7 +185,16 @@ bool ShaderCompiler::crossCompile(const std::vector<uint32_t>& spirv, ShaderTarg
 
     ok = ok && spvc_compiler_install_compiler_options(compiler, options) == SPVC_SUCCESS && spvc_compiler_compile(compiler, &result) == SPVC_SUCCESS;
 
-    if (ok)
+    // kernels keep NaN, infinities and signed zeros like the VM, which these languages can't declare in the shader
+    if (ok && (target == ShaderTarget::MslIos || target == ShaderTarget::MslMacos))
+        source = std::string("// compile with MTLMathModeSafe (fast math off) to keep NaN, infinities and signed zeros\n") + result;
+    else if (ok && target == ShaderTarget::GlslEs)
+    {
+        // after #version, which must come first in GLSL ES
+        source = result;
+        source.insert(source.find('\n') + 1, "// OpenGL ES can't be asked to keep NaN, infinities and signed zeros; results with them may differ\n");
+    }
+    else if (ok)
         source = result;
     else
         error = std::string("SPIRV-Cross failed: ") + spvc_context_get_last_error_string(context);

@@ -764,6 +764,52 @@ assert(buffer.readu32(b, 4) == 0xfffffff1)
     CHECK(stats.fallbacks == 0);
 }
 
+TEST_CASE("kernels_keep_nan_infinities_and_signed_zeros")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // without SignedZeroInfNanPreserve, drivers fold 0/0 to 0, x/x to 1, inf-inf to 0 and -0+0 to -0
+    CHECK(run(*backend, R"(
+@gpu
+local function k(i: number, src: buffer, out: buffer)
+    local z = buffer.readf32(src, 0)
+    local nz = buffer.readf32(src, 4)
+    local b = buffer.readi32(src, 8)
+    local h = buffer.readf32(src, 12)
+    buffer.writef32(out, 0, 0 / b)
+    buffer.writef32(out, 4, z / z)
+    buffer.writef32(out, 8, 1 / z)
+    buffer.writef32(out, 12, 1 / nz)
+    buffer.writef32(out, 16, h - h)
+    buffer.writef32(out, 20, h * 0)
+    buffer.writef32(out, 24, nz + 0)
+    buffer.writef32(out, 28, -z)
+    buffer.writeu32(out, 32, if z / z ~= z / z then 1 else 0)
+    buffer.writef32(out, 36, math.huge - math.huge)
+end
+
+local src = buffer.create(16)
+buffer.writef32(src, 4, -0.0)
+buffer.writef32(src, 12, math.huge)
+
+local gpuOut, vmOut = buffer.create(40), buffer.create(40)
+gpu.dispatch(k, 1, src, gpuOut)
+assert(gpu.status(k) == "gpu")
+k(0, src, vmOut)
+
+for o = 0, 36, 4 do
+    local x, y = buffer.readf32(gpuOut, o), buffer.readf32(vmOut, o)
+    -- NaN payloads are platform specific, in the VM too
+    local same = if x ~= x then y ~= y else buffer.readu32(gpuOut, o) == buffer.readu32(vmOut, o)
+    assert(same, `offset {o}: gpu {x} vm {y}`)
+end
+)") == "");
+
+    CHECK(backend->stats().gpuDispatches == 1);
+}
+
 TEST_CASE("kernels_that_crashed_the_spirv_optimizer_run_on_the_gpu")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();
@@ -855,18 +901,20 @@ for k = 1, n do
     maxCached = math.max(maxCached, (backendstats()))
 end
 
-local function mean(a, b)
-    local s = 0
+-- medians, since other processes using the GPU make single dispatches slow at random
+local function median(a, b)
+    local t = table.create(b - a + 1)
     for k = a, b do
-        s += times[k]
+        table.insert(t, times[k])
     end
-    return s / (b - a + 1)
+    table.sort(t)
+    return t[#t // 2 + 1]
 end
 
 -- what is alive between two collections, not everything that was ever dispatched
 assert(maxCached < 101 * 72 * 1024, `{maxCached}`)
 -- the cost of a dispatch doesn't grow with the number of buffers that came before
-local first, last = mean(1, n // 10), mean(n - n // 10 + 1, n)
+local first, last = median(1, n // 10), median(n - n // 10 + 1, n)
 assert(last < first * 1.5 + 0.0002, `{first} {last}`)
 )") == "");
 }

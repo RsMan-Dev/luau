@@ -173,6 +173,8 @@ struct VulkanBackend::Impl
 
     // set when the device stopped responding or was lost; every dispatch then runs in the VM
     std::string disabledReason;
+    // set when the device can't run kernels with the VM's float semantics
+    std::string floatReason;
     bool deviceBusy = false;
 
     // kernels are shared by every function lowering to the same shader; rejected functions share one per reason
@@ -240,7 +242,8 @@ bool VulkanBackend::Impl::init(std::string& error)
 {
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "Luau";
-    app.apiVersion = VK_API_VERSION_1_0;
+    // 1.1 to query the float controls of the device, which shaders need to keep NaN, infinities and signed zeros
+    app.apiVersion = VK_API_VERSION_1_1;
 
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
@@ -302,6 +305,34 @@ bool VulkanBackend::Impl::init(std::string& error)
 
     vkGetPhysicalDeviceMemoryProperties(physical, &memory);
 
+    // shaders declare SignedZeroInfNanPreserve for 32-bit floats; without it, kernels can't compute what the VM does
+    std::vector<const char*> extensions;
+    {
+        uint32_t extensionCount = 0;
+        vkEnumerateDeviceExtensionProperties(physical, nullptr, &extensionCount, nullptr);
+        std::vector<VkExtensionProperties> available(extensionCount);
+        vkEnumerateDeviceExtensionProperties(physical, nullptr, &extensionCount, available.data());
+
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(physical, &props);
+
+        bool core = props.apiVersion >= VK_API_VERSION_1_2;
+        bool listed = false;
+        for (const VkExtensionProperties& e : available)
+            listed |= strcmp(e.extensionName, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME) == 0;
+
+        VkPhysicalDeviceFloatControlsPropertiesKHR floatControls = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 props2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        props2.pNext = &floatControls;
+        if (core || listed)
+            vkGetPhysicalDeviceProperties2(physical, &props2);
+
+        if (!core && listed)
+            extensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
+        if (!(core || listed) || !floatControls.shaderSignedZeroInfNanPreserveFloat32)
+            floatReason = "the device can't keep NaN, infinities and signed zeros in shaders";
+    }
+
     float priority = 1.0f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = queueFamily;
@@ -311,6 +342,8 @@ bool VulkanBackend::Impl::init(std::string& error)
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = uint32_t(extensions.size());
+    dci.ppEnabledExtensionNames = extensions.data();
     VK_CHECK(vkCreateDevice(physical, &dci, nullptr, &device));
     vkGetDeviceQueue(device, queueFamily, 0, &queue);
 
@@ -637,6 +670,8 @@ KernelEntry* VulkanBackend::Impl::kernelFor(lua_State* L, int fn)
 
         if (!kernel.reason.empty())
             entry->reason = kernel.reason;
+        else if (!floatReason.empty())
+            entry->reason = floatReason;
         else if (!disabledReason.empty())
             entry->reason = disabledReason;
         else
