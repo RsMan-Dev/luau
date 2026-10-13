@@ -949,8 +949,11 @@ struct Compiler
         Function* fi = functions.find(func);
         LUAU_ASSERT(fi);
 
+        // GPU code has no calls, so gpu functions are inlined whenever possible
+        bool gpu = func->hasAttribute(AstAttr::Type::Gpu);
+
         // make sure we have enough register space
-        if (regTop > 128 || fi->stackSize > 32)
+        if (regTop > 128 || (fi->stackSize > 32 && !gpu))
         {
             bytecode.addDebugRemark("inlining failed: high register pressure");
             return false;
@@ -1017,7 +1020,7 @@ struct Compiler
         int threshold = thresholdBase * inlineProfit / 100;
         bool isIife = unwrapExprOfType<AstExprFunction>(expr->func) != nullptr;
 
-        if (inlinedCost > threshold && !isIife)
+        if (inlinedCost > threshold && !isIife && !gpu)
         {
             bytecode.addDebugRemark("inlining failed: too expensive (cost %d, profit %.2fx)", inlinedCost, double(inlineProfit) / 100);
             return false;
