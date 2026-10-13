@@ -23,6 +23,7 @@
 #include <string>
 
 LUAU_FASTFLAG(LuauGpuKernels)
+LUAU_FASTFLAG(LuauGpuLibrary)
 
 static std::unique_ptr<Luau::Gpu::VulkanBackend> gBackend;
 
@@ -221,6 +222,7 @@ static int traceback(lua_State* L)
 int main(int argc, char** argv)
 {
     FFlag::LuauGpuKernels.value = true;
+    FFlag::LuauGpuLibrary.value = true;
 
     bool useGpu = true;
     bool useNative = true;
@@ -260,8 +262,6 @@ int main(int argc, char** argv)
 
     lua_State* L = luaL_newstate();
     luaL_openlibs(L);
-    luaopen_gpu(L);
-    lua_pop(L, 1);
     luaL_register(L, "host", hostlib);
     lua_pop(L, 1);
     luaL_register(L, "window", windowlib);

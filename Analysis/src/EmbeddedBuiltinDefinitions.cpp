@@ -3,6 +3,8 @@
 
 LUAU_FASTFLAG(LuauIntegerLibrary)
 LUAU_FASTFLAG(LuauIntegerType2)
+LUAU_FASTFLAG(LuauGpuKernels)
+LUAU_FASTFLAG(LuauGpuLibrary)
 LUAU_FASTFLAG(LuauAllowGlobalDeclarationToBeCalledClass)
 LUAU_FASTFLAG(DebugLuauExactTableTypes)
 LUAU_FASTFLAG(DebugLuauUserDefinedClasses)
@@ -488,6 +490,18 @@ declare class: {
 }
 )CLASS_SRC";
 
+static const char* const kBuiltinDefinitionGpuSrc = R"BUILTIN_SRC(
+
+declare gpu: {
+    dispatch: <A...>(kernel: (index: number, A...) -> (), count: number, A...) -> (),
+    status: (kernel: (...any) -> ...any) -> (string, string?),
+    atomicadd: @checked (b: buffer, offset: number, value: number) -> number,
+    atomicmin: @checked (b: buffer, offset: number, value: number) -> number,
+    atomicmax: @checked (b: buffer, offset: number, value: number) -> number,
+}
+
+)BUILTIN_SRC";
+
 std::string getBuiltinDefinitionSource()
 {
     std::string result = FFlag::LuauRemoveLoadstringFromBuiltinDefinitions ? kBuiltinDefinitionBaseSrc : kBuiltinDefinitionBaseSrc_DEPRECATED;
@@ -513,6 +527,9 @@ std::string getBuiltinDefinitionSource()
         result += kBuiltinDefinitionBufferSrc_NOINTEGER;
 
     result += kBuiltinDefinitionVectorSrc;
+
+    if (FFlag::LuauGpuKernels && FFlag::LuauGpuLibrary)
+        result += kBuiltinDefinitionGpuSrc;
 
     if (FFlag::LuauIntegerType2 && FFlag::LuauIntegerLibrary)
     {

@@ -6,6 +6,8 @@
 
 #include <string.h>
 
+LUAU_FASTFLAGVARIABLE(LuauGpuLibrary)
+
 #define GPU_BACKEND_KEY "_GPUBACKEND"
 
 static const lua_GpuBackend* getbackend(lua_State* L)
