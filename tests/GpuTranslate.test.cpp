@@ -6,6 +6,8 @@
 
 #include "doctest.h"
 
+#include <regex>
+#include <set>
 #include <string>
 
 using namespace Luau;
@@ -44,6 +46,28 @@ std::string reasonFor(const std::string& body)
 bool contains(const std::string& s, const std::string& part)
 {
     return s.find(part) != std::string::npos;
+}
+
+bool matches(const std::string& s, const char* pattern)
+{
+    return std::regex_search(s, std::regex(pattern));
+}
+
+size_t count(const std::string& s, const std::string& part)
+{
+    size_t result = 0;
+    for (size_t pos = s.find(part); pos != std::string::npos; pos = s.find(part, pos + 1))
+        result++;
+    return result;
+}
+
+std::set<std::string> identifiers(const std::string& glsl)
+{
+    std::set<std::string> result;
+    std::regex word("[A-Za-z_][A-Za-z0-9_]*");
+    for (auto it = std::sregex_iterator(glsl.begin(), glsl.end(), word); it != std::sregex_iterator(); ++it)
+        result.insert(it->str());
+    return result;
 }
 
 } // namespace
@@ -105,10 +129,10 @@ end
 
     REQUIRE(kernels.size() == 1);
     const std::string& glsl = kernels[0].glsl;
-    CHECK(contains(glsl, "int l_offset_"));
-    CHECK(contains(glsl, "float l_half_"));
-    CHECK(contains(glsl, "uint l_bits_"));
-    CHECK(contains(glsl, "float l_mixed_"));
+    CHECK(matches(glsl, "int l[0-9]+_offset "));
+    CHECK(matches(glsl, "float l[0-9]+_half "));
+    CHECK(matches(glsl, "uint l[0-9]+_bits "));
+    CHECK(matches(glsl, "float l[0-9]+_mixed "));
 }
 
 TEST_CASE("helpers_are_specialized_per_argument_types")
@@ -245,6 +269,142 @@ local a, b = @gpu function(i: number) end, @gpu function(i: number) end
     REQUIRE(kernels.size() == 2);
     CHECK(contains(kernels[0].reason, "same line"));
     CHECK(contains(kernels[1].reason, "same line"));
+}
+
+TEST_CASE("type_inference_that_does_not_settle_is_rejected")
+{
+    // each pass of inference widens one more variable to float, against the order of the statements
+    auto chain = [](int length)
+    {
+        std::string source = "@gpu\nlocal function k(i: number, b: buffer)\n";
+        for (int v = 1; v <= length; ++v)
+            source += "    local x" + std::to_string(v) + " = 0\n";
+        source += "    while i > 0 do\n";
+        for (int v = length; v > 1; --v)
+            source += "        x" + std::to_string(v) + " = x" + std::to_string(v - 1) + "\n";
+        source += "        x1 = 0.5\n        i -= 1\n    end\n";
+        source += "    buffer.writef32(b, 0, x" + std::to_string(length) + ")\nend\n";
+        return translate(source);
+    };
+
+    std::vector<Gpu::Kernel> settles = chain(8);
+    REQUIRE(settles.size() == 1);
+    CHECK(settles[0].reason.empty());
+    CHECK(matches(settles[0].glsl, "float l[0-9]+_x8 "));
+
+    std::vector<Gpu::Kernel> unsettled = chain(40);
+    REQUIRE(unsettled.size() == 1);
+    CHECK(unsettled[0].reason == "types of the function's values don't settle after 32 passes");
+    CHECK(unsettled[0].glsl.empty());
+}
+
+TEST_CASE("every_loop_spends_the_loop_budget")
+{
+    std::vector<Gpu::Kernel> kernels = translate(R"(
+@gpu
+local function sum(n: number)
+    local s = 0
+    for j = 1, n do
+        s += j
+    end
+    return s
+end
+
+@gpu
+local function k(i: number, b: buffer)
+    local x = i
+    while x > 0 do
+        x -= 1
+    end
+    repeat
+        x += 1
+    until x > 10
+    for j = 1, i, x do
+        x += sum(j)
+    end
+    buffer.writeu32(b, 0, x)
+end
+)");
+
+    const Gpu::Kernel& k = kernelNamed(kernels, "k");
+    REQUIRE(k.reason.empty());
+
+    // while, repeat and for in the kernel, and the for loop in the helper
+    CHECK(count(k.glsl, "if (l_spent()) break;") == 4);
+    CHECK(contains(k.glsl, "pc.budget"));
+
+    // a step that isn't a constant can be zero, which must not loop forever
+    CHECK(matches(k.glsl, "if \\(fs[0-9]+ == int\\(0\\)\\) l_fail\\(\\);"));
+}
+
+TEST_CASE("operations_undefined_in_glsl_are_guarded")
+{
+    std::vector<Gpu::Kernel> kernels = translate(R"(
+@gpu
+local function k(i: number, b: buffer)
+    local n = buffer.readi32(b, 0)
+    buffer.writei32(b, 0, n // i + n % i + math.abs(n) + math.clamp(n, i, 10))
+    buffer.writeu32(b, 4, bit32.extract(n, i, 3))
+    buffer.writef32(b, 8, math.sqrt(n) + math.log(n) + math.asin(n) + math.acos(n) + math.atan2(n, i) + math.clamp(0.5, n, i))
+    buffer.writeu32(b, 12, -0.5)
+end
+)");
+
+    REQUIRE(kernels.size() == 1);
+    const std::string& glsl = kernels[0].glsl;
+    REQUIRE(kernels[0].reason.empty());
+
+    // INT_MIN // -1 overflows
+    CHECK(contains(glsl, "b == -1 && a == int(0x80000000u)"));
+    CHECK(contains(glsl, "l_idiv("));
+    CHECK(contains(glsl, "l_imod("));
+    CHECK(contains(glsl, "l_iabs("));
+    CHECK(count(glsl, "l_clamp(") >= 3 + 2);
+    CHECK(contains(glsl, "l_extract("));
+    CHECK(count(glsl, "bitfieldExtract(") == 1); // only inside l_extract
+    for (const char* fn : {"l_sqrt(", "l_log(", "l_asin(", "l_acos(", "l_atan2("})
+        CHECK(contains(glsl, fn));
+
+    // float to uint goes through int, since negative floats can't be converted to uint
+    CHECK(contains(glsl, "uint(int("));
+    CHECK(!matches(glsl, "uint\\(float"));
+}
+
+TEST_CASE("generated_identifiers_are_safe_in_every_shading_language")
+{
+    std::vector<Gpu::Kernel> kernels = translate(R"(
+@gpu
+local function half__(device: number)
+    local kernel = device * 2
+    return kernel
+end
+
+@gpu
+local function k(i: number, b: buffer)
+    local a__b = i
+    local gl_x = 1
+    local _ = 2
+    local constant, sample, out, threadgroup = 1, 2, 3, 4
+    buffer.writeu32(b, 0, half__(a__b + gl_x + _ + constant + sample + out + threadgroup))
+end
+)");
+
+    const Gpu::Kernel& k = kernelNamed(kernels, "k");
+    REQUIRE(k.reason.empty());
+
+    std::set<std::string> ids = identifiers(k.glsl);
+    for (const char* name : {"half__", "device", "kernel", "a__b", "gl_x", "_", "constant", "sample", "out", "threadgroup"})
+        CHECK_MESSAGE(ids.count(name) == 0, name);
+
+    for (const std::string& id : ids)
+    {
+        CHECK_MESSAGE(!contains(id, "__"), id);
+        CHECK_MESSAGE((id.rfind("gl_", 0) != 0 || id == "gl_GlobalInvocationID" || id == "gl_NumWorkGroups"), id);
+    }
+
+    // names stay readable
+    CHECK(matches(k.glsl, "h[0-9]+_half\\("));
+    CHECK(matches(k.glsl, "int l[0-9]+_a_b "));
 }
 
 TEST_CASE("source_without_the_flag_does_not_parse")

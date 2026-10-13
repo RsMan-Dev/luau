@@ -128,8 +128,37 @@ Val convert(const Location& location, const Val& v, Ty to)
     if (!isNumeric(v.type.ty) || !isNumeric(to))
         fail(location, "can't convert between these GPU types");
 
+    // float to uint is undefined for negative values, so it goes through int like Luau's unsigned conversions
+    if (v.type.ty == Ty::Float && to == Ty::UInt)
+        return Val{"uint(int(" + v.code + "))", type(to)};
+
     const char* ctor = to == Ty::Int ? "int" : to == Ty::UInt ? "uint" : "float";
     return Val{std::string(ctor) + "(" + v.code + ")", type(to)};
+}
+
+// generated identifiers are a letter, a number and the alphanumeric parts of the Luau name, which can't be reserved
+// or invalid in GLSL, GLSL ES, MSL or HLSL (no keywords, no double underscores, no 'gl_' prefix)
+std::string safeName(char prefix, size_t index, const char* name)
+{
+    std::string result = prefix + std::to_string(index);
+
+    bool separator = true;
+    for (const char* c = name; c && *c && result.size() < 32; ++c)
+    {
+        if ((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9'))
+        {
+            if (separator)
+                result += '_';
+            result += *c;
+            separator = false;
+        }
+        else
+        {
+            separator = true;
+        }
+    }
+
+    return result;
 }
 
 // common type of two numbers for arithmetic and comparisons
@@ -292,6 +321,8 @@ struct ChunkInfo : AstVisitor
 
 struct Translator;
 
+constexpr int kMaxInferencePasses = 32;
+
 // translates one function body for a given set of argument types
 struct FunctionEmitter
 {
@@ -319,6 +350,40 @@ struct FunctionEmitter
         , func(func)
         , isKernel(isKernel)
     {
+    }
+
+    // translates the body until the inferred types stop changing; 'prologue' declares the parameters on every pass
+    template<typename F>
+    void run(F&& prologue)
+    {
+        for (int pass = 0; pass < kMaxInferencePasses; ++pass)
+        {
+            changed = false;
+            out.clear();
+            unresolvedLocals.clear();
+            tempCounter = 0;
+
+            prologue();
+            block(func->body);
+
+            if (!changed)
+            {
+                if (!unresolvedLocals.empty())
+                    fail(func->location, "local '" + std::string(unresolvedLocals[0]->name.value) + "' is never assigned a value");
+                return;
+            }
+        }
+
+        fail(func->location, "types of the function's values don't settle after " + std::to_string(kMaxInferencePasses) + " passes");
+    }
+
+    // every loop iteration starts by spending the invocation's loop budget, so that no kernel can run forever
+    void loopBody(AstStatBlock* body, bool isRepeat)
+    {
+        line("if (l_spent()) break;");
+        loops.push_back(isRepeat);
+        block(body);
+        loops.pop_back();
     }
 
     void line(const std::string& s)
@@ -412,7 +477,7 @@ struct Translator
         }
 
         HelperSpec& spec = helpers[key];
-        spec.name = "h" + std::to_string(helperCounter++) + "_" + (func->debugname.value ? func->debugname.value : "anon");
+        spec.name = safeName('h', helperCounter++, func->debugname.value);
 
         if (func->vararg)
             fail(func->location, "variadic functions are not supported on the GPU");
@@ -424,43 +489,34 @@ struct Translator
         std::vector<std::string> params;
         std::vector<std::string> copies;
 
-        for (int iter = 0; iter < 32; ++iter)
-        {
-            em.changed = false;
-            em.out.clear();
-            em.unresolvedLocals.clear();
-            params.clear();
-            copies.clear();
-
-            for (size_t i = 0; i < func->args.size; ++i)
+        em.run(
+            [&]
             {
-                AstLocal* arg = func->args.data[i];
-                Type t = i < argTypes.size() ? argTypes[i] : type(Ty::Unknown);
-                if (t.ty == Ty::Unknown)
-                    fail(func->location, "helper function called with too few arguments");
+                params.clear();
+                copies.clear();
 
-                em.declareType(func->location, arg, t);
+                for (size_t i = 0; i < func->args.size; ++i)
+                {
+                    AstLocal* arg = func->args.data[i];
+                    Type t = i < argTypes.size() ? argTypes[i] : type(Ty::Unknown);
+                    if (t.ty == Ty::Unknown)
+                        fail(func->location, "helper function called with too few arguments");
 
-                if (t.ty == Ty::Buffer)
-                    continue;
+                    em.declareType(func->location, arg, t);
 
-                std::string pname = "p" + std::to_string(i);
-                params.push_back(glslType(func->location, t) + " " + pname);
-                Val pv{pname, t};
-                copies.push_back(
-                    glslType(func->location, em.localTypes[arg]) + " " + em.nameOf(arg) + " = " +
-                    convert(func->location, pv, em.localTypes[arg].ty).code + ";"
-                );
+                    if (t.ty == Ty::Buffer)
+                        continue;
+
+                    // parameters are copied to locals, which assignments in the body can widen
+                    std::string pname = "p" + std::to_string(i);
+                    Type local = em.localTypes[arg];
+                    params.push_back(glslType(func->location, t) + " " + pname);
+                    copies.push_back(
+                        glslType(func->location, local) + " " + em.nameOf(arg) + " = " + convert(func->location, Val{pname, t}, local.ty).code + ";"
+                    );
+                }
             }
-
-            em.block(func->body);
-
-            if (!em.changed)
-                break;
-        }
-
-        if (!em.unresolvedLocals.empty())
-            fail(func->location, "local '" + std::string(em.unresolvedLocals[0]->name.value) + "' is never assigned a value");
+        );
 
         Type ret = em.returnType.ty == Ty::Unknown ? type(Ty::Void) : em.returnType;
 
@@ -491,7 +547,7 @@ std::string FunctionEmitter::nameOf(AstLocal* local)
     if (it != localNames.end())
         return it->second;
 
-    std::string name = "l_" + std::string(local->name.value) + "_" + std::to_string(localNames.size());
+    std::string name = safeName('l', localNames.size(), local->name.value);
     localNames[local] = name;
     return name;
 }
@@ -654,6 +710,23 @@ Val FunctionEmitter::expr(AstExpr* node)
     fail(node->location, "expression is not supported on the GPU");
 }
 
+const char* infixOperator(AstExprBinary::Op op)
+{
+    switch (op)
+    {
+    case AstExprBinary::Add:
+        return " + ";
+    case AstExprBinary::Sub:
+        return " - ";
+    case AstExprBinary::Mul:
+        return " * ";
+    case AstExprBinary::Div:
+        return " / ";
+    default:
+        return nullptr;
+    }
+}
+
 Val FunctionEmitter::binary(AstExprBinary* node)
 {
     Val a = expr(node->left);
@@ -712,21 +785,12 @@ Val FunctionEmitter::binary(AstExprBinary* node)
         if (b.type.ty != Ty::Vec)
             b = convert(loc, b, Ty::Float);
 
-        switch (node->op)
-        {
-        case AstExprBinary::Add:
-            return Val{"(" + a.code + " + " + b.code + ")", type(Ty::Vec)};
-        case AstExprBinary::Sub:
-            return Val{"(" + a.code + " - " + b.code + ")", type(Ty::Vec)};
-        case AstExprBinary::Mul:
-            return Val{"(" + a.code + " * " + b.code + ")", type(Ty::Vec)};
-        case AstExprBinary::Div:
-            return Val{"(" + a.code + " / " + b.code + ")", type(Ty::Vec)};
-        case AstExprBinary::FloorDiv:
+        if (const char* op = infixOperator(node->op))
+            return Val{"(" + a.code + op + b.code + ")", type(Ty::Vec)};
+        if (node->op == AstExprBinary::FloorDiv)
             return Val{"floor(" + a.code + " / " + b.code + ")", type(Ty::Vec)};
-        default:
-            fail(loc, "operator is not supported on vectors");
-        }
+
+        fail(loc, "operator is not supported on vectors");
     }
 
     if (!isNumeric(a.type.ty) || !isNumeric(b.type.ty))
@@ -736,16 +800,11 @@ Val FunctionEmitter::binary(AstExprBinary* node)
     a = convert(loc, a, t);
     b = convert(loc, b, t);
 
+    if (const char* op = infixOperator(node->op))
+        return Val{"(" + a.code + op + b.code + ")", type(t)};
+
     switch (node->op)
     {
-    case AstExprBinary::Add:
-        return Val{"(" + a.code + " + " + b.code + ")", type(t)};
-    case AstExprBinary::Sub:
-        return Val{"(" + a.code + " - " + b.code + ")", type(t)};
-    case AstExprBinary::Mul:
-        return Val{"(" + a.code + " * " + b.code + ")", type(t)};
-    case AstExprBinary::Div:
-        return Val{"(" + a.code + " / " + b.code + ")", type(t)};
     case AstExprBinary::Pow:
         return Val{"l_pow(" + a.code + ", " + b.code + ")", type(t)};
     case AstExprBinary::FloorDiv:
@@ -863,9 +922,7 @@ Val FunctionEmitter::builtin(AstExprCall* node, const std::string& lib, const st
             else if (name == "writei32")
                 value = "uint(" + num(a[2], Ty::Int) + ")";
             else
-                value = num(a[2], a[2].type.ty == Ty::Float ? Ty::Float : Ty::UInt);
-            if (name == "writeu32" && a[2].type.ty == Ty::Float)
-                value = "uint(int(" + value + "))";
+                value = num(a[2], Ty::UInt);
 
             return Val{"l_wr" + std::to_string(b) + "(" + offsetArg(a[1]) + ", " + value + ")", type(Ty::Void)};
         }
@@ -886,7 +943,7 @@ Val FunctionEmitter::builtin(AstExprCall* node, const std::string& lib, const st
             int b = bufferArg(a[0]);
             tr.atomics.insert({name, b});
             tr.writtenBindings.insert(b);
-            std::string value = a[2].type.ty == Ty::Float ? "uint(int(" + num(a[2], Ty::Float) + "))" : num(a[2], Ty::UInt);
+            std::string value = num(a[2], Ty::UInt);
             return Val{"l_" + name + std::to_string(b) + "(" + offsetArg(a[1]) + ", " + value + ")", type(Ty::UInt)};
         }
 
@@ -914,7 +971,7 @@ Val FunctionEmitter::builtin(AstExprCall* node, const std::string& lib, const st
             auto a = args(node, 1);
             if (a[0].type.ty == Ty::UInt)
                 return a[0];
-            return Val{"abs(" + num(a[0], a[0].type.ty) + ")", a[0].type};
+            return Val{std::string(a[0].type.ty == Ty::Int ? "l_iabs(" : "abs(") + a[0].code + ")", a[0].type};
         }
         if (name == "sign")
         {
@@ -942,25 +999,24 @@ Val FunctionEmitter::builtin(AstExprCall* node, const std::string& lib, const st
             auto a = args(node, 3);
             Ty t = commonNumeric(a[0], a[1]);
             t = commonNumeric(Val{"", type(t)}, a[2]);
-            return Val{"clamp(" + num(a[0], t) + ", " + num(a[1], t) + ", " + num(a[2], t) + ")", type(t)};
+            return Val{"l_clamp(" + num(a[0], t) + ", " + num(a[1], t) + ", " + num(a[2], t) + ")", type(t)};
         }
-        if (name == "sqrt" || name == "sin" || name == "cos" || name == "tan" || name == "asin" || name == "acos" || name == "exp")
+        // functions whose GLSL result is undefined for some inputs go through helpers that return what Luau does
+        if (name == "sin" || name == "cos" || name == "tan" || name == "atan" || name == "exp")
             return unaryFloat(name.c_str());
-        if (name == "atan")
-            return unaryFloat("atan");
+        if (name == "sqrt" || name == "asin" || name == "acos" || name == "log")
+        {
+            if (name == "log" && node->args.size == 2)
+            {
+                auto a = args(node, 2);
+                return Val{"(l_log(" + num(a[0], Ty::Float) + ") / l_log(" + num(a[1], Ty::Float) + "))", type(Ty::Float)};
+            }
+            return unaryFloat(("l_" + name).c_str());
+        }
         if (name == "atan2")
         {
             auto a = args(node, 2);
-            return Val{"atan(" + num(a[0], Ty::Float) + ", " + num(a[1], Ty::Float) + ")", type(Ty::Float)};
-        }
-        if (name == "log")
-        {
-            if (node->args.size == 2)
-            {
-                auto a = args(node, 2);
-                return Val{"(log(" + num(a[0], Ty::Float) + ") / log(" + num(a[1], Ty::Float) + "))", type(Ty::Float)};
-            }
-            return unaryFloat("log");
+            return Val{"l_atan2(" + num(a[0], Ty::Float) + ", " + num(a[1], Ty::Float) + ")", type(Ty::Float)};
         }
         if (name == "pow")
         {
@@ -986,8 +1042,6 @@ Val FunctionEmitter::builtin(AstExprCall* node, const std::string& lib, const st
     {
         auto u = [&](const Val& v)
         {
-            if (v.type.ty == Ty::Float)
-                return "uint(int(" + v.code + "))";
             return num(v, Ty::UInt);
         };
 
@@ -1020,7 +1074,7 @@ Val FunctionEmitter::builtin(AstExprCall* node, const std::string& lib, const st
         if (name == "extract")
         {
             auto a = args(node, 3);
-            return Val{"bitfieldExtract(" + u(a[0]) + ", int(" + u(a[1]) + "), int(" + u(a[2]) + "))", type(Ty::UInt)};
+            return Val{"l_extract(" + u(a[0]) + ", " + u(a[1]) + ", " + u(a[2]) + ")", type(Ty::UInt)};
         }
 
         fail(loc, "bit32." + name + " is not supported on the GPU");
@@ -1060,7 +1114,9 @@ Val FunctionEmitter::builtin(AstExprCall* node, const std::string& lib, const st
         if (name == "normalize")
         {
             auto a = args(node, 1);
-            return Val{"normalize(" + vec(a[0]) + ")", type(Ty::Vec)};
+            // like Luau, a zero vector normalizes to NaNs instead of GLSL's undefined result
+            std::string v = vec(a[0]);
+            return Val{"(" + v + " / length(" + v + "))", type(Ty::Vec)};
         }
         if (name == "floor" || name == "ceil" || name == "abs")
         {
@@ -1166,8 +1222,7 @@ void FunctionEmitter::stat(AstStat* node)
                 Type& t = localTypes[var];
                 if (t.ty == Ty::Unknown)
                 {
-                    // type is learned from a later assignment; the fixpoint iteration declares it on the next pass
-                    line("/* " + std::string(var->name.value) + " */");
+                    // type is learned from a later assignment; the next inference pass declares it
                     unresolvedLocals.push_back(var);
                     continue;
                 }
@@ -1250,9 +1305,7 @@ void FunctionEmitter::stat(AstStat* node)
         line("while (" + condition(w->condition).code + ")");
         line("{");
         indent++;
-        loops.push_back(false);
-        block(w->body);
-        loops.pop_back();
+        loopBody(w->body, false);
         indent--;
         line("}");
         return;
@@ -1263,9 +1316,7 @@ void FunctionEmitter::stat(AstStat* node)
         line("for (;;)");
         line("{");
         indent++;
-        loops.push_back(true);
-        block(r->body);
-        loops.pop_back();
+        loopBody(r->body, true);
         line("if (" + condition(r->condition).code + ") break;");
         indent--;
         line("}");
@@ -1299,8 +1350,13 @@ void FunctionEmitter::stat(AstStat* node)
         line(ty + " " + ve + " = " + convert(f->to->location, to, t).code + ";");
         line(ty + " " + vs + " = " + convert(f->step ? f->step->location : node->location, step, t).code + ";");
 
-        std::string cond = constantStep ? (stepValue > 0 ? vi + " <= " + ve : vi + " >= " + ve)
-                                        : "(" + vs + " > " + ty + "(0)) ? (" + vi + " <= " + ve + ") : (" + vi + " >= " + ve + ")";
+        // Luau raises an error for a zero step; the condition is false for it, so the loop doesn't run either
+        std::string cond =
+            constantStep ? (stepValue > 0 ? vi + " <= " + ve : vi + " >= " + ve)
+                         : "(" + vs + " > " + ty + "(0)) ? (" + vi + " <= " + ve + ") : (" + vs + " < " + ty + "(0) && " + vi + " >= " + ve + ")";
+
+        if (!constantStep)
+            line("if (" + vs + " == " + ty + "(0)) l_fail();");
 
         line("for (" + ty + " " + vi + " = " + convert(f->from->location, from, t).code + "; " + cond + "; " + vi + " += " + vs + ")");
         line("{");
@@ -1310,9 +1366,7 @@ void FunctionEmitter::stat(AstStat* node)
         Type vt = localTypes[f->var];
         line(glslType(node->location, vt) + " " + nameOf(f->var) + " = " + convert(node->location, Val{vi, type(t)}, vt.ty).code + ";");
 
-        loops.push_back(false);
-        block(f->body);
-        loops.pop_back();
+        loopBody(f->body, false);
 
         indent--;
         line("}");
@@ -1371,17 +1425,33 @@ void FunctionEmitter::stat(AstStat* node)
     fail(node->location, "statement is not supported on the GPU");
 }
 
+// runtime support for generated code: every operation whose GLSL result is undefined for some inputs either reports an
+// error (the dispatch then reruns in the VM) or returns what Luau does
 const char* kPrelude = R"(
+uint l_steps = 0u;
 void l_fail() { atomicOr(st.err, 1u); }
-int l_idiv(int a, int b) { if (b == 0) { l_fail(); return 0; } int q = a / b; if (q * b != a && ((a < 0) != (b < 0))) q -= 1; return q; }
-int l_imod(int a, int b) { if (b == 0) { l_fail(); return 0; } return a - l_idiv(a, b) * b; }
+bool l_spent() { l_steps++; if (pc.budget == 0u || l_steps <= pc.budget) return false; l_fail(); return true; }
+float l_nan() { return uintBitsToFloat(0x7FC00000u); }
+float l_inf() { return uintBitsToFloat(0x7F800000u); }
+int l_idiv(int a, int b) { if (b == 0 || (b == -1 && a == int(0x80000000u))) { l_fail(); return 0; } int q = a / b; if (q * b != a && ((a < 0) != (b < 0))) q -= 1; return q; }
+int l_imod(int a, int b) { return a - l_idiv(a, b) * b; }
 uint l_udiv(uint a, uint b) { if (b == 0u) { l_fail(); return 0u; } return a / b; }
 uint l_umod(uint a, uint b) { if (b == 0u) { l_fail(); return 0u; } return a % b; }
+int l_iabs(int x) { if (x == int(0x80000000u)) { l_fail(); return 0; } return abs(x); }
+int l_clamp(int x, int lo, int hi) { if (lo > hi) { l_fail(); return x; } return clamp(x, lo, hi); }
+uint l_clamp(uint x, uint lo, uint hi) { if (lo > hi) { l_fail(); return x; } return clamp(x, lo, hi); }
+float l_clamp(float x, float lo, float hi) { if (lo > hi) { l_fail(); return x; } return clamp(x, lo, hi); }
 float l_fmod(float a, float b) { return a - floor(a / b) * b; }
-float l_pow(float a, float b) { if (a < 0.0 && b == floor(b)) { float r = pow(-a, b); return mod(b, 2.0) == 1.0 ? -r : r; } return pow(a, b); }
+float l_pow(float a, float b) { if (a == 0.0) return b > 0.0 ? 0.0 : b == 0.0 ? 1.0 : l_inf(); if (a < 0.0) { if (b != floor(b)) return l_nan(); float r = pow(-a, b); return mod(b, 2.0) == 1.0 ? -r : r; } return pow(a, b); }
+float l_sqrt(float x) { return x < 0.0 ? l_nan() : sqrt(x); }
+float l_log(float x) { return x < 0.0 ? l_nan() : x == 0.0 ? -l_inf() : log(x); }
+float l_asin(float x) { return abs(x) > 1.0 ? l_nan() : asin(x); }
+float l_acos(float x) { return abs(x) > 1.0 ? l_nan() : acos(x); }
+float l_atan2(float y, float x) { return x == 0.0 && y == 0.0 ? 0.0 : atan(y, x); }
 uint l_shl(uint x, uint n) { return n >= 32u ? 0u : x << n; }
 uint l_shr(uint x, uint n) { return n >= 32u ? 0u : x >> n; }
 uint l_sar(uint x, uint n) { return uint(int(x) >> min(n, 31u)); }
+uint l_extract(uint x, uint f, uint w) { if (w == 0u || w > 32u || f > 32u - w) { l_fail(); return 0u; } return bitfieldExtract(x, int(f), int(w)); }
 int l_round(float x) { return int(sign(x) * floor(abs(x) + 0.5)); }
 bool l_bad(int off, int b) { return off < 0 || (off & 3) != 0 || uint(off) + 4u > pc.len[b]; }
 )";
@@ -1433,24 +1503,14 @@ Kernel translateKernel(ChunkInfo& info, AstExprFunction* func)
 
         size_t buffers = func->args.size - 1;
 
-        for (int iter = 0; iter < 32; ++iter)
-        {
-            em.changed = false;
-            em.out.clear();
-            em.unresolvedLocals.clear();
-
-            em.declareType(func->location, func->args.data[0], type(Ty::Int));
-            for (size_t i = 0; i < buffers; ++i)
-                em.declareType(func->location, func->args.data[i + 1], Type{Ty::Buffer, int(i)});
-
-            em.block(func->body);
-
-            if (!em.changed)
-                break;
-        }
-
-        if (!em.unresolvedLocals.empty())
-            fail(func->location, "local '" + std::string(em.unresolvedLocals[0]->name.value) + "' is never assigned a value");
+        em.run(
+            [&]
+            {
+                em.declareType(func->location, func->args.data[0], type(Ty::Int));
+                for (size_t i = 0; i < buffers; ++i)
+                    em.declareType(func->location, func->args.data[i + 1], Type{Ty::Buffer, int(i)});
+            }
+        );
 
         AstLocal* index = func->args.data[0];
         Type indexType = em.localTypes[index];
