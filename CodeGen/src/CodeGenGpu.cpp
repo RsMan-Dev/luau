@@ -1004,6 +1004,27 @@ struct GlslLowering
         case IrCmd::NOT_ANY:
             line(v + " = int(" + tag(OP_A(inst)) + " == 0u || (" + tag(OP_A(inst)) + " == 1u && " + intv(OP_B(inst)) + " == 0));");
             break;
+        case IrCmd::CMP_ANY:
+        {
+            // values of other types, or an order between values that aren't numbers, are left to the VM
+            std::string ta = tag(OP_A(inst)), tb = tag(OP_B(inst));
+            IrCondition cond = conditionOp(OP_C(inst));
+            std::string number = std::to_string(LUA_TNUMBER) + "u";
+            std::string fail = "(l_fail(), 0)";
+
+            if (cond == IrCondition::Equal)
+                line(
+                    v + " = " + ta + " != " + tb + " ? 0 : " + ta + " == " + std::to_string(LUA_TNIL) + "u ? 1 : " + ta +
+                    " == " + std::to_string(LUA_TBOOLEAN) + "u ? int(" + intv(OP_A(inst)) + " == " + intv(OP_B(inst)) + ") : " + ta +
+                    " == " + number + " ? int(" + compareNum(OP_A(inst), OP_B(inst), cond) + ") : " + fail + ";"
+                );
+            else
+                line(
+                    v + " = " + ta + " == " + number + " && " + tb + " == " + number + " ? int(" + compareNum(OP_A(inst), OP_B(inst), cond) +
+                    ") : " + fail + ";"
+                );
+            break;
+        }
         case IrCmd::CMP_INT:
             line(v + " = int(" + compare(intv(OP_A(inst)), intv(OP_B(inst)), conditionOp(OP_C(inst))) + ");");
             break;

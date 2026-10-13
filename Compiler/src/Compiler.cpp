@@ -952,8 +952,8 @@ struct Compiler
         // GPU code has no calls, so gpu functions are inlined whenever possible
         bool gpu = func->hasAttribute(AstAttr::Type::Gpu);
 
-        // make sure we have enough register space
-        if (regTop > 128 || (fi->stackSize > 32 && !gpu))
+        // make sure we have enough register space; gpu functions only need the inlined frame to fit
+        if (gpu ? regTop + fi->stackSize > 240 : regTop > 128 || fi->stackSize > 32)
         {
             bytecode.addDebugRemark("inlining failed: high register pressure");
             return false;
