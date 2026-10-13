@@ -19,6 +19,7 @@ LUAU_FASTINT(LuauParseErrorLimit)
 LUAU_DYNAMIC_FASTFLAG(DebugLuauReportReturnTypeVariadicWithTypeSuffix)
 LUAU_FASTFLAG(LuauExportValueSyntax)
 LUAU_FASTFLAG(DebugLuauNoInline)
+LUAU_FASTFLAG(LuauGpuKernels)
 LUAU_FASTFLAG(LuauIntegerType2)
 LUAU_FASTFLAG(DebugLuauUserDefinedClasses)
 LUAU_FASTFLAG(LuauAllowGlobalDeclarationToBeCalledClass)
@@ -5185,6 +5186,8 @@ void checkFirstErrorForAttributes(const std::vector<ParseError>& errors, const s
 
 TEST_CASE_FIXTURE(Fixture, "parse_gpu_attribute_on_local_function")
 {
+    ScopedFastFlag sff{FFlag::LuauGpuKernels, true};
+
     AstStatBlock* stat = parse(R"(
 @gpu
 local function kernel(i: number, b: buffer)
@@ -5202,6 +5205,19 @@ end)");
 
     checkAttribute(attributes.data[0], AstAttr::Type::Gpu, Location(Position(1, 0), Position(1, 4)));
     CHECK(statFun->func->hasAttribute(AstAttr::Type::Gpu));
+}
+
+TEST_CASE_FIXTURE(Fixture, "gpu_attribute_requires_flag")
+{
+    ScopedFastFlag sff{FFlag::LuauGpuKernels, false};
+
+    ParseResult result = tryParse(R"(
+@gpu
+local function kernel(i: number, b: buffer)
+end)");
+
+    REQUIRE_EQ(result.errors.size(), 1);
+    CHECK_EQ(result.errors[0].getMessage(), "Invalid attribute '@gpu'");
 }
 
 TEST_CASE_FIXTURE(Fixture, "parse_attribute_on_function_stat")

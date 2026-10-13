@@ -8,6 +8,8 @@
 #include "luacode.h"
 #include "luacodegen.h"
 
+#include "Luau/Common.h"
+
 #include <SDL.h>
 
 #include <stdio.h>
@@ -19,6 +21,8 @@
 #include <memory>
 #include <sstream>
 #include <string>
+
+LUAU_FASTFLAG(LuauGpuKernels)
 
 static std::unique_ptr<Luau::Gpu::VulkanBackend> gBackend;
 
@@ -216,6 +220,8 @@ static int traceback(lua_State* L)
 
 int main(int argc, char** argv)
 {
+    FFlag::LuauGpuKernels.value = true;
+
     bool useGpu = true;
     bool useNative = true;
     const char* path = nullptr;

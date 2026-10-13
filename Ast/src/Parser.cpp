@@ -28,6 +28,7 @@ LUAU_FASTFLAGVARIABLE(LuauExportValueSyntax)
 LUAU_FLAGVERSION(LuauExportValueSyntax, 5)
 
 LUAU_FASTFLAGVARIABLE(DebugLuauNoInline)
+LUAU_FASTFLAGVARIABLE(LuauGpuKernels)
 LUAU_FASTFLAGVARIABLE(DebugLuauUserDefinedClasses)
 LUAU_FASTFLAGVARIABLE(LuauAllowGlobalDeclarationToBeCalledClass)
 LUAU_FASTFLAGVARIABLE(LuauSingleTypeOptionalPackReturnsAttributeParens)
@@ -99,12 +100,12 @@ AttributeEntry kAttributeEntries[] = {
     {"checked", AstAttr::Type::Checked, {}},
     {"native", AstAttr::Type::Native, {}},
     {"deprecated", AstAttr::Type::Deprecated, deprecatedArgsValidator},
-    {"gpu", AstAttr::Type::Gpu, {}},
     {nullptr, AstAttr::Type::Checked, {}}
 };
 
-std::pair<AttributeEntry, Luau::FValue<bool>&> kDebugAttributeEntries[] = {
+std::pair<AttributeEntry, Luau::FValue<bool>&> kFlaggedAttributeEntries[] = {
     {{"debugnoinline", AstAttr::Type::DebugNoinline, {}}, FFlag::DebugLuauNoInline},
+    {{"gpu", AstAttr::Type::Gpu, {}}, FFlag::LuauGpuKernels},
 };
 
 ParseError::ParseError(const Location& location, std::string message)
@@ -1044,7 +1045,7 @@ std::optional<AstAttr::Type> Parser::validateAttribute(
         }
     }
 
-    for (const auto& [attributeEntry, fflagBool] : kDebugAttributeEntries)
+    for (const auto& [attributeEntry, fflagBool] : kFlaggedAttributeEntries)
     {
         if (fflagBool && strcmp(attributeName, attributeEntry.name) == 0)
         {
