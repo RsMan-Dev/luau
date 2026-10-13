@@ -619,6 +619,9 @@ struct Compiler
         if (func->hasNativeAttribute())
             protoflags |= LPF_NATIVE_FUNCTION;
 
+        if (func->hasAttribute(AstAttr::Type::Gpu))
+            protoflags |= LPF_NATIVE_FUNCTION | LPF_GPU_FUNCTION;
+
         if (FFlag::LuauExportValueSyntax && !exports.isEmpty() && func->functionDepth == 0)
             protoflags |= LPF_USES_EXPORT;
 
@@ -5494,7 +5497,7 @@ struct Compiler
             LUAU_ASSERT(functions.end() == std::find(functions.begin(), functions.end(), node));
             functions.push_back(node);
 
-            if (!hasNativeFunction && node->hasNativeAttribute())
+            if (!hasNativeFunction && (node->hasNativeAttribute() || node->hasAttribute(AstAttr::Type::Gpu)))
                 hasNativeFunction = true;
 
             return false;

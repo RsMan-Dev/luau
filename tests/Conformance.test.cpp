@@ -54,6 +54,7 @@ void luaC_validate(lua_State* L);
 #define lua_pushvector3(L, x, y, z) lua_pushvector(L, x, y, z)
 #endif
 
+LUAU_FASTFLAG(LuauGpuKernels)
 LUAU_FASTFLAG(DebugLuauAbortingChecks)
 LUAU_FASTFLAG(LuauBytecodeFold)
 LUAU_FASTFLAG(LuauEmitCallFeedback)
@@ -5487,6 +5488,49 @@ TEST_CASE("NativeAttribute")
 
     // We should be able to compile at least one of our functions
     CHECK_EQ(nativeStats.functionsCompiled, 2);
+}
+
+TEST_CASE("GpuAttributeIsCompiledNatively")
+{
+    if (!codegen || !luau_codegen_supported())
+        return;
+
+    ScopedFastFlag luauGpuKernels{FFlag::LuauGpuKernels, true};
+
+    // functions with the gpu attribute run as native code when they run on the CPU
+    std::string source = R"R(
+        @gpu
+        local function scale(i: number, b: buffer)
+            buffer.writef32(b, i * 4, buffer.readf32(b, i * 4) * 2)
+        end
+
+        local function other(x)
+            return x + 1
+        end)R";
+
+    StateRef globalState(luaL_newstate(), lua_close);
+    lua_State* L = globalState.get();
+
+    luau_codegen_create(L);
+
+    luaL_openlibs(L);
+    luaL_sandbox(L);
+    luaL_sandboxthread(L);
+
+    size_t bytecodeSize = 0;
+    char* bytecode = luau_compile(source.data(), source.size(), nullptr, &bytecodeSize);
+    int result = luau_load(L, "=Code", bytecode, bytecodeSize, 0);
+    free(bytecode);
+
+    REQUIRE(result == 0);
+
+    Luau::CodeGen::CompilationOptions nativeOptions{Luau::CodeGen::CodeGen_ColdFunctions};
+    Luau::CodeGen::CompilationStats nativeStats = {};
+    Luau::CodeGen::CompilationResult nativeResult = Luau::CodeGen::compile(L, -1, nativeOptions, &nativeStats);
+
+    CHECK(nativeResult.result == Luau::CodeGen::CodeGenCompilationResult::Success);
+    REQUIRE(nativeResult.protoFailures.empty());
+    CHECK_EQ(nativeStats.functionsCompiled, 1);
 }
 
 // Without nopPadding, two compilations of the same source must

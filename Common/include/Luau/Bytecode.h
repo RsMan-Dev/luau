@@ -797,6 +797,8 @@ enum LuauProtoFlag
     LPF_INLINABLE = 1 << 3,
     // top-level function uses export statements and returns the export table
     LPF_USES_EXPORT = 1 << 4,
+    // used to tag individual protos that have the gpu attribute; they are also tagged LPF_NATIVE_FUNCTION
+    LPF_GPU_FUNCTION = 1 << 5,
 };
 
 enum LuauFeedbackType
