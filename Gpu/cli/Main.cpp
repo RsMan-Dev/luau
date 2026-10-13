@@ -117,9 +117,16 @@ static int window_open(lua_State* L)
     int w = luaL_checkinteger(L, 1);
     int h = luaL_checkinteger(L, 2);
     const char* title = luaL_optstring(L, 3, "luau-gpu");
+    // the window can be shown larger than the image, which is scaled to fit
+    int scale = luaL_optinteger(L, 4, 1);
+    // "argb" (default) takes 32-bit 0xAARRGGBB words, "rgba" takes the bytes R, G, B, A as EditableImage buffers store them
+    const char* format = luaL_optstring(L, 5, "argb");
+    bool rgba = strcmp(format, "rgba") == 0;
+    luaL_argcheck(L, rgba || strcmp(format, "argb") == 0, 5, "format must be 'argb' or 'rgba'");
 
     luaL_argcheck(L, w > 0 && w <= 16384, 1, "width must be between 1 and 16384");
     luaL_argcheck(L, h > 0 && h <= 16384, 2, "height must be between 1 and 16384");
+    luaL_argcheck(L, scale >= 1 && scale <= 8 && w * scale <= 16384 && h * scale <= 16384, 4, "scale must be between 1 and 8");
 
     if (gWindow.window)
         luaL_error(L, "window is already open");
@@ -127,7 +134,8 @@ static int window_open(lua_State* L)
     if (SDL_Init(SDL_INIT_VIDEO) != 0)
         luaL_error(L, "SDL_Init failed: %s", SDL_GetError());
 
-    gWindow.window = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, SDL_WINDOW_SHOWN);
+    gWindow.window =
+        SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w * scale, h * scale, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     if (!gWindow.window)
         luaL_error(L, "SDL_CreateWindow failed: %s", SDL_GetError());
 
@@ -137,7 +145,8 @@ static int window_open(lua_State* L)
     if (!gWindow.renderer)
         luaL_error(L, "SDL_CreateRenderer failed: %s", SDL_GetError());
 
-    gWindow.texture = SDL_CreateTexture(gWindow.renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
+    gWindow.texture =
+        SDL_CreateTexture(gWindow.renderer, rgba ? SDL_PIXELFORMAT_RGBA32 : SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
     if (!gWindow.texture)
         luaL_error(L, "SDL_CreateTexture failed: %s", SDL_GetError());
     gWindow.width = w;
