@@ -13,7 +13,6 @@ LUAU_FASTFLAG(LuauExperimentalIfLocalSyntax)
 LUAU_FASTFLAG(LuauExperimentalIfLocalAnalysis)
 
 LUAU_FASTFLAG(LuauImproveDeprecatedLint)
-LUAU_FASTFLAG(LuauGpuKernels)
 
 using namespace Luau;
 
@@ -2791,41 +2790,6 @@ f(3)(4)
 
     CHECK_EQ(result.warnings[1].text, "native attribute on a function is redundant in a native module; consider removing it");
     CHECK_EQ(result.warnings[1].location, Location(Position(5, 4), Position(5, 11)));
-}
-
-TEST_CASE_FIXTURE(Fixture, "GpuKernel")
-{
-    ScopedFastFlag sff{FFlag::LuauGpuKernels, true};
-
-    LintResult result = lint(R"(
-@gpu
-local function scale(x: number)
-    return x * 2
-end
-
-@gpu
-local function good(i: number, b: buffer)
-    buffer.writef32(b, i * 4, scale(i))
-end
-
-@gpu
-local function bad(i: number, b: buffer)
-    local t = {}
-    buffer.writef32(b, i * 4, scale(i))
-end
-)");
-
-    std::vector<LintWarning> gpuWarnings;
-    for (const LintWarning& w : result.warnings)
-    {
-        if (w.code == LintWarning::Code_GpuKernel)
-            gpuWarnings.push_back(w);
-    }
-
-    // the helper is only reported through kernels that call it, and the valid kernel isn't reported
-    REQUIRE(1 == gpuWarnings.size());
-    CHECK_EQ(gpuWarnings[0].text, "@gpu function 'bad' will run in the VM: tables are not supported on the GPU");
-    CHECK_EQ(gpuWarnings[0].location, Location(Position(13, 14), Position(13, 16)));
 }
 
 TEST_CASE_FIXTURE(Fixture, "type_instantiation_lints")

@@ -2121,7 +2121,7 @@ end
 gpu.dispatch(k, "four", buffer.create(16))
 )");
 
-    LUAU_REQUIRE_ERROR_COUNT(1, result);
+    LUAU_REQUIRE_ERRORS(result);
 }
 
 TEST_SUITE_END();

@@ -96,17 +96,10 @@ target_sources(Luau.Compiler PRIVATE
     Compiler/src/ValueTracking.h
 )
 
-# Luau.Gpu Sources
-target_sources(Luau.Gpu PRIVATE
-    Gpu/include/Luau/GpuAbi.h
-    Gpu/include/Luau/GpuTranslate.h
-
-    Gpu/src/GpuTranslate.cpp
-)
-
 if(TARGET Luau.Gpu.Shaders)
     # Luau.Gpu.Shaders Sources
     target_sources(Luau.Gpu.Shaders PRIVATE
+        Gpu/include/Luau/GpuAbi.h
         Gpu/include/Luau/GpuShaderCompiler.h
 
         Gpu/src/GpuShaderCompiler.cpp
@@ -556,7 +549,6 @@ if(TARGET Luau.UnitTest)
         tests/Fixture.h
         tests/FragmentAutocomplete.test.cpp
         tests/Frontend.test.cpp
-        tests/GpuTranslate.test.cpp
         tests/Generalization.test.cpp
         tests/InsertionOrderedMap.test.cpp
         tests/IostreamOptional.h

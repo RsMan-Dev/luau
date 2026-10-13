@@ -39,7 +39,7 @@ ShaderCompiler::~ShaderCompiler()
     glslang_finalize_process();
 }
 
-bool ShaderCompiler::compileSpirv(const Kernel& kernel, std::vector<uint32_t>& spirv, std::string& error)
+bool ShaderCompiler::compileSpirv(const std::string& glsl, const std::string& name, std::vector<uint32_t>& spirv, std::string& error)
 {
     if (!impl->compiler || !impl->validator)
     {
@@ -54,9 +54,8 @@ bool ShaderCompiler::compileSpirv(const Kernel& kernel, std::vector<uint32_t>& s
     // keeps names, which the OpenGL ES output needs to find its uniforms
     shaderc_compile_options_set_generate_debug_info(options);
 
-    shaderc_compilation_result_t result = shaderc_compile_into_spv(
-        impl->compiler, kernel.glsl.data(), kernel.glsl.size(), shaderc_compute_shader, kernel.name.c_str(), "main", options
-    );
+    shaderc_compilation_result_t result =
+        shaderc_compile_into_spv(impl->compiler, glsl.data(), glsl.size(), shaderc_compute_shader, name.c_str(), "main", options);
     shaderc_compile_options_release(options);
 
     bool ok = shaderc_result_get_compilation_status(result) == shaderc_compilation_status_success;

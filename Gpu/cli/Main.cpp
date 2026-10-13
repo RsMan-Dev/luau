@@ -220,8 +220,8 @@ static const luaL_Reg windowlib[] = {
     {NULL, NULL},
 };
 
-// prints the shader of every @gpu function for a target, without running the script
-static int emit(const std::string& source, const char* target)
+// prints the shader of every @gpu function of the loaded chunk at the top of the stack for a target, without running it
+static int emit(lua_State* L, const char* target)
 {
     using Luau::Gpu::ShaderTarget;
 
@@ -253,20 +253,21 @@ static int emit(const std::string& source, const char* target)
     Luau::Gpu::ShaderCompiler compiler;
     int code = 0;
 
-    for (const Luau::Gpu::Kernel& kernel : Luau::Gpu::translate(source.data(), source.size()))
+    for (const Luau::CodeGen::GpuKernel& kernel : Luau::CodeGen::compileGpuModule(L, -1))
     {
         printf("// @gpu %s (line %d)\n", kernel.name.c_str(), kernel.line);
 
         if (!kernel.reason.empty())
         {
-            printf("// runs in the VM: line %d: %s\n\n", kernel.reasonLocation.begin.line + 1, kernel.reason.c_str());
+            printf("// runs in the VM: %s\n\n", kernel.reason.c_str());
             continue;
         }
 
         std::string output = kernel.glsl;
         std::string error;
         std::vector<uint32_t> spirv;
-        bool ok = glsl || (compiler.compileSpirv(kernel, spirv, error) && compiler.crossCompile(spirv, shaderTarget, output, error));
+        bool ok =
+            glsl || (compiler.compileSpirv(kernel.glsl, kernel.name, spirv, error) && compiler.crossCompile(spirv, shaderTarget, output, error));
 
         if (ok)
         {
@@ -335,9 +336,6 @@ int main(int argc, char** argv)
     std::string source = ss.str();
     std::string chunkname = std::string("@") + path;
 
-    if (emitTarget)
-        return emit(source, emitTarget);
-
     lua_State* L = luaL_newstate();
     luaL_openlibs(L);
     luaL_register(L, "host", hostlib);
@@ -353,7 +351,7 @@ int main(int argc, char** argv)
     }
     lua_setglobal(L, "arg");
 
-    if (useGpu)
+    if (useGpu && !emitTarget)
     {
         std::string error;
         gBackend = Luau::Gpu::VulkanBackend::create(error);
@@ -369,7 +367,6 @@ int main(int argc, char** argv)
                 fprintf(stderr, "luau-gpu: %s\n", message.c_str());
             }
         );
-        gBackend->load(chunkname, source.data(), source.size());
         gBackend->install(L);
     }
 
@@ -380,7 +377,7 @@ int main(int argc, char** argv)
     luaL_sandboxthread(T);
 
     lua_CompileOptions options = {};
-    options.optimizationLevel = 1;
+    options.optimizationLevel = 2; // helper functions of kernels must be inlined for the GPU
     options.debugLevel = 1;
     options.typeInfoLevel = 1; // lets native code use type annotations, as in the luau REPL
     size_t bytecodeSize = 0;
@@ -393,6 +390,9 @@ int main(int argc, char** argv)
         fprintf(stderr, "%s\n", lua_tostring(T, -1));
         return 1;
     }
+
+    if (emitTarget)
+        return emit(T, emitTarget);
 
     // kernels usually have no loops, so cold functions are compiled too
     if (useNative && Luau::CodeGen::isSupported())

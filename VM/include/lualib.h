@@ -157,17 +157,29 @@ LUALIB_API int luaopen_integer(lua_State* L);
 #define LUA_GPULIBNAME "gpu"
 LUALIB_API int luaopen_gpu(lua_State* L);
 
+// one step of a dispatch: the function at stack index fn runs for invocations 0..count-1 with nargs buffers from stack index args
+typedef struct lua_GpuStep
+{
+    int fn;
+    int count;
+    int args;
+    int nargs;
+    // 0 when the builtins the function uses may have been replaced, as native code checks; it must then run in the VM
+    int safe;
+} lua_GpuStep;
+
 // hooks used by the gpu library to run kernels on a GPU; without a backend, gpu.dispatch runs kernels in the VM
 typedef struct lua_GpuBackend
 {
     void* context;
 
-    // runs the function at stack index fnidx for invocations 0..n-1 with nargs buffers starting at stack index argidx
-    // returns 1 if the dispatch ran on the GPU, 0 if it must run in the VM instead
-    int (*dispatch)(void* context, lua_State* L, int fnidx, int n, int argidx, int nargs);
+    // runs the steps in order and returns 1, or returns 0 without any visible effect if the VM must run them instead
+    // outputs and changed are the stack indices of the tables of a batch call (see gpu.dispatch), or 0 for a single dispatch,
+    // whose buffers all hold their Luau contents before and after
+    int (*dispatch)(void* context, lua_State* L, const lua_GpuStep* steps, int nsteps, int outputs, int changed);
 
-    // pushes a string explaining why the function at stack index fnidx can't run on the GPU, or nil if it can
-    void (*status)(void* context, lua_State* L, int fnidx);
+    // pushes a string explaining why the function at stack index fn can't run on the GPU, or nil if it can
+    void (*status)(void* context, lua_State* L, int fn);
 } lua_GpuBackend;
 
 // installs the backend (which must outlive the state) or removes it if NULL

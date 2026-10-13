@@ -2,7 +2,6 @@
 #include "Luau/Linter.h"
 
 #include "Luau/AstQuery.h"
-#include "Luau/GpuTranslate.h"
 #include "Luau/Module.h"
 #include "Luau/Scope.h"
 #include "Luau/TypeInfer.h"
@@ -18,7 +17,6 @@ LUAU_FASTINTVARIABLE(LuauLinterRecursionLimit, 128)
 LUAU_FASTFLAG(LuauExperimentalIfLocalAnalysis)
 
 LUAU_FASTFLAGVARIABLE(LuauImproveDeprecatedLint)
-LUAU_FASTFLAG(LuauGpuKernels)
 
 namespace Luau
 {
@@ -3634,29 +3632,6 @@ private:
     }
 };
 
-// reports @gpu functions that will run in the VM because they use something the GPU translator doesn't support
-struct LintGpuKernel
-{
-    LUAU_NOINLINE static void process(LintContext& context)
-    {
-        for (const Gpu::Kernel& kernel : Gpu::translate(context.root))
-        {
-            // helpers are only translated as part of the kernels that call them, where their errors are reported
-            if (kernel.reason.empty() || kernel.isCalled)
-                continue;
-
-            emitWarning(
-                context,
-                LintWarning::Code_GpuKernel,
-                kernel.reasonLocation,
-                "@gpu function '%s' will run in the VM: %s",
-                kernel.name.c_str(),
-                kernel.reason.c_str()
-            );
-        }
-    }
-};
-
 std::vector<LintWarning> lint(
     AstStat* root,
     const AstNameTable& names,
@@ -3754,9 +3729,6 @@ std::vector<LintWarning> lint(
         if (hasNativeCommentDirective(hotcomments))
             LintRedundantNativeAttribute::process(context);
     }
-
-    if (FFlag::LuauGpuKernels && context.warningEnabled(LintWarning::Code_GpuKernel))
-        LintGpuKernel::process(context);
 
     std::sort(context.result.begin(), context.result.end(), WarningComparator());
 

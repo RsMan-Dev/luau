@@ -1,7 +1,7 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #pragma once
 
-#include "Luau/GpuTranslate.h"
+#include "Luau/GpuAbi.h"
 
 #include <stdint.h>
 
@@ -14,7 +14,7 @@ namespace Luau
 namespace Gpu
 {
 
-// Shader languages a translated kernel can be compiled to. Every target keeps the resource interface of GpuAbi.h:
+// Shader languages a kernel can be compiled to. Every target keeps the resource interface of GpuAbi.h:
 //   - SpirvVulkan: SPIR-V 1.0 for Vulkan 1.0 (desktop and Android); descriptor set 0, bindings as in GpuAbi.h
 //   - MslIos, MslMacos: Metal Shading Language 2.2 (iOS 13, macOS 10.15); the entry point is 'main0', kernel buffer i is
 //     [[buffer(i)]], the status word is [[buffer(buffers)]], push constants are a constant buffer at [[buffer(kMslPushConstantBuffer)]],
@@ -32,7 +32,7 @@ enum class ShaderTarget
 
 constexpr uint32_t kMslPushConstantBuffer = kMaxKernelBuffers + 1;
 
-// compiles the GLSL of translated kernels and cross-compiles it for other graphics APIs
+// compiles the GLSL of kernels and cross-compiles it for other graphics APIs
 class ShaderCompiler
 {
 public:
@@ -42,8 +42,8 @@ public:
     ShaderCompiler(const ShaderCompiler&) = delete;
     ShaderCompiler& operator=(const ShaderCompiler&) = delete;
 
-    // compiles the kernel's GLSL to SPIR-V and validates it for Vulkan 1.0
-    bool compileSpirv(const Kernel& kernel, std::vector<uint32_t>& spirv, std::string& error);
+    // compiles the GLSL of a kernel to SPIR-V and validates it for Vulkan 1.0; the name only appears in errors
+    bool compileSpirv(const std::string& glsl, const std::string& name, std::vector<uint32_t>& spirv, std::string& error);
 
     // translates validated SPIR-V to the source of another target (SPIR-V itself gives its disassembly). GLSL ES output is
     // validated by parsing it again; MSL can't be validated here since Apple's Metal compiler only runs on Apple platforms

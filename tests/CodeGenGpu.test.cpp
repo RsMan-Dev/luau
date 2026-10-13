@@ -48,15 +48,10 @@ static GpuKernel lowerGpu(const char* source, bool sandbox = true)
     // every shader the lowering produces must be valid for Vulkan
     if (kernel.reason.empty())
     {
-        Luau::Gpu::Kernel shader;
-        shader.name = "kernel";
-        shader.glsl = kernel.glsl;
-        shader.bufferWritten = kernel.bufferWritten;
-
         Luau::Gpu::ShaderCompiler compiler;
         std::vector<uint32_t> spirv;
         std::string error;
-        CHECK_MESSAGE(compiler.compileSpirv(shader, spirv, error), error << "\n" << kernel.glsl);
+        CHECK_MESSAGE(compiler.compileSpirv(kernel.glsl, kernel.name, spirv, error), error << "\n" << kernel.glsl);
     }
 #endif
 
@@ -199,7 +194,7 @@ local function k(i: number, b: buffer)
 end
 return k
 )");
-    CHECK(global.reason == "GET_CACHED_IMPORT is not supported on the GPU (line 4)");
+    CHECK(global.reason == "a call that wasn't inlined is not supported on the GPU (line 4)");
 
     GpuKernel call = lowerGpu(R"(
 local function fib(n: number): number
@@ -280,19 +275,9 @@ static bool runOnGpuAndVm(const char* source, int count, int size, bool floats, 
     REQUIRE(luau_load(L, "=gpu", bytecode.data(), bytecode.size(), 0) == 0);
     REQUIRE(lua_pcall(L, 0, 1, 0) == 0);
 
+    // the backend lowers the function itself on its first dispatch
     GpuKernel lowered = compileGpu(L, -1);
     REQUIRE_MESSAGE(lowered.reason.empty(), lowered.reason);
-
-    lua_Debug ar = {};
-    lua_getinfo(L, -1, "s", &ar);
-
-    std::vector<Luau::Gpu::Kernel> kernels(1);
-    kernels[0].name = "kernel";
-    kernels[0].line = ar.linedefined;
-    kernels[0].glsl = lowered.glsl;
-    kernels[0].bufferWritten = lowered.bufferWritten;
-    backend->loadKernels("=gpu", kernels);
-    REQUIRE_MESSAGE(kernels[0].reason.empty(), kernels[0].reason);
 
     // the same input for both runs: a pattern of small signed and large unsigned words
     std::vector<uint32_t> input(size / 4);

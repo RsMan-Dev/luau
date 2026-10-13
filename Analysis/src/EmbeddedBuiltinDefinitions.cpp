@@ -493,7 +493,8 @@ declare class: {
 static const char* const kBuiltinDefinitionGpuSrc = R"BUILTIN_SRC(
 
 declare gpu: {
-    dispatch: <A...>(kernel: (index: number, A...) -> (), count: number, A...) -> (),
+    dispatch: (<A...>(kernel: (index: number, A...) -> (), count: number, A...) -> ())
+        & ((steps: { { any } }, outputs: { buffer }?, changed: { buffer }?) -> ()),
     status: (kernel: (...any) -> ...any) -> (string, string?),
     atomicadd: @checked (b: buffer, offset: number, value: number) -> number,
     atomicmin: @checked (b: buffer, offset: number, value: number) -> number,

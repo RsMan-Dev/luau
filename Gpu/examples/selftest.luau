@@ -110,7 +110,7 @@ local function bits(i: number, src: buffer, out: buffer)
     local o = i * 16
     buffer.writeu32(out, o, bit32.bor(bit32.lshift(v, 3), bit32.band(v, 0xff)))
     buffer.writeu32(out, o + 4, bit32.bxor(v, 0xdeadbeef))
-    buffer.writeu32(out, o + 8, bit32.rshift(v, i % 40))
+    buffer.writeu32(out, o + 8, bit32.rshift(v, i % 32))
     buffer.writeu32(out, o + 12, bit32.bnot(v))
 end
 check("bit32 on u32", bits, N, { filled(N, function(i) return (i * 2654435761) % 4294967296 end), buffer.create(N * 16) })
@@ -225,7 +225,7 @@ local function usesTable(i: number, out: buffer)
 end
 do
     local where, why = gpu.status(usesTable)
-    if where == "vm" and why and string.find(why, "tables") then
+    if where == "vm" and why and string.find(why, "NEW_TABLE") then
         print("ok   unsupported code reports: " .. why)
     else
         print("FAIL unsupported code", where, why)
@@ -318,10 +318,10 @@ local function integerEdges(i: number, src: buffer, out: buffer)
     buffer.writei32(out, o + 12, s % (s + 5))
     buffer.writei32(out, o + 16, math.floor(s / 14))
     buffer.writei32(out, o + 20, math.round(s / 2.8))
-    buffer.writeu32(out, o + 24, bit32.rshift(0xffffffff, 32 + i))
+    buffer.writeu32(out, o + 24, bit32.rshift(0xffffffff, 31 - i))
     buffer.writeu32(out, o + 28, bit32.lshift(1, 31))
     buffer.writeu32(out, o + 32, bit32.arshift(0x80000000, 31))
-    buffer.writeu32(out, o + 36, bit32.lshift(1, 40))
+    buffer.writeu32(out, o + 36, bit32.lshift(3, 30))
     buffer.writei32(out, o + 40, a - m)
     buffer.writei32(out, o + 44, a + s * m)
 end
@@ -331,6 +331,26 @@ do
     buffer.writei32(src, 4, -1)
     buffer.writei32(src, 8, -7)
     samePaths("integer edge cases", "gpu", integerEdges, 2, { src, buffer.create(96) })
+end
+
+-- like native code, shifts by 32 or more leave to the VM, which gives Luau's result
+@gpu
+local function wideShifts(i: number, out: buffer)
+    buffer.writeu32(out, i * 8, bit32.rshift(0xffffffff, 32 + i))
+    buffer.writeu32(out, i * 8 + 4, bit32.lshift(1, 40 - i))
+end
+samePaths("shifts by 32 or more", "fallback", wideShifts, 2, { buffer.create(16) })
+
+-- integers stay exact: a result that doesn't fit 32 bits leaves to the VM instead of wrapping
+@gpu
+local function overflows(i: number, src: buffer, out: buffer)
+    local a = buffer.readi32(src, 0) -- -2147483648
+    buffer.writef32(out, i * 4, a - 1 - i)
+end
+do
+    local src = buffer.create(4)
+    buffer.writei32(src, 0, -2147483648)
+    samePaths("integer overflow", "fallback", overflows, 2, { src, buffer.create(8) })
 end
 
 -- -2147483648 // -1 doesn't fit 32 bits: the GPU must not produce its own answer
@@ -383,9 +403,9 @@ end
 
 for _, case in
     {
-        { dispatchesAgain, "gpu.dispatch can't be called from a kernel" },
-        { readsClock, "os.clock is not supported" },
-        { prints, "'print' is not a @gpu function" },
+        { dispatchesAgain, "GET_UPVALUE is not supported" },
+        { readsClock, "a call that wasn't inlined is not supported" },
+        { prints, "a call that wasn't inlined is not supported" },
     }
 do
     local where, why = gpu.status(case[1])

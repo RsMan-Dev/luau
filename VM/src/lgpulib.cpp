@@ -2,7 +2,10 @@
 #include "lualib.h"
 
 #include "lcommon.h"
+#include "lapi.h"
 #include "lbuffer.h"
+#include "lobject.h"
+#include "lstate.h"
 
 #include <limits.h>
 #include <string.h>
@@ -36,31 +39,113 @@ static int checkrange(lua_State* L, int narg, double lo, double hi, const char* 
     return int(v);
 }
 
+// a function can run on the GPU only if the builtins it uses can't have been replaced, as for native code
+static bool gpusafe(lua_State* L, int idx)
+{
+    const TValue* fn = luaA_toobject(L, idx);
+    return !clvalue(fn)->isC && clvalue(fn)->env->safeenv;
+}
+
+static void runstep(lua_State* L, const lua_GpuStep* step)
+{
+    luaL_checkstack(L, step->nargs + 2, "too many arguments");
+
+    for (int i = 0; i < step->count; ++i)
+    {
+        lua_pushvalue(L, step->fn);
+        lua_pushinteger(L, i);
+        for (int a = 0; a < step->nargs; ++a)
+            lua_pushvalue(L, step->args + a);
+        lua_call(L, step->nargs + 1, 0);
+    }
+}
+
+static void checkbuffers(lua_State* L, int narg)
+{
+    if (lua_isnoneornil(L, narg))
+        return;
+
+    luaL_checktype(L, narg, LUA_TTABLE);
+    for (int i = 1, n = lua_objlen(L, narg); i <= n; ++i)
+    {
+        lua_rawgeti(L, narg, i);
+        if (!lua_isbuffer(L, -1))
+            luaL_argerror(L, narg, "expected a table of buffers");
+        lua_pop(L, 1);
+    }
+}
+
+// checks a step whose function is at stack index fn, followed by its count and nargs buffers
+static void checkstep(lua_State* L, lua_GpuStep* step, int fn, int nargs)
+{
+    luaL_checktype(L, fn, LUA_TFUNCTION);
+    step->fn = fn;
+    // like numeric for loops, a fractional count is rounded down
+    step->count = checkrange(L, fn + 1, 0, double(INT_MAX) + 1, "invocation count must be between 0 and 2147483647");
+    step->args = fn + 2;
+    step->nargs = nargs > 0 ? nargs : 0;
+
+    for (int i = 0; i < step->nargs; ++i)
+        luaL_checkbuffer(L, step->args + i, NULL);
+
+    step->safe = gpusafe(L, fn);
+}
+
 // gpu.dispatch(fn, n, ...buffers) has the semantics of `for i = 0, n - 1 do fn(i, ...) end` with an unspecified order
+//
+// gpu.dispatch(steps, outputs, changed) runs each step { fn, n, ...buffers } of the list like gpu.dispatch(fn, n, ...buffers),
+// in order, with two relaxations that let a GPU keep buffers in its memory:
+// - after the call, only the buffers in the outputs list have up to date Luau contents; other buffers the call writes have
+//   unspecified contents until they are in the outputs of a later call, but later calls see what this one wrote
+// - a buffer modified by Luau code since a call used it must be in the changed list of the next call that uses it, otherwise
+//   that call may see its former contents
 static int gpu_dispatch(lua_State* L)
 {
-    luaL_checktype(L, 1, LUA_TFUNCTION);
-    // like numeric for loops, a fractional count is rounded down
-    int n = checkrange(L, 2, 0, double(INT_MAX) + 1, "invocation count must be between 0 and 2147483647");
-
-    int nargs = lua_gettop(L) - 2;
-    for (int i = 0; i < nargs; ++i)
-        luaL_checkbuffer(L, 3 + i, NULL);
-
     const lua_GpuBackend* backend = getbackend(L);
-    if (backend && backend->dispatch(backend->context, L, 1, n, 3, nargs))
+    bool batch = lua_istable(L, 1);
+    lua_GpuStep* steps;
+    int nsteps;
+
+    if (batch)
+    {
+        checkbuffers(L, 2);
+        checkbuffers(L, 3);
+        lua_settop(L, 3);
+
+        nsteps = lua_objlen(L, 1);
+        steps = (lua_GpuStep*)lua_newuserdata(L, sizeof(lua_GpuStep) * (nsteps > 0 ? nsteps : 1));
+
+        // the steps are copied to the stack, so they can't change while they run
+        for (int s = 0; s < nsteps; ++s)
+        {
+            lua_rawgeti(L, 1, s + 1);
+            if (!lua_istable(L, -1))
+                luaL_error(L, "step %d must be a table { fn, count, ...buffers }", s + 1);
+
+            int t = lua_gettop(L);
+            int n = lua_objlen(L, t);
+            luaL_checkstack(L, n + 1, "too many steps");
+            for (int i = 1; i <= n; ++i)
+                lua_rawgeti(L, t, i);
+            lua_remove(L, t);
+
+            checkstep(L, &steps[s], lua_gettop(L) - n + 1, n - 2);
+        }
+    }
+    else
+    {
+        nsteps = 1;
+        int nargs = lua_gettop(L) - 2;
+        steps = (lua_GpuStep*)lua_newuserdata(L, sizeof(lua_GpuStep));
+        checkstep(L, steps, 1, nargs);
+    }
+
+    // the backend is called even for steps that must run in the VM, so that it can bring the buffers it holds up to date
+    if (backend && backend->dispatch(backend->context, L, steps, nsteps, batch ? 2 : 0, batch ? 3 : 0))
         return 0;
 
-    luaL_checkstack(L, nargs + 2, "too many arguments");
-
-    for (int i = 0; i < n; ++i)
-    {
-        lua_pushvalue(L, 1);
-        lua_pushinteger(L, i);
-        for (int a = 0; a < nargs; ++a)
-            lua_pushvalue(L, 3 + a);
-        lua_call(L, nargs + 1, 0);
-    }
+    for (int s = 0; s < nsteps; ++s)
+        runstep(L, &steps[s]);
 
     return 0;
 }
