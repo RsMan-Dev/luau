@@ -940,7 +940,9 @@ void VulkanBackend::Impl::record(const lua_GpuStep* steps, int nsteps, bool batc
         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
     );
 
-    vkResetDescriptorPool(device, descriptorPool, 0);
+    // the pool only exists once a batch had steps; an empty batch (a download) can come first
+    if (descriptorPool)
+        vkResetDescriptorPool(device, descriptorPool, 0);
 
     for (int s = 0; s < nsteps; ++s)
     {

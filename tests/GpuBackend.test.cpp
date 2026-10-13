@@ -743,6 +743,22 @@ end
     CHECK(stats.downloadedBytes == 4096 * 4);
 }
 
+TEST_CASE("an_empty_batch_can_be_the_first_call_of_a_backend")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // nothing has been dispatched yet, so no descriptor pool exists; scripts probe for batch support this way
+    CHECK(run(*backend, std::string(kSquare) + R"(
+assert(pcall(gpu.dispatch, {}, {}, {}))
+local b = buffer.create(40)
+gpu.dispatch({}, { b })
+gpu.dispatch({ { square, 10, b } }, { b })
+assert(buffer.readu32(b, 36) == 81)
+)") == "");
+}
+
 TEST_CASE("buffers_stay_on_the_gpu_between_batches_until_luau_changes_them")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();
