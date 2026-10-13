@@ -411,6 +411,11 @@ if(LUAU_BUILD_GPU)
         target_link_libraries(Luau.UnitTest PRIVATE Luau.Gpu.Vulkan Luau.Gpu.Shaders Luau.VM)
         target_compile_definitions(Luau.UnitTest PRIVATE LUAU_GPU_BACKEND_TESTS LUAU_GPU_EXAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Gpu/examples")
     endif()
+
+    if(TARGET Luau.Conformance)
+        target_link_libraries(Luau.Conformance PRIVATE Luau.Gpu.Vulkan Luau.Gpu.Shaders)
+        target_compile_definitions(Luau.Conformance PRIVATE LUAU_GPU_BACKEND_TESTS)
+    endif()
 endif()
 
 # validate dependencies for internal libraries

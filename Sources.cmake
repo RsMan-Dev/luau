@@ -149,6 +149,7 @@ target_sources(Luau.CodeGen PRIVATE
     CodeGen/include/Luau/CodeAllocator.h
     CodeGen/include/Luau/CodeBlockUnwind.h
     CodeGen/include/Luau/CodeGen.h
+    CodeGen/include/Luau/CodeGenGpu.h
     CodeGen/include/Luau/CodeGenCommon.h
     CodeGen/include/Luau/CodeGenOptions.h
     CodeGen/include/Luau/ConditionA64.h
@@ -186,6 +187,7 @@ target_sources(Luau.CodeGen PRIVATE
     CodeGen/src/CodeGen.cpp
     CodeGen/src/CodeGenAssembly.cpp
     CodeGen/src/CodeGenContext.cpp
+    CodeGen/src/CodeGenGpu.cpp
     CodeGen/src/CodeGenUtils.cpp
     CodeGen/src/CodeGenA64.cpp
     CodeGen/src/CodeGenX64.cpp
@@ -636,6 +638,7 @@ if(TARGET Luau.Conformance)
         tests/BufferCage.cpp
         tests/RegisterCallbacks.h
         tests/RegisterCallbacks.cpp
+        tests/CodeGenGpu.test.cpp
         tests/ConformanceIrHooks.h
         tests/Conformance.test.cpp
         tests/DirectFieldAccess.test.cpp
