@@ -1455,12 +1455,12 @@ Kernel translateKernel(ChunkInfo& info, AstExprFunction* func)
         AstLocal* index = func->args.data[0];
         Type indexType = em.localTypes[index];
 
-        std::string glsl = "#version 450\nlayout(local_size_x = 64) in;\n\n";
+        std::string glsl = "#version 450\nlayout(local_size_x = " + std::to_string(kWorkgroupSize) + ") in;\n\n";
         for (size_t i = 0; i < buffers; ++i)
             glsl += "layout(std430, set = 0, binding = " + std::to_string(i) + ") buffer B" + std::to_string(i) + " { uint d[]; } b" +
                     std::to_string(i) + ";\n";
         glsl += "layout(std430, set = 0, binding = " + std::to_string(buffers) + ") buffer BS { uint err; } st;\n";
-        glsl += "layout(push_constant) uniform PC { uint n; uint len[" + std::to_string(kMaxKernelBuffers) + "]; } pc;\n";
+        glsl += "layout(push_constant) uniform PC { uint n; uint budget; uint len[" + std::to_string(kMaxKernelBuffers) + "]; } pc;\n";
         glsl += kPrelude;
         glsl += accessors(tr);
         glsl += "\n";
@@ -1471,7 +1471,7 @@ Kernel translateKernel(ChunkInfo& info, AstExprFunction* func)
         glsl += em.out;
         glsl += "}\n\n";
         glsl += "void main()\n{\n";
-        glsl += "    uint gid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u;\n";
+        glsl += "    uint gid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * " + std::to_string(kWorkgroupSize) + "u;\n";
         glsl += "    if (gid >= pc.n) return;\n";
         glsl += "    l_kernel(int(gid));\n";
         glsl += "}\n";

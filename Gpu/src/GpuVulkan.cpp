@@ -22,7 +22,6 @@ namespace Gpu
 namespace
 {
 
-constexpr uint32_t kWorkgroupSize = 64;
 constexpr uint32_t kMaxGroupsX = 65535;
 constexpr uint64_t kEvictAfterDispatches = 2000;
 
@@ -430,7 +429,7 @@ std::string VulkanBackend::Impl::buildPipeline(KernelEntry& entry, const Kernel&
     dslci.pBindings = layoutBindings.data();
     vkCreateDescriptorSetLayout(device, &dslci, nullptr, &entry.setLayout);
 
-    VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, uint32_t(4 * (1 + kMaxKernelBuffers))};
+    VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, uint32_t(sizeof(PushConstants))};
     VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plci.setLayoutCount = 1;
     plci.pSetLayouts = &entry.setLayout;
@@ -575,12 +574,13 @@ int VulkanBackend::Impl::dispatch(lua_State* L, int fnidx, int n, int argidx, in
     }
     vkUpdateDescriptorSets(device, uint32_t(writes.size()), writes.data(), 0, nullptr);
 
-    uint32_t push[1 + kMaxKernelBuffers] = {uint32_t(n)};
-    memcpy(push + 1, lengths, sizeof(lengths));
+    PushConstants push = {};
+    push.count = uint32_t(n);
+    memcpy(push.lengths, lengths, sizeof(lengths));
 
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, kernel->pipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, kernel->pipelineLayout, 0, 1, &set, 0, nullptr);
-    vkCmdPushConstants(commandBuffer, kernel->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+    vkCmdPushConstants(commandBuffer, kernel->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
 
     uint32_t groups = (uint32_t(n) + kWorkgroupSize - 1) / kWorkgroupSize;
     uint32_t gx = groups < kMaxGroupsX ? groups : kMaxGroupsX;

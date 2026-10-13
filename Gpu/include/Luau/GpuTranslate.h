@@ -1,6 +1,7 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #pragma once
 
+#include "Luau/GpuAbi.h"
 #include "Luau/Location.h"
 
 #include <stddef.h>
@@ -14,8 +15,6 @@ class AstStat;
 
 namespace Gpu
 {
-
-constexpr int kMaxKernelBuffers = 15;
 
 // a function marked @gpu, translated to a GLSL compute shader when it fits the supported subset
 struct Kernel

@@ -98,6 +98,7 @@ target_sources(Luau.Compiler PRIVATE
 
 # Luau.Gpu Sources
 target_sources(Luau.Gpu PRIVATE
+    Gpu/include/Luau/GpuAbi.h
     Gpu/include/Luau/GpuTranslate.h
 
     Gpu/src/GpuTranslate.cpp
