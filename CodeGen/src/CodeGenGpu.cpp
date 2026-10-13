@@ -539,17 +539,22 @@ struct GlslLowering
             return;
 
         std::vector<RegState>& to = entry[target.index];
+        bool first = !reached[target.index];
+        reached[target.index] = true;
+        changed |= first;
 
-        if (!reached[target.index])
-        {
-            reached[target.index] = true;
-            to = cur;
-            changed = true;
-            return;
-        }
-
+        // only registers the block reads before writing matter; the others hold values that are never used
         for (size_t r = 0; r < to.size(); r++)
         {
+            if (!live(target.index, r))
+                continue;
+
+            if (first)
+            {
+                to[r] = cur[r];
+                continue;
+            }
+
             RegState m = {
                 join(to[r].cls, cur[r].cls),
                 to[r].buffer == cur[r].buffer ? to[r].buffer : -2,
@@ -558,6 +563,12 @@ struct GlslLowering
             changed |= m.cls != to[r].cls || m.buffer != to[r].buffer || m.call != to[r].call;
             to[r] = m;
         }
+    }
+
+    bool live(uint32_t block, size_t reg)
+    {
+        const RegisterSet& in = function.cfg.in[block];
+        return in.regs.test(reg) || (in.varargSeq && reg >= in.varargStart);
     }
 
     void reachTargets(IrInst& inst)
@@ -632,6 +643,9 @@ struct GlslLowering
             const std::vector<RegState>& to = entry[target.index];
             for (size_t r = 0; r < to.size(); r++)
             {
+                if (!live(target.index, r))
+                    continue;
+
                 NumClass from = cur[r].cls;
                 if (from == NumClass::None || from == to[r].cls)
                     continue;
@@ -1404,6 +1418,9 @@ struct GlslLowering
         build.bufferWritten.assign(buffers, false);
         readBuffers.assign(buffers, false);
         atomics.assign(buffers, 0);
+
+        // which registers each block reads, on the IR after the optimizations
+        computeCfgInfo(function);
 
         if (!analyze(sortedBlocks))
             return false;

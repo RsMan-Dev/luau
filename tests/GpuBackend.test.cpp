@@ -732,6 +732,38 @@ end
     CHECK_MESSAGE(backend->stats().gpuDispatches == 200, fallback);
 }
 
+TEST_CASE("registers_dead_at_a_join_dont_need_exact_conversions")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // 'big' doesn't fit a float exactly, and its register is reused for floats after the branch, where it's dead
+    CHECK(run(*backend, R"(
+@gpu
+local function k(i: number, b: buffer)
+    if i % 2 == 0 then
+        local big = buffer.readu32(b, 0)
+        buffer.writeu32(b, 4 + i * 4, big)
+    end
+    local acc = i * 0.5
+    for j = 1, 3 do
+        acc = acc * 1.5 + j
+    end
+    buffer.writef32(b, 64 + i * 4, acc)
+end
+
+local b = buffer.create(128)
+buffer.writeu32(b, 0, 0xfffffff1)
+gpu.dispatch(k, 8, b)
+assert(buffer.readu32(b, 4) == 0xfffffff1)
+)") == "");
+
+    DispatchStats stats = backend->stats();
+    CHECK(stats.gpuDispatches == 1);
+    CHECK(stats.fallbacks == 0);
+}
+
 TEST_CASE("kernels_that_crashed_the_spirv_optimizer_run_on_the_gpu")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();
