@@ -47,7 +47,18 @@ struct VulkanOptions
     // device memory kept for copies of Luau buffers (host memory of the same size mirrors it); the least recently used
     // copies are freed beyond it, and a single run can use more
     uint64_t cacheBytes = uint64_t(1) << 30;
+
+    // pipelines are created on host threads, since drivers can take minutes on large kernels: until a kernel's is ready,
+    // runs of it return kCompiling and leave the buffers as they were. Set to have runs wait for it instead
+    bool waitForPipelines = false;
+
+    // file that keeps the pipelines the driver compiled between processes, read when the backend is created and written
+    // when it's destroyed; empty for none
+    std::string pipelineCachePath;
 };
+
+// what runs return while their kernel's pipeline is being created
+constexpr const char* kCompiling = "the kernel is being compiled for the GPU";
 
 // runs gpu.run on a Vulkan device, with the kernels native code generation lowers from @gpu functions
 //

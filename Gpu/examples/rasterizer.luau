@@ -258,6 +258,16 @@ local paused = false
 local useGpu = host.gpuname() ~= nil
 
 -- runs a pass on the GPU, or calls it from Luau
+
+-- the first runs of a kernel return false while the driver creates its pipeline, which the first frame waits for
+local COMPILING = "the kernel is being compiled for the GPU"
+local function runReady(fn, buffers: { buffer }, runs: number)
+    local ok, err = gpu.run(fn, buffers, runs)
+    while not ok and err == COMPILING do
+        ok, err = gpu.run(fn, buffers, runs)
+    end
+    return ok, err
+end
 local function pass(kernel, runs: number)
     if not useGpu then
         for i = 0, runs - 1 do
@@ -266,7 +276,7 @@ local function pass(kernel, runs: number)
         return
     end
 
-    local ok, err = gpu.run(kernel, { scene }, runs)
+    local ok, err = runReady(kernel, { scene }, runs)
     if not ok then
         error("the GPU can't render: " .. tostring(err))
     end

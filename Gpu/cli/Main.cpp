@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -309,6 +310,8 @@ int main(int argc, char** argv)
 
     bool useGpu = true;
     bool useNative = true;
+    Luau::Gpu::VulkanOptions backendOptions;
+    bool pipelineCache = true;
     const char* emitTarget = nullptr;
     const char* path = nullptr;
     int scriptArg = argc;
@@ -321,6 +324,10 @@ int main(int argc, char** argv)
             useNative = false;
         else if (strncmp(argv[i], "--emit=", 7) == 0)
             emitTarget = argv[i] + 7;
+        else if (strcmp(argv[i], "--wait-for-pipelines") == 0)
+            backendOptions.waitForPipelines = true;
+        else if (strcmp(argv[i], "--no-pipeline-cache") == 0)
+            pipelineCache = false;
         else
         {
             path = argv[i];
@@ -331,7 +338,9 @@ int main(int argc, char** argv)
 
     if (!path)
     {
-        fprintf(stderr, "usage: luau-gpu [--vm] [--no-native] script.luau [args...]\n");
+        fprintf(stderr, "usage: luau-gpu [--vm] [--no-native] [--wait-for-pipelines] [--no-pipeline-cache] script.luau [args...]\n");
+        fprintf(stderr, "         --wait-for-pipelines: gpu.run waits for the pipeline of a kernel instead of returning false while it's\n");
+        fprintf(stderr, "         created; --no-pipeline-cache: doesn't keep the pipelines the driver compiled in ~/.cache/luau-gpu\n");
         fprintf(stderr, "       luau-gpu --emit=<glsl|spirv|msl-ios|msl-macos|gles> script.luau\n");
         fprintf(stderr, "         prints the shader of every @gpu function for that target to stdout, without running the script\n");
         return 1;
@@ -366,7 +375,20 @@ int main(int argc, char** argv)
     std::string unavailable = "the GPU is disabled (--vm)";
     if (useGpu && !emitTarget)
     {
-        gBackend = Luau::Gpu::VulkanBackend::create(unavailable);
+        // the driver's compiled pipelines are kept between runs of scripts, since large kernels take it minutes
+        const char* cacheHome = getenv("XDG_CACHE_HOME");
+        const char* home = getenv("HOME");
+        if (pipelineCache && (cacheHome || home))
+        {
+            std::filesystem::path dir = cacheHome ? std::filesystem::path(cacheHome) : std::filesystem::path(home) / ".cache";
+            dir /= "luau-gpu";
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            if (!ec)
+                backendOptions.pipelineCachePath = (dir / "pipelines.bin").string();
+        }
+
+        gBackend = Luau::Gpu::VulkanBackend::create(unavailable, backendOptions);
         if (!gBackend)
             fprintf(stderr, "luau-gpu: no GPU backend (%s), gpu.run returns false\n", unavailable.c_str());
     }

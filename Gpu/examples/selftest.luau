@@ -11,6 +11,16 @@ end
 
 local failures = 0
 
+-- the first runs of a kernel return false while the driver creates its pipeline, which each check waits for
+local COMPILING = "the kernel is being compiled for the GPU"
+local function runReady(fn, buffers: { buffer }, runs: number)
+    local ok, err = gpu.run(fn, buffers, runs)
+    while not ok and err == COMPILING do
+        ok, err = gpu.run(fn, buffers, runs)
+    end
+    return ok, err
+end
+
 local function fail(name: string, problem: string)
     print(string.format("FAIL %-22s %s", name, problem))
     failures += 1
@@ -21,7 +31,7 @@ end
 local function check(name: string, fn, runs: number, input: buffer, floatTolerance: number?)
     local onGpu, inLuau = copy(input), copy(input)
 
-    local ok, err = gpu.run(fn, { onGpu }, runs)
+    local ok, err = runReady(fn, { onGpu }, runs)
     if not ok then
         return fail(name, `didn't run on the GPU: {err}`)
     end
@@ -53,7 +63,7 @@ end
 -- runs fn with gpu.run, which must return false and why, with the buffer left byte for byte as it was
 local function fails(name: string, fn, runs: number, input: buffer, expected: string?)
     local onGpu = copy(input)
-    local ok, err = gpu.run(fn, { onGpu }, runs)
+    local ok, err = runReady(fn, { onGpu }, runs)
     if ok then
         return fail(name, "ran on the GPU")
     elseif expected and err ~= expected then
@@ -360,7 +370,7 @@ end
 do
     local INVOCATIONS = 50_000_000
     local bins = buffer.create(1024 * 4)
-    local ok, err = gpu.run(manyInvocations, { bins }, INVOCATIONS)
+    local ok, err = runReady(manyInvocations, { bins }, INVOCATIONS)
     for b = 0, 1023 do
         local expected = INVOCATIONS // 1024 + (if b < INVOCATIONS % 1024 then 1 else 0)
         ok = ok and buffer.readu32(bins, b * 4) == expected

@@ -52,13 +52,23 @@ local scenarios: { Scenario } = {}
 -- scenarios run kernels through this, so the 'loop' mode can replace gpu.run with a Luau loop
 local loopMode = false
 
+-- the first runs of a kernel return false while the driver creates its pipeline, which the bench waits for
+local COMPILING = "the kernel is being compiled for the GPU"
+local function runReady(fn, buffers: { buffer }, runs: number)
+    local ok, err = gpu.run(fn, buffers, runs)
+    while not ok and err == COMPILING do
+        ok, err = gpu.run(fn, buffers, runs)
+    end
+    return ok, err
+end
+
 local function run(fn: (buffer, number) -> (), n: number, b: buffer)
     if loopMode then
         for i = 0, n - 1 do
             fn(b, i)
         end
     else
-        local ok, err = gpu.run(fn, { b }, n)
+        local ok, err = runReady(fn, { b }, n)
         if not ok then
             error(err)
         end

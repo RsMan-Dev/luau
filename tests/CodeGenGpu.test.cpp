@@ -294,7 +294,9 @@ static bool runOnGpuAndVm(const char* source, int count, int size, bool floats, 
     ScopedFastFlag flag{FFlag::LuauGpuKernels, true};
 
     std::string error;
-    std::unique_ptr<Luau::Gpu::VulkanBackend> backend = Luau::Gpu::VulkanBackend::create(error);
+    Luau::Gpu::VulkanOptions backendOptions;
+    backendOptions.waitForPipelines = true;
+    std::unique_ptr<Luau::Gpu::VulkanBackend> backend = Luau::Gpu::VulkanBackend::create(error, backendOptions);
     if (!backend)
     {
         MESSAGE("skipped, no Vulkan device: " << error);

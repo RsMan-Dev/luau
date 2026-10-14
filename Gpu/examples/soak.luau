@@ -11,6 +11,15 @@ local maxCached, maxMemory, maxKernels = 0, 0, 0
 local start = host.clock()
 local frame = 0
 
+-- the first frame waits for the driver to create the kernel's pipeline, which gpu.run returns false during
+local function runReady(fn, buffers: { buffer }, runs: number)
+    local ok, err = gpu.run(fn, buffers, runs)
+    while not ok and err == "the kernel is being compiled for the GPU" do
+        ok, err = gpu.run(fn, buffers, runs)
+    end
+    return ok, err
+end
+
 while host.clock() - start < seconds do
     frame += 1
 
@@ -28,7 +37,7 @@ while host.clock() - start < seconds do
     end
 
     local t = host.clock()
-    assert(gpu.run(shade, { data }, 128 * 1024))
+    assert(runReady(shade, { data }, 128 * 1024))
     frames[frame] = host.clock() - t
     assert(buffer.readu32(data, 1024 + 4) == bit32.bxor(frame + 4, 1))
 

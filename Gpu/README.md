@@ -54,8 +54,20 @@ ordinary `buffer`s that can also be called from Luau, and data layouts are writt
   large for a float at line 980`: out of bounds or unaligned buffer access, integer overflow, integer division by zero,
   integer too large for a float, number out of the range of 32-bit integers, float overflow, number beyond the range of
   floats, loop limit reached, or a value of a type the kernel doesn't handle there.
+- `false, "the kernel is being compiled for the GPU"`: the driver is still creating the kernel's pipeline, on a host
+  thread, and the buffers are left as they were. Drivers take a time growing faster than the size of the kernel: tens of
+  milliseconds for small ones, but about 40 s for 600 KB of GLSL and 160 s for 1.1 MB on NVIDIA's (Find a Geode's frame
+  kernel), which a script can't wait for. Several pipelines are created at once. A script that needs the result calls
+  `gpu.run` again (the examples do); `VulkanOptions::waitForPipelines` and `luau-gpu --wait-for-pipelines` make runs
+  wait instead. A kernel of more than 2 MB of GLSL is refused, with "Function cannot run in GPU", since its pipeline
+  would take a compile thread for most of an hour.
 - Arguments of the wrong type or out of range (`runs_per_buffer` must be an integer from 0 to 2^31-1, `buffers` an array
   of buffers) are mistakes in the script and raise errors, as in other libraries.
+
+`luau-gpu` keeps the pipelines the driver compiled in `~/.cache/luau-gpu/pipelines.bin` (`$XDG_CACHE_HOME/luau-gpu`
+when set, `--no-pipeline-cache` to leave it out), so that a script runs its kernels at once from its second run: Find a
+Geode's frame kernel takes 165 s on its first run without any cache, 5 s for the whole run with it. The library leaves it
+to the host: `VulkanOptions::pipelineCachePath`, empty by default.
 
 A buffer listed several times runs several times, in the order of the list; different buffers run concurrently.
 

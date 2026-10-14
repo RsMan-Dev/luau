@@ -42,7 +42,15 @@ std::string readFile(const std::filesystem::path& path)
     return ss.str();
 }
 
-std::unique_ptr<VulkanBackend> createBackend(const VulkanOptions& options = VulkanOptions())
+// runs wait for pipelines, which tests of other behaviors would otherwise have to retry
+VulkanOptions waiting()
+{
+    VulkanOptions options;
+    options.waitForPipelines = true;
+    return options;
+}
+
+std::unique_ptr<VulkanBackend> createBackend(const VulkanOptions& options = waiting())
 {
     std::string error;
     std::unique_ptr<VulkanBackend> backend = VulkanBackend::create(error, options);
@@ -256,7 +264,7 @@ assert(gpu.run(square, { a }, 0) == true)
 
 TEST_CASE("large_indices_are_exact_integers")
 {
-    VulkanOptions options;
+    VulkanOptions options = waiting();
     options.minimumLimits = true;
     std::unique_ptr<VulkanBackend> backend = createBackend(options);
     if (!backend)
@@ -333,6 +341,136 @@ local b = buffer.create(16)
 local ok, err = gpu.run(square, { b }, 4)
 assert(not ok and err == "Function cannot run in GPU", err)
 assert(buffer.readu32(b, 12) == 0)
+)") == "");
+}
+
+// makes the driver take seconds to compile the kernel, with code that doesn't change what it does; a constant of its own
+// keeps the driver from finding it in its cache
+CodeGen::GpuKernel slowToCompile(lua_State* L, int idx)
+{
+    CodeGen::GpuKernel kernel = CodeGen::compileGpu(L, idx);
+    static uint32_t seed = uint32_t(std::chrono::steady_clock::now().time_since_epoch().count());
+    std::string slow = "    uint l_slow = uint(index) + " + std::to_string(seed++) + "u;\n";
+    for (int i = 0; i < 10000; i++)
+        slow += "    l_slow = (l_slow * 1664525u + 1013904223u) ^ (l_slow >> 13);\n";
+    slow += "    if (l_slow == 0x12345678u && index < 0) l_fail(10u);\n";
+    size_t at = kernel.glsl.find("void l_kernel(int index)\n{\n");
+    REQUIRE(at != std::string::npos);
+    kernel.glsl.insert(at + strlen("void l_kernel(int index)\n{\n"), slow);
+    return kernel;
+}
+
+TEST_CASE("runs_return_while_their_pipeline_is_created_on_host_threads")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend(VulkanOptions());
+    if (!backend)
+        return;
+
+    // drivers take seconds to minutes on large kernels, which the script doesn't wait for: runs return false and leave the
+    // buffers as they were until the pipeline is ready, and several are created at once
+    backend->setLowering(slowToCompile);
+    auto start = std::chrono::steady_clock::now();
+    CHECK(run(*backend, std::string(kSquare) + R"(
+@gpu
+local function double(b: buffer, i: number)
+    buffer.writeu32(b, i * 4, buffer.readu32(b, i * 4) * 2)
+end
+
+local a, b = buffer.create(16), buffer.create(16)
+buffer.writeu32(b, 0, 21)
+local ok, err = gpu.run(square, { a }, 4)
+assert(not ok and err == "the kernel is being compiled for the GPU", err)
+ok, err = gpu.run(double, { b }, 4)
+assert(not ok and err == "the kernel is being compiled for the GPU", err)
+assert(buffer.readu32(a, 12) == 0 and buffer.readu32(b, 0) == 21)
+
+local tries = 0
+repeat
+    ok, err = gpu.run(square, { a }, 4)
+    tries += 1
+until err ~= "the kernel is being compiled for the GPU"
+assert(ok, err)
+assert(buffer.readu32(a, 12) == 9)
+repeat
+    ok, err = gpu.run(double, { b }, 4)
+until err ~= "the kernel is being compiled for the GPU"
+assert(ok, err)
+assert(buffer.readu32(b, 0) == 42)
+assert(tries > 1)
+)") == "");
+    // a gpu.run call doesn't wait for the driver
+    MESSAGE("both pipelines in " << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() << " s");
+}
+
+TEST_CASE("pipelines_that_fail_on_host_threads_cant_run")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend(VulkanOptions());
+    if (!backend)
+        return;
+
+    backend->setLowering(
+        [](lua_State* L, int idx)
+        {
+            CodeGen::GpuKernel kernel = CodeGen::compileGpu(L, idx);
+            kernel.glsl = "#version 450\nvoid main() { this is not glsl; }\n";
+            return kernel;
+        }
+    );
+
+    CHECK(run(*backend, std::string(kSquare) + R"(
+local b = buffer.create(16)
+local ok, err
+repeat
+    ok, err = gpu.run(square, { b }, 4)
+until err ~= "the kernel is being compiled for the GPU"
+assert(not ok and err == "Function cannot run in GPU", err)
+assert(buffer.readu32(b, 12) == 0)
+)") == "");
+}
+
+TEST_CASE("functions_and_backends_can_go_while_their_pipelines_are_created")
+{
+    // a collected function's kernel is freed once its pipeline is ready, by the compile thread if it comes last
+    {
+        std::unique_ptr<VulkanBackend> backend = createBackend(VulkanOptions());
+        if (!backend)
+            return;
+        backend->setLowering(slowToCompile);
+
+        CHECK(run(*backend, R"(
+do
+    @gpu
+    local function f(b: buffer, i: number)
+        buffer.writeu32(b, i * 4, i)
+    end
+    local ok, err = gpu.run(f, { buffer.create(16) }, 4)
+    assert(not ok and err == "the kernel is being compiled for the GPU", err)
+end
+collect()
+@gpu
+local function g(b: buffer, i: number)
+    buffer.writeu32(b, i * 4, i + 1)
+end
+gpu.run(g, { buffer.create(16) }, 4)
+)") == "");
+
+        // the backend goes while the second one is still being created: it doesn't wait for the driver
+        auto start = std::chrono::steady_clock::now();
+        backend.reset();
+        CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500));
+    }
+
+    // and once nothing is being created, the backend frees everything as usual
+    std::unique_ptr<VulkanBackend> backend = createBackend(VulkanOptions());
+    if (!backend)
+        return;
+    CHECK(run(*backend, std::string(kSquare) + R"(
+local b = buffer.create(16)
+local ok, err
+repeat
+    ok, err = gpu.run(square, { b }, 4)
+until err ~= "the kernel is being compiled for the GPU"
+assert(ok, err)
 )") == "");
 }
 
@@ -552,7 +690,7 @@ assert(buffer.readu32(b, 0) == 0)
 TEST_CASE("a_runaway_run_gives_the_gpu_back_quickly")
 {
     // no loop budget: only the request to stop bounds the GPU time
-    VulkanOptions options;
+    VulkanOptions options = waiting();
     options.loopBudget = 0;
     std::unique_ptr<VulkanBackend> backend = createBackend(options);
     if (!backend)
@@ -588,7 +726,7 @@ assert(buffer.readu32(b, 12) == 9)
 
 TEST_CASE("buffers_over_the_storage_range_fail_the_run")
 {
-    VulkanOptions options;
+    VulkanOptions options = waiting();
     options.minimumLimits = true;
     std::unique_ptr<VulkanBackend> backend = createBackend(options);
     if (!backend)
@@ -605,7 +743,7 @@ assert(buffer.readu32(b, 12) == 0)
 
 TEST_CASE("a_run_over_the_timeout_disables_the_backend_without_copying_results")
 {
-    VulkanOptions options;
+    VulkanOptions options = waiting();
     options.timeoutMs = 1;
     options.loopBudget = 0;
     std::unique_ptr<VulkanBackend> backend = createBackend(options);
@@ -880,7 +1018,7 @@ assert(buffer.readu32(b, 12) == 9)
 
 TEST_CASE("buffer_copies_stay_within_the_cache_budget")
 {
-    VulkanOptions options;
+    VulkanOptions options = waiting();
     options.cacheBytes = 1 << 20;
     std::unique_ptr<VulkanBackend> backend = createBackend(options);
     if (!backend)

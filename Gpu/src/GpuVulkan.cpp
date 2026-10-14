@@ -8,9 +8,11 @@
 
 #include <vulkan/vulkan.h>
 
+#include <stdio.h>
 #include <string.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -149,6 +151,9 @@ private:
 const char* const kKernelsKey = "_GPUKERNELS";
 const char* const kBuffersKey = "_GPUBUFFERS";
 
+// kernels larger than this are refused, see kernelFor
+constexpr size_t kMaxKernelGlsl = size_t(2) << 20;
+
 struct KernelEntry
 {
     std::string key;
@@ -162,6 +167,215 @@ struct KernelEntry
     VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+
+    // the pipeline is created on a compile thread, which sets kReady once it's done and compileError when it failed; a
+    // kernel whose functions were collected meanwhile is kAbandoned, and whichever of the two comes last destroys it
+    static constexpr uint32_t kReady = 1, kAbandoned = 2;
+    std::atomic<uint32_t> flags{0};
+    std::string compileError;
+    std::string glsl; // until the compile thread takes it
+
+    bool ready() const
+    {
+        return (flags.load(std::memory_order_acquire) & kReady) != 0;
+    }
+};
+
+void destroyPipeline(VkDevice device, KernelEntry& entry)
+{
+    vkDestroyPipeline(device, entry.pipeline, nullptr);
+    vkDestroyPipelineLayout(device, entry.pipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device, entry.setLayout, nullptr);
+    entry.pipeline = VK_NULL_HANDLE;
+    entry.pipelineLayout = VK_NULL_HANDLE;
+    entry.setLayout = VK_NULL_HANDLE;
+}
+
+std::string createPipeline(
+    VkDevice device,
+    VkPipelineCache cache,
+    uint32_t pushConstants,
+    ShaderCompiler& shaders,
+    KernelEntry& entry,
+    const std::string& glsl
+)
+{
+    std::vector<uint32_t> spirv;
+    std::string error;
+    if (!shaders.compileSpirv(glsl, entry.name, spirv, error))
+        return "internal error, " + error;
+
+    VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smci.codeSize = spirv.size() * sizeof(uint32_t);
+    smci.pCode = spirv.data();
+    VkShaderModule module;
+    if (vkCreateShaderModule(device, &smci, nullptr, &module) != VK_SUCCESS)
+        return "vkCreateShaderModule failed";
+
+    uint32_t bindings = uint32_t(entry.written.size()) + 2;
+    std::vector<VkDescriptorSetLayoutBinding> layoutBindings(bindings);
+    for (uint32_t i = 0; i < bindings; ++i)
+    {
+        layoutBindings[i].binding = i;
+        layoutBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        layoutBindings[i].descriptorCount = 1;
+        layoutBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+
+    VkDescriptorSetLayoutCreateInfo dslci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslci.bindingCount = bindings;
+    dslci.pBindings = layoutBindings.data();
+
+    VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstants};
+    VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &entry.setLayout;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &range;
+
+    VkComputePipelineCreateInfo cpci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module = module;
+    cpci.stage.pName = "main";
+
+    bool ok = vkCreateDescriptorSetLayout(device, &dslci, nullptr, &entry.setLayout) == VK_SUCCESS &&
+              vkCreatePipelineLayout(device, &plci, nullptr, &entry.pipelineLayout) == VK_SUCCESS;
+    cpci.layout = entry.pipelineLayout;
+    ok = ok && vkCreateComputePipelines(device, cache, 1, &cpci, nullptr, &entry.pipeline) == VK_SUCCESS;
+    vkDestroyShaderModule(device, module, nullptr);
+
+    if (!ok)
+    {
+        destroyPipeline(device, entry);
+        return "failed to create the compute pipeline";
+    }
+
+    return "";
+}
+
+// creates pipelines on a few host threads: drivers take a time growing faster than the size of the kernel, minutes on large
+// ones, which runs can't wait for. What the threads use is shared with them, so that a backend destroyed while a driver
+// compiles doesn't take it away: the thread is left to finish, then destroys what it made
+class PipelineCompiler
+{
+public:
+    PipelineCompiler(VkDevice device, VkPipelineCache cache, uint32_t pushConstants)
+        : shared(std::make_shared<Shared>())
+    {
+        shared->device = device;
+        shared->cache = cache;
+        shared->pushConstants = pushConstants;
+
+        unsigned n = std::thread::hardware_concurrency();
+        n = n < 4 ? 1 : n < 8 ? 2 : 3;
+        for (unsigned i = 0; i < n; ++i)
+            workers.emplace_back(work, shared);
+    }
+
+    // returns whether a thread was still creating a pipeline, which the device must then outlive
+    bool shutdown()
+    {
+        bool busy;
+        {
+            std::lock_guard<std::mutex> lock(shared->mutex);
+            shared->stopping = true;
+            shared->queue.clear();
+            busy = shared->busy > 0;
+        }
+        shared->wake.notify_all();
+
+        for (std::thread& t : workers)
+        {
+            if (busy)
+                t.detach();
+            else
+                t.join();
+        }
+        workers.clear();
+        return busy;
+    }
+
+    void submit(std::shared_ptr<KernelEntry> entry)
+    {
+        {
+            std::lock_guard<std::mutex> lock(shared->mutex);
+            shared->queue.push_back(std::move(entry));
+        }
+        shared->wake.notify_one();
+    }
+
+    void wait(const KernelEntry& entry)
+    {
+        std::unique_lock<std::mutex> lock(shared->mutex);
+        shared->done.wait(
+            lock,
+            [&]
+            {
+                return entry.ready();
+            }
+        );
+    }
+
+private:
+    struct Shared
+    {
+        VkDevice device = VK_NULL_HANDLE;
+        VkPipelineCache cache = VK_NULL_HANDLE;
+        uint32_t pushConstants = 0;
+
+        std::mutex mutex;
+        std::condition_variable wake, done;
+        std::list<std::shared_ptr<KernelEntry>> queue;
+        int busy = 0;
+        bool stopping = false;
+    };
+
+    std::shared_ptr<Shared> shared;
+    std::vector<std::thread> workers;
+
+    static void work(std::shared_ptr<Shared> shared)
+    {
+        ShaderCompiler shaders;
+
+        for (;;)
+        {
+            std::shared_ptr<KernelEntry> entry;
+            {
+                std::unique_lock<std::mutex> lock(shared->mutex);
+                shared->wake.wait(
+                    lock,
+                    [&]
+                    {
+                        return shared->stopping || !shared->queue.empty();
+                    }
+                );
+                if (shared->stopping)
+                    return;
+                entry = std::move(shared->queue.front());
+                shared->queue.pop_front();
+                shared->busy++;
+            }
+
+            std::string glsl;
+            glsl.swap(entry->glsl);
+            entry->compileError = createPipeline(shared->device, shared->cache, shared->pushConstants, shaders, *entry, glsl);
+
+            bool stopping;
+            {
+                std::lock_guard<std::mutex> lock(shared->mutex);
+                shared->busy--;
+                stopping = shared->stopping;
+                uint32_t old = entry->flags.fetch_or(KernelEntry::kReady, std::memory_order_acq_rel);
+                if ((old & KernelEntry::kAbandoned) || stopping)
+                    destroyPipeline(shared->device, *entry);
+            }
+            shared->done.notify_all();
+
+            if (stopping)
+                return;
+        }
+    }
 };
 
 // memory that buffers share, since allocating memory takes longer than a run on a buffer made for it; a block is freed
@@ -331,7 +545,9 @@ struct VulkanBackend::Impl
     bool deviceBusy = false;
 
     // kernels are shared by every function lowering to the same shader; rejected functions share one per reason
-    std::unordered_map<std::string, std::unique_ptr<KernelEntry>> kernels;
+    std::unordered_map<std::string, std::shared_ptr<KernelEntry>> kernels;
+    VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+    std::unique_ptr<PipelineCompiler> compiler;
 
     std::unordered_map<uint64_t, BufferEntry> buffers;
     std::list<uint64_t> lru;
@@ -357,6 +573,7 @@ struct VulkanBackend::Impl
     bool createHostWords(uint32_t words, HostWords& result, bool cached = false);
     void destroyHostWords(HostWords& words);
     std::string probe();
+    void savePipelineCache();
     int findMemory(uint32_t typeBits, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred);
     bool allocate(const VkMemoryRequirements& req, uint32_t type, bool map, Memory& mem);
     void release(Memory& mem);
@@ -369,6 +586,7 @@ struct VulkanBackend::Impl
     void freeDeadBuffers();
 
     std::string buildPipeline(KernelEntry& entry, const std::string& glsl);
+    std::string checkLimits(const KernelEntry& entry);
     KernelEntry* kernelFor(lua_State* L, int fn);
     BufferEntry* bufferFor(lua_State* L, int idx, bool create);
     Use* useFor(BufferEntry* entry, void* data);
@@ -513,6 +731,28 @@ bool VulkanBackend::Impl::init(std::string& error)
 
     VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VK_CHECK(vkCreateFence(device, &fci, nullptr, &fence));
+
+    // drivers check that the data is theirs, for this device and driver version, and ignore it otherwise
+    std::vector<char> cached;
+    if (!options.pipelineCachePath.empty())
+    {
+        if (FILE* f = fopen(options.pipelineCachePath.c_str(), "rb"))
+        {
+            char chunk[65536];
+            for (size_t n; (n = fread(chunk, 1, sizeof(chunk), f)) > 0;)
+                cached.insert(cached.end(), chunk, chunk + n);
+            fclose(f);
+        }
+    }
+    VkPipelineCacheCreateInfo pcci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    pcci.initialDataSize = cached.size();
+    pcci.pInitialData = cached.empty() ? nullptr : cached.data();
+    if (vkCreatePipelineCache(device, &pcci, nullptr, &pipelineCache) != VK_SUCCESS)
+    {
+        pcci.initialDataSize = 0;
+        pcci.pInitialData = nullptr;
+        VK_CHECK(vkCreatePipelineCache(device, &pcci, nullptr, &pipelineCache));
+    }
 
     if (!createHostWords(3, status))
     {
@@ -723,13 +963,25 @@ std::string VulkanBackend::Impl::probe()
 
 VulkanBackend::Impl::~Impl()
 {
+    // a driver still creating a pipeline can't be interrupted: its thread is left to finish, so the device must outlive it
+    if (compiler && compiler->shutdown())
+        deviceBusy = true;
+
+    // with the pipelines made so far, even if one is still being made
+    if (device)
+        savePipelineCache();
+
     // a device that may still be executing a run can't be waited for or have its resources destroyed; leak them instead
     if (device && !deviceBusy)
     {
         vkDeviceWaitIdle(device);
 
         for (auto& [key, entry] : kernels)
-            destroyPipeline(*entry);
+        {
+            if (entry->ready())
+                destroyPipeline(*entry);
+        }
+        vkDestroyPipelineCache(device, pipelineCache, nullptr);
         for (auto& [id, entry] : buffers)
             destroyBuffer(entry);
 
@@ -745,6 +997,31 @@ VulkanBackend::Impl::~Impl()
 
     if (instance && !deviceBusy)
         vkDestroyInstance(instance, nullptr);
+}
+
+void VulkanBackend::Impl::savePipelineCache()
+{
+    if (options.pipelineCachePath.empty() || !pipelineCache)
+        return;
+
+    size_t size = 0;
+    if (vkGetPipelineCacheData(device, pipelineCache, &size, nullptr) != VK_SUCCESS || size == 0)
+        return;
+    std::vector<char> data(size);
+    if (vkGetPipelineCacheData(device, pipelineCache, &size, data.data()) != VK_SUCCESS)
+        return;
+
+    // written next to it first, so that a process stopped meanwhile doesn't leave a truncated file
+    std::string temporary = options.pipelineCachePath + ".tmp";
+    FILE* f = fopen(temporary.c_str(), "wb");
+    if (!f)
+        return;
+    bool ok = fwrite(data.data(), 1, size, f) == size;
+    ok = fclose(f) == 0 && ok;
+    if (ok)
+        rename(temporary.c_str(), options.pipelineCachePath.c_str());
+    else
+        remove(temporary.c_str());
 }
 
 int VulkanBackend::Impl::findMemory(uint32_t typeBits, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred)
@@ -929,12 +1206,7 @@ void VulkanBackend::Impl::destroyBuffer(BufferEntry& entry)
 
 void VulkanBackend::Impl::destroyPipeline(KernelEntry& entry)
 {
-    vkDestroyPipeline(device, entry.pipeline, nullptr);
-    vkDestroyPipelineLayout(device, entry.pipelineLayout, nullptr);
-    vkDestroyDescriptorSetLayout(device, entry.setLayout, nullptr);
-    entry.pipeline = VK_NULL_HANDLE;
-    entry.pipelineLayout = VK_NULL_HANDLE;
-    entry.setLayout = VK_NULL_HANDLE;
+    Luau::Gpu::destroyPipeline(device, entry);
 }
 
 // frees the least recently used copy that the current run doesn't use, which the Luau buffer has the contents of; buffers
@@ -975,7 +1247,8 @@ void VulkanBackend::Impl::freeDeadBuffers()
         if (--kernel->users > 0)
             continue;
 
-        if (!deviceBusy)
+        uint32_t old = kernel->flags.fetch_or(KernelEntry::kAbandoned, std::memory_order_acq_rel);
+        if ((old & KernelEntry::kReady) && !deviceBusy)
             destroyPipeline(*kernel);
         kernels.erase(kernel->key);
     }
@@ -995,63 +1268,21 @@ void VulkanBackend::Impl::freeDeadBuffers()
 
 std::string VulkanBackend::Impl::buildPipeline(KernelEntry& entry, const std::string& glsl)
 {
+    std::string reason = checkLimits(entry);
+    if (reason.empty())
+        reason = createPipeline(device, pipelineCache, uint32_t(sizeof(PushConstants)), shaders, entry, glsl);
+    entry.flags.fetch_or(KernelEntry::kReady);
+    return reason;
+}
+
+std::string VulkanBackend::Impl::checkLimits(const KernelEntry& entry)
+{
     uint32_t bindings = uint32_t(entry.written.size()) + 2;
     if (bindings > limits.storageBuffers)
         return "kernel uses " + std::to_string(bindings) +
                " storage buffers (its buffer, the status words and the written parts), the device supports " + std::to_string(limits.storageBuffers);
     if (sizeof(PushConstants) > limits.pushConstants)
         return "device doesn't support " + std::to_string(sizeof(PushConstants)) + " bytes of push constants";
-
-    std::vector<uint32_t> spirv;
-    std::string error;
-    if (!shaders.compileSpirv(glsl, entry.name, spirv, error))
-        return "internal error, " + error;
-
-    VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smci.codeSize = spirv.size() * sizeof(uint32_t);
-    smci.pCode = spirv.data();
-    VkShaderModule module;
-    if (vkCreateShaderModule(device, &smci, nullptr, &module) != VK_SUCCESS)
-        return "vkCreateShaderModule failed";
-
-    std::vector<VkDescriptorSetLayoutBinding> layoutBindings(bindings);
-    for (uint32_t i = 0; i < bindings; ++i)
-    {
-        layoutBindings[i].binding = i;
-        layoutBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        layoutBindings[i].descriptorCount = 1;
-        layoutBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    }
-
-    VkDescriptorSetLayoutCreateInfo dslci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslci.bindingCount = bindings;
-    dslci.pBindings = layoutBindings.data();
-
-    VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, uint32_t(sizeof(PushConstants))};
-    VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    plci.setLayoutCount = 1;
-    plci.pSetLayouts = &entry.setLayout;
-    plci.pushConstantRangeCount = 1;
-    plci.pPushConstantRanges = &range;
-
-    VkComputePipelineCreateInfo cpci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpci.stage.module = module;
-    cpci.stage.pName = "main";
-
-    bool ok = vkCreateDescriptorSetLayout(device, &dslci, nullptr, &entry.setLayout) == VK_SUCCESS &&
-              vkCreatePipelineLayout(device, &plci, nullptr, &entry.pipelineLayout) == VK_SUCCESS;
-    cpci.layout = entry.pipelineLayout;
-    ok = ok && vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci, nullptr, &entry.pipeline) == VK_SUCCESS;
-    vkDestroyShaderModule(device, module, nullptr);
-
-    if (!ok)
-    {
-        destroyPipeline(entry);
-        return "failed to create the compute pipeline";
-    }
-
     return "";
 }
 
@@ -1073,16 +1304,31 @@ KernelEntry* VulkanBackend::Impl::kernelFor(lua_State* L, int fn)
     CodeGen::GpuKernel kernel = lowering(L, fn);
 
     std::string key = kernel.reason.empty() ? kernel.glsl : "\1" + kernel.name + "\1" + std::to_string(kernel.line) + "\1" + kernel.reason;
-    std::unique_ptr<KernelEntry>& entry = kernels[key];
+    std::shared_ptr<KernelEntry>& entry = kernels[key];
 
     if (!entry)
     {
-        entry = std::make_unique<KernelEntry>();
+        entry = std::make_shared<KernelEntry>();
         entry->key = key;
         entry->name = kernel.name;
         entry->written = kernel.bufferWritten;
+        entry->reason = kernel.reason.empty() ? checkLimits(*entry) : kernel.reason;
 
-        entry->reason = kernel.reason.empty() ? buildPipeline(*entry, kernel.glsl) : kernel.reason;
+        // drivers take a time growing faster than the code, about 40 s for 600 KB of GLSL and 160 s for 1.1 MB on NVIDIA's;
+        // larger kernels would keep a compile thread for most of an hour
+        if (entry->reason.empty() && kernel.glsl.size() > kMaxKernelGlsl)
+            entry->reason = "a kernel of " + std::to_string(kernel.glsl.size() >> 10) + " KB of GLSL, beyond the " +
+                            std::to_string(kMaxKernelGlsl >> 10) + " KB that drivers compile in a few minutes,";
+
+        if (entry->reason.empty())
+        {
+            if (!compiler)
+                compiler = std::make_unique<PipelineCompiler>(device, pipelineCache, uint32_t(sizeof(PushConstants)));
+            entry->glsl = std::move(kernel.glsl);
+            compiler->submit(entry);
+        }
+        else
+            entry->flags.fetch_or(KernelEntry::kReady);
     }
 
     KernelEntry* result = entry.get();
@@ -1218,6 +1464,14 @@ std::string VulkanBackend::Impl::run(lua_State* L, int fn, int list, uint32_t ru
 
     // kernels are lowered once, but the builtins they use can be replaced afterwards
     KernelEntry* kernel = kernelFor(L, fn);
+    if (!kernel->ready())
+    {
+        if (!options.waitForPipelines)
+            return kCompiling;
+        compiler->wait(*kernel);
+    }
+    if (kernel->reason.empty() && !kernel->compileError.empty())
+        kernel->reason = kernel->compileError;
     if (!kernel->reason.empty() || !CodeGen::isGpuEnvironmentSafe(L, fn))
         return kCannotRun;
 
