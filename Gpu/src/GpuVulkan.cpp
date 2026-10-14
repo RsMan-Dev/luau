@@ -12,9 +12,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -25,6 +28,122 @@ namespace Gpu
 
 namespace
 {
+
+// runs tasks on a few host threads: comparing and copying buffers is limited by memory bandwidth, which one thread doesn't use
+// up
+class HostThreads
+{
+public:
+    HostThreads()
+    {
+        unsigned n = std::thread::hardware_concurrency();
+        n = n < 2 ? 0 : n > 8 ? 7 : n - 1;
+        for (unsigned i = 0; i < n; ++i)
+            workers.emplace_back(
+                [this]
+                {
+                    work();
+                }
+            );
+    }
+
+    ~HostThreads()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        wake.notify_all();
+        for (std::thread& t : workers)
+            t.join();
+    }
+
+    // calls task(i) for i = 0 .. count-1, on this thread and the workers, and returns once every call returned; a few tasks
+    // run on this thread only, since waking the workers costs more than they take
+    void run(size_t count, const std::function<void(size_t)>& task)
+    {
+        if (workers.empty() || count < 32)
+        {
+            for (size_t i = 0; i < count; ++i)
+                task(i);
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            current = &task;
+            total = count;
+            next = 0;
+            pending = count;
+            generation++;
+        }
+        wake.notify_all();
+        take();
+
+        std::unique_lock<std::mutex> lock(mutex);
+        finished.wait(
+            lock,
+            [this]
+            {
+                return pending == 0;
+            }
+        );
+        current = nullptr;
+    }
+
+private:
+    std::vector<std::thread> workers;
+    std::mutex mutex;
+    std::condition_variable wake, finished;
+    const std::function<void(size_t)>* current = nullptr;
+    size_t total = 0, next = 0, pending = 0;
+    uint64_t generation = 0;
+    bool stopping = false;
+
+    void take()
+    {
+        for (;;)
+        {
+            size_t i;
+            const std::function<void(size_t)>* task;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!current || next >= total)
+                    return;
+                i = next++;
+                task = current;
+            }
+
+            (*task)(i);
+
+            std::lock_guard<std::mutex> lock(mutex);
+            if (--pending == 0)
+                finished.notify_one();
+        }
+    }
+
+    void work()
+    {
+        uint64_t seen = 0;
+        for (;;)
+        {
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                wake.wait(
+                    lock,
+                    [&]
+                    {
+                        return stopping || generation != seen;
+                    }
+                );
+                if (stopping)
+                    return;
+                seen = generation;
+            }
+            take();
+        }
+    }
+};
 
 // registry tables, weak on their keys, that map functions to kernels and buffers to the device copies of them
 const char* const kKernelsKey = "_GPUKERNELS";
@@ -191,8 +310,12 @@ struct VulkanBackend::Impl
     HostWords status;
     // the parts of the buffers of a run that its kernel wrote
     HostWords written;
+    // a copy of them the host reads, in cached memory: reading device memory from the host is slow
+    HostWords writtenCopy;
 
     std::vector<std::unique_ptr<MemoryBlock>> blocks;
+
+    HostThreads threads;
 
     ShaderCompiler shaders;
     std::function<CodeGen::GpuKernel(lua_State*, int)> lowering = CodeGen::compileGpu;
@@ -231,7 +354,7 @@ struct VulkanBackend::Impl
     ~Impl();
 
     bool init(std::string& error);
-    bool createHostWords(uint32_t words, HostWords& result);
+    bool createHostWords(uint32_t words, HostWords& result, bool cached = false);
     void destroyHostWords(HostWords& words);
     std::string probe();
     int findMemory(uint32_t typeBits, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred);
@@ -419,21 +542,23 @@ bool VulkanBackend::Impl::init(std::string& error)
 // the status words are read by every invocation and written by the host while a run is going on, and kernels read and set
 // the words of written parts, so both live in device memory the host can map when there is some (resizable BAR), and in
 // host memory otherwise
-bool VulkanBackend::Impl::createHostWords(uint32_t words, HostWords& result)
+bool VulkanBackend::Impl::createHostWords(uint32_t words, HostWords& result, bool cached)
 {
     HostWords w;
     w.words = words;
 
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = words * 4;
-    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (vkCreateBuffer(device, &bci, nullptr, &w.buffer) != VK_SUCCESS)
         return false;
 
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(device, w.buffer, &req);
     int type = findMemory(
-        req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+        req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        cached ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
     );
 
     VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -610,6 +735,7 @@ VulkanBackend::Impl::~Impl()
 
         destroyHostWords(status);
         destroyHostWords(written);
+        destroyHostWords(writtenCopy);
 
         vkDestroyDescriptorPool(device, descriptorPool, nullptr);
         vkDestroyFence(device, fence, nullptr);
@@ -1145,7 +1271,7 @@ std::string VulkanBackend::Impl::download()
         commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT
     );
 
-    const volatile uint32_t* flags = static_cast<const volatile uint32_t*>(written.mapped);
+    const uint32_t* flags = static_cast<const uint32_t*>(writtenCopy.mapped);
     std::vector<VkBufferCopy> regions;
     std::vector<std::vector<VkBufferCopy>> copied(uses.size());
     bool submitting = false;
@@ -1182,17 +1308,30 @@ std::string VulkanBackend::Impl::download()
     if (!reason.empty())
         return reason;
 
+    // copied back to the Luau buffers in parts, by several threads
+    std::vector<std::pair<size_t, VkDeviceSize>> parts;
     for (size_t i = 0; i < uses.size(); ++i)
     {
         BufferEntry* e = uses[i].entry;
         for (const VkBufferCopy& r : copied[i])
         {
+            for (VkDeviceSize offset = r.srcOffset; offset < r.srcOffset + r.size; offset += kChunk)
+                parts.push_back({i, offset});
             // the last word may be partly past the end of the Luau buffer
-            size_t bytes = size_t(std::min<VkDeviceSize>(r.size, e->size - std::min<VkDeviceSize>(r.srcOffset, e->size)));
-            memcpy(static_cast<uint8_t*>(uses[i].data) + r.srcOffset, static_cast<uint8_t*>(e->mapped) + r.srcOffset, bytes);
-            stats.downloadedBytes += bytes;
+            stats.downloadedBytes += std::min<VkDeviceSize>(r.size, e->size - std::min<VkDeviceSize>(r.srcOffset, e->size));
         }
     }
+
+    threads.run(
+        parts.size(),
+        [&](size_t i)
+        {
+            const Use& u = uses[parts[i].first];
+            VkDeviceSize offset = parts[i].second;
+            size_t bytes = size_t(std::min<VkDeviceSize>(kChunk, u.entry->size - std::min<VkDeviceSize>(offset, u.entry->size)));
+            memcpy(static_cast<uint8_t*>(u.data) + offset, static_cast<uint8_t*>(u.entry->mapped) + offset, bytes);
+        }
+    );
 
     return "";
 }
@@ -1239,7 +1378,9 @@ std::string VulkanBackend::Impl::prepare(lua_State* L, const KernelEntry& kernel
     if (words > written.words)
     {
         destroyHostWords(written);
-        if (!createHostWords(std::max(words, written.words * 2), written))
+        destroyHostWords(writtenCopy);
+        uint32_t size = std::max(words, written.words * 2);
+        if (!createHostWords(size, written) || !createHostWords(size, writtenCopy, true))
             return "not enough memory to track what a run writes";
     }
 
@@ -1276,29 +1417,50 @@ void VulkanBackend::Impl::record(const KernelEntry& kernel, uint32_t runs)
     vkResetCommandBuffer(commandBuffer, 0);
     vkBeginCommandBuffer(commandBuffer, &begin);
 
-    // only the parts of a buffer that differ from its device copy are uploaded
-    std::vector<VkBufferCopy> regions;
+    // only the parts of a buffer that differ from its device copy are uploaded; they're compared and copied by several threads
+    std::vector<std::pair<Use*, VkDeviceSize>> parts;
     for (Use& u : uses)
     {
-        BufferEntry* e = u.entry;
-        regions.clear();
+        for (VkDeviceSize offset = 0; offset < u.entry->deviceSize; offset += kChunk)
+            parts.push_back({&u, offset});
+    }
 
-        for (VkDeviceSize offset = 0; offset < e->deviceSize; offset += kChunk)
+    std::vector<uint8_t> changed(parts.size(), 0);
+    threads.run(
+        parts.size(),
+        [&](size_t i)
         {
-            VkDeviceSize size = std::min(kChunk, e->deviceSize - offset);
+            BufferEntry* e = parts[i].first->entry;
+            VkDeviceSize offset = parts[i].second;
             // the last word may be partly past the end of the Luau buffer
-            size_t bytes = size_t(std::min<VkDeviceSize>(size, e->size - std::min<VkDeviceSize>(offset, e->size)));
+            size_t bytes =
+                size_t(std::min<VkDeviceSize>(std::min(kChunk, e->deviceSize - offset), e->size - std::min<VkDeviceSize>(offset, e->size)));
             uint8_t* mirror = static_cast<uint8_t*>(e->mapped) + offset;
-            const uint8_t* data = static_cast<const uint8_t*>(u.data) + offset;
+            const uint8_t* data = static_cast<const uint8_t*>(parts[i].first->data) + offset;
             if (e->valid && memcmp(mirror, data, bytes) == 0)
-                continue;
+                return;
 
             memcpy(mirror, data, bytes);
+            changed[i] = 1;
+        }
+    );
+
+    std::vector<VkBufferCopy> regions;
+    for (size_t i = 0; i < parts.size();)
+    {
+        BufferEntry* e = parts[i].first->entry;
+        regions.clear();
+        for (; i < parts.size() && parts[i].first->entry == e; ++i)
+        {
+            if (!changed[i])
+                continue;
+
+            VkDeviceSize offset = parts[i].second, size = std::min(kChunk, e->deviceSize - offset);
             if (!regions.empty() && regions.back().srcOffset + regions.back().size == offset)
                 regions.back().size += size;
             else
                 regions.push_back({offset, offset, size});
-            stats.uploadedBytes += bytes;
+            stats.uploadedBytes += std::min<VkDeviceSize>(size, e->size - std::min<VkDeviceSize>(offset, e->size));
         }
 
         if (!regions.empty())
@@ -1385,6 +1547,7 @@ void VulkanBackend::Impl::record(const KernelEntry& kernel, uint32_t runs)
             if (u.entry->deviceSize <= kChunk)
                 copyBuffer(commandBuffer, u.entry->device, u.entry->staging, u.entry->deviceSize);
         }
+        copyBuffer(commandBuffer, written.buffer, writtenCopy.buffer, VkDeviceSize(written.words) * 4);
     }
 
     barrier(
