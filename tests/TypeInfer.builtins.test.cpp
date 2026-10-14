@@ -13,8 +13,6 @@ using namespace Luau;
 LUAU_FASTFLAG(DebugLuauForceOldSolver)
 LUAU_FASTFLAG(LuauNewTypePathErrorMessages)
 LUAU_FASTFLAG(LuauRemoveLoadstringFromBuiltinDefinitions)
-LUAU_FASTFLAG(LuauGpuKernels)
-LUAU_FASTFLAG(LuauGpuLibrary)
 
 TEST_SUITE_BEGIN("BuiltinTests");
 
@@ -2091,37 +2089,6 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "table_freeze_function")
 
     LUAU_REQUIRE_ERROR_COUNT(1, result);
     CHECK_EQ("Argument count mismatch. Function 'table.freeze' expects 1 argument, but none are specified", toString(result.errors[0]));
-}
-
-TEST_CASE_FIXTURE(BuiltinsFixture, "gpu_library_types")
-{
-    ScopedFastFlag sff[] = {{FFlag::LuauGpuKernels, true}, {FFlag::LuauGpuLibrary, true}};
-
-    CheckResult result = check(R"(
-local function k(i: number, a: buffer, b: buffer)
-end
-
-local a, b = buffer.create(16), buffer.create(16)
-gpu.dispatch(k, 4, a, b)
-local where: string, why: string? = gpu.status(k)
-local old: number = gpu.atomicadd(a, 0, 1)
-)");
-
-    LUAU_REQUIRE_NO_ERRORS(result);
-}
-
-TEST_CASE_FIXTURE(BuiltinsFixture, "gpu_dispatch_checks_the_count")
-{
-    ScopedFastFlag sff[] = {{FFlag::LuauGpuKernels, true}, {FFlag::LuauGpuLibrary, true}};
-
-    CheckResult result = check(R"(
-local function k(i: number, a: buffer)
-end
-
-gpu.dispatch(k, "four", buffer.create(16))
-)");
-
-    LUAU_REQUIRE_ERRORS(result);
 }
 
 TEST_SUITE_END();

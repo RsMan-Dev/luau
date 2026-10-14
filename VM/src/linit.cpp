@@ -7,7 +7,6 @@
 
 LUAU_FASTFLAG(LuauIntegerLibrary)
 LUAU_FASTFLAG(DebugLuauUserDefinedClassesRuntime)
-LUAU_FASTFLAG(LuauGpuLibrary)
 LUAU_FASTFLAGVARIABLE(LuauSandboxFreezesVectorMetatable)
 
 static const luaL_Reg lualibs[] = {
@@ -60,13 +59,6 @@ void luaL_openlibs(lua_State* L)
     {
         lua_pushcfunction(L, luaopen_class, NULL);
         lua_pushstring(L, LUA_CLASSLIBNAME);
-        lua_call(L, 1, 0);
-    }
-
-    if (FFlag::LuauGpuLibrary)
-    {
-        lua_pushcfunction(L, luaopen_gpu, NULL);
-        lua_pushstring(L, LUA_GPULIBNAME);
         lua_call(L, 1, 0);
     }
 }
