@@ -68,7 +68,7 @@ static int host_clock(lua_State* L)
 
 static int host_stats(lua_State* L)
 {
-    lua_createtable(L, 0, 8);
+    lua_createtable(L, 0, 9);
     if (gBackend)
     {
         Luau::Gpu::RunStats s = gBackend->stats();
@@ -88,6 +88,8 @@ static int host_stats(lua_State* L)
         lua_setfield(L, -2, "memoryBytes");
         lua_pushnumber(L, double(s.kernels));
         lua_setfield(L, -2, "kernels");
+        lua_pushnumber(L, double(s.checkedRuns));
+        lua_setfield(L, -2, "checkedRuns");
     }
     return 1;
 }
