@@ -155,8 +155,9 @@ bool ShaderCompiler::crossCompile(const std::vector<uint32_t>& spirv, ShaderTarg
             options, SPVC_COMPILER_OPTION_MSL_PLATFORM, target == ShaderTarget::MslIos ? SPVC_MSL_PLATFORM_IOS : SPVC_MSL_PLATFORM_MACOS
         );
 
-        // binding i (kernel buffers, then the status word) becomes [[buffer(i)]], independently of which bindings the shader uses
-        for (uint32_t i = 0; i <= kMaxKernelBuffers && ok; ++i)
+        // binding i (kernel buffers, the status word, the written parts) becomes [[buffer(i)]], independently of which bindings
+        // the shader uses
+        for (uint32_t i = 0; i < kBindings && ok; ++i)
         {
             spvc_msl_resource_binding_2 binding;
             spvc_msl_resource_binding_init_2(&binding);

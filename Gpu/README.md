@@ -65,8 +65,9 @@ A buffer listed several times runs several times, in the order of the list; diff
 - Numbers are 32-bit on the GPU. Integers stay exact: the lowering types each value as `int`, `uint` or `float` from how
   it's produced, and a result that wouldn't be the VM's (an integer overflow, a conversion that isn't exact) fails the
   run. Floating point math is f32 instead of f64, and keeps NaN, infinities and signed zeros.
-- Buffers stay on the GPU between runs. A run only uploads the parts of a buffer that changed since the GPU last had it,
-  and downloads every buffer it was given.
+- Buffers stay on the GPU between runs. A run only uploads the 64 KB parts of a buffer that changed since the GPU last had
+  it, and only downloads the parts its kernel wrote: kernels mark each part they write to, and the parts they don't are
+  still those of the Luau buffer.
 
 ## Safety
 
@@ -168,6 +169,5 @@ without running the script (see [Other platforms](#other-platforms)).
 
 ## Known limitations
 
-- Every run is synchronous and downloads its buffers, even the parts the kernel didn't write: data used by several
-  passes in one buffer (as in the rasterizer, about 35 MB) is copied back after each pass.
+- Every run is synchronous, and downloads every part its kernel wrote, even when a later run overwrites it.
 - Tools built on the upstream parser (luau-lsp, StyLua, selene) report `@gpu` as an invalid attribute.

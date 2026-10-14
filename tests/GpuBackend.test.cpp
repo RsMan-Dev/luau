@@ -638,6 +638,85 @@ assert(buffer.readu32(b, 60) == 115)
     CHECK(stats.downloadedBytes == 64 * 6);
 }
 
+TEST_CASE("only_the_parts_kernels_write_are_downloaded_and_the_others_match_luau")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // buffers come back in parts of 64 KB: this one has three whole parts and a last one of 10 bytes. The kernel writes the
+    // last word of part 0, the first word of part 1 and a word of the last part, never part 2
+    CHECK(run(*backend, std::string(kSquare) + R"(
+local PART = 65536
+local SIZE = 3 * PART + 10
+
+@gpu
+local function sparse(b: buffer, i: number)
+    local o = if i == 0 then 65532 elseif i == 1 then 65536 else 196612
+    buffer.writeu32(b, o, bit32.bxor(buffer.readu32(b, o), 0x5a5a5a5a + i))
+end
+
+-- the same calls from Luau, on another copy
+local function reference(b: buffer, times: number)
+    for _ = 1, times do
+        for i = 0, 2 do
+            sparse(b, i)
+        end
+    end
+end
+
+local b = buffer.create(SIZE)
+for o = 0, SIZE - 1 do
+    buffer.writeu8(b, o, o % 251)
+end
+local expected = copy(b)
+
+local function runs(list, times)
+    assert(gpu.run(sparse, list, 3))
+    reference(expected, times)
+    assert(same(b, expected))
+end
+
+runs({ b }, 1)
+
+-- Luau changes a part the kernel writes and one it doesn't: both changes reach the GPU, and stay
+buffer.writeu32(b, 2 * PART + 100, 0xdeadbeef)
+buffer.writeu32(b, PART + 8, 0x12345678)
+buffer.writeu8(b, SIZE - 1, 7)
+buffer.copy(expected, 0, b)
+runs({ b }, 1)
+
+-- listed twice, the second run sees what the first wrote
+runs({ b, b }, 2)
+)") == "");
+
+    // three runs of the kernel's three parts, the last one 10 bytes: part 2 never comes back
+    CHECK(backend->stats().downloadedBytes == 3 * (65536 * 2 + 10));
+
+    // a run that fails after writing parts of the buffers leaves them all as they were
+    CHECK(run(*backend, std::string(kSquare) + R"(
+@gpu
+local function partly(b: buffer, i: number)
+    buffer.writeu32(b, i * 4 * 16384, 1)
+    if i == 3 and buffer.len(b) < 4 * 65536 then
+        buffer.writeu32(b, buffer.len(b), 1)
+    end
+end
+
+local a, b = buffer.create(4 * 65536), buffer.create(3 * 65536 + 4)
+buffer.fill(a, 0, 9)
+buffer.fill(b, 0, 5)
+local beforeA, beforeB = copy(a), copy(b)
+local ok, err = gpu.run(partly, { a, b }, 4)
+assert(not ok and string.find(err, "failed on the GPU", 1, true), err)
+assert(same(a, beforeA) and same(b, beforeB))
+
+-- and the next run starts again from the Luau contents
+assert(gpu.run(partly, { a }, 4))
+assert(buffer.readu32(a, 0) == 1 and buffer.readu32(a, 4) == 0x09090909 and buffer.readu32(a, 3 * 65536) == 1)
+)") == "");
+}
+
 TEST_CASE("buffers_reusing_an_address_are_uploaded_again")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();

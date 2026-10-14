@@ -115,6 +115,8 @@ struct Use
 {
     BufferEntry* entry;
     void* data;
+    // its words in the binding of written parts
+    uint32_t written = 0;
 };
 
 struct Limits
@@ -179,12 +181,16 @@ struct VulkanBackend::Impl
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     uint32_t descriptorSets = 0;
 
-    struct
+    struct HostWords
     {
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         void* mapped = nullptr;
-    } status;
+        uint32_t words = 0;
+    };
+    HostWords status;
+    // the parts of the buffers of a run that its kernel wrote
+    HostWords written;
 
     std::vector<std::unique_ptr<MemoryBlock>> blocks;
 
@@ -225,6 +231,8 @@ struct VulkanBackend::Impl
     ~Impl();
 
     bool init(std::string& error);
+    bool createHostWords(uint32_t words, HostWords& result);
+    void destroyHostWords(HostWords& words);
     std::string probe();
     int findMemory(uint32_t typeBits, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred);
     bool allocate(const VkMemoryRequirements& req, uint32_t type, bool map, Memory& mem);
@@ -244,6 +252,7 @@ struct VulkanBackend::Impl
 
     std::string run(lua_State* L, int fn, int list, uint32_t runs);
     std::string prepare(lua_State* L, const KernelEntry& kernel, int list, uint32_t runs);
+    std::string download();
     void record(const KernelEntry& kernel, uint32_t runs);
     std::string submit();
 };
@@ -382,28 +391,11 @@ bool VulkanBackend::Impl::init(std::string& error)
     VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VK_CHECK(vkCreateFence(device, &fci, nullptr, &fence));
 
-    // the status words are read by every invocation and written by the host while a run is going on, so they live in device
-    // memory the host can map when there is some (resizable BAR), and in host memory otherwise
-    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bci.size = 12;
-    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    VK_CHECK(vkCreateBuffer(device, &bci, nullptr, &status.buffer));
-    VkMemoryRequirements req;
-    vkGetBufferMemoryRequirements(device, status.buffer, &req);
-    int type = findMemory(
-        req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-    );
-    if (type < 0)
+    if (!createHostWords(3, status))
     {
-        error = "no host visible memory";
+        error = "no host visible memory for the status words";
         return false;
     }
-    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    mai.allocationSize = req.size;
-    mai.memoryTypeIndex = type;
-    VK_CHECK(vkAllocateMemory(device, &mai, nullptr, &status.memory));
-    VK_CHECK(vkBindBufferMemory(device, status.buffer, status.memory, 0));
-    VK_CHECK(vkMapMemory(device, status.memory, 0, 12, 0, &status.mapped));
 
     // feature bits aren't enough: kernels must compute what the VM does, and runaway ones must stop when asked
     if (!floatReason.empty())
@@ -424,6 +416,47 @@ bool VulkanBackend::Impl::init(std::string& error)
 
 #undef VK_CHECK
 
+// the status words are read by every invocation and written by the host while a run is going on, and kernels read and set
+// the words of written parts, so both live in device memory the host can map when there is some (resizable BAR), and in
+// host memory otherwise
+bool VulkanBackend::Impl::createHostWords(uint32_t words, HostWords& result)
+{
+    HostWords w;
+    w.words = words;
+
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = words * 4;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (vkCreateBuffer(device, &bci, nullptr, &w.buffer) != VK_SUCCESS)
+        return false;
+
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device, w.buffer, &req);
+    int type = findMemory(
+        req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+    );
+
+    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = uint32_t(type);
+    if (type < 0 || vkAllocateMemory(device, &mai, nullptr, &w.memory) != VK_SUCCESS ||
+        vkBindBufferMemory(device, w.buffer, w.memory, 0) != VK_SUCCESS || vkMapMemory(device, w.memory, 0, bci.size, 0, &w.mapped) != VK_SUCCESS)
+    {
+        destroyHostWords(w);
+        return false;
+    }
+
+    result = w;
+    return true;
+}
+
+void VulkanBackend::Impl::destroyHostWords(HostWords& words)
+{
+    vkDestroyBuffer(device, words.buffer, nullptr);
+    vkFreeMemory(device, words.memory, nullptr);
+    words = HostWords();
+}
+
 // runs a kernel that checks what the shaders the lowering produces rely on: NaN, infinities and signed zeros are kept, and
 // a loop sees the stop word the host writes while it runs
 static const char* const kProbe = R"(#version 450
@@ -432,7 +465,7 @@ spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [44
 layout(local_size_x = 1) in;
 layout(std430, set = 0, binding = 0) buffer B0 { uint d[]; } b0;
 layout(std430, set = 0, binding = 1) coherent volatile buffer BS { uint err; int stop; uint started; } st;
-layout(push_constant) uniform PC { uint n; uint budget; uint len[1]; } pc;
+layout(push_constant) uniform PC { uint n; uint budget; uint len[1]; uint written; } pc;
 
 void main()
 {
@@ -464,7 +497,7 @@ std::string VulkanBackend::Impl::probe()
     BufferEntry buffer;
     buffer.deviceSize = 32;
     VkDescriptorPool pool = VK_NULL_HANDLE;
-    VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+    VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kBindings};
     VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = 1;
     dpci.poolSizeCount = 1;
@@ -571,8 +604,8 @@ VulkanBackend::Impl::~Impl()
         for (auto& [id, entry] : buffers)
             destroyBuffer(entry);
 
-        vkDestroyBuffer(device, status.buffer, nullptr);
-        vkFreeMemory(device, status.memory, nullptr);
+        destroyHostWords(status);
+        destroyHostWords(written);
 
         vkDestroyDescriptorPool(device, descriptorPool, nullptr);
         vkDestroyFence(device, fence, nullptr);
@@ -832,10 +865,10 @@ void VulkanBackend::Impl::freeDeadBuffers()
 
 std::string VulkanBackend::Impl::buildPipeline(KernelEntry& entry, const std::string& glsl)
 {
-    uint32_t bindings = uint32_t(entry.written.size()) + 1;
+    uint32_t bindings = uint32_t(entry.written.size()) + 2;
     if (bindings > limits.storageBuffers)
-        return "kernel uses " + std::to_string(bindings) + " storage buffers (its buffers and a status word), the device supports " +
-               std::to_string(limits.storageBuffers);
+        return "kernel uses " + std::to_string(bindings) +
+               " storage buffers (its buffer, the status words and the written parts), the device supports " + std::to_string(limits.storageBuffers);
     if (sizeof(PushConstants) > limits.pushConstants)
         return "device doesn't support " + std::to_string(sizeof(PushConstants)) + " bytes of push constants";
 
@@ -1042,8 +1075,8 @@ Use* VulkanBackend::Impl::useFor(BufferEntry* entry, void* data)
 
 const char* const kCannotRun = "Function cannot run in GPU";
 
-// buffers are compared with their device copies, and uploaded, in parts of this size
-constexpr VkDeviceSize kUploadChunk = 64 << 10;
+// buffers are compared with their device copies, uploaded, and downloaded when kernels write them, in parts of this size
+constexpr VkDeviceSize kChunk = VkDeviceSize(1) << kWrittenChunkShift;
 
 std::string VulkanBackend::Impl::run(lua_State* L, int fn, int list, uint32_t runs)
 {
@@ -1079,17 +1112,84 @@ std::string VulkanBackend::Impl::run(lua_State* L, int fn, int list, uint32_t ru
                "loop limit)";
     }
 
-    // the device copies are now those of the Luau buffers
+    // the parts the kernel didn't write are still those the Luau buffers have, since they were uploaded or found the same;
+    // the parts it wrote are downloaded
     if (kernel->written[0])
     {
-        for (Use& u : uses)
+        reason = download();
+        if (!reason.empty())
         {
-            memcpy(u.data, u.entry->mapped, u.entry->size);
-            stats.downloadedBytes += u.entry->size;
+            for (Use& u : uses)
+                u.entry->valid = false;
+            return reason;
         }
     }
 
     stats.succeeded++;
+    return "";
+}
+
+std::string VulkanBackend::Impl::download()
+{
+    VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkResetCommandBuffer(commandBuffer, 0);
+    vkBeginCommandBuffer(commandBuffer, &begin);
+
+    // what the run wrote, in the previous submission
+    barrier(
+        commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT
+    );
+
+    const volatile uint32_t* flags = static_cast<const volatile uint32_t*>(written.mapped);
+    std::vector<VkBufferCopy> regions;
+    std::vector<std::vector<VkBufferCopy>> copied(uses.size());
+    bool submitting = false;
+    for (size_t i = 0; i < uses.size(); ++i)
+    {
+        BufferEntry* e = uses[i].entry;
+        regions.clear();
+
+        for (VkDeviceSize offset = 0; offset < e->deviceSize; offset += kChunk)
+        {
+            if (flags[uses[i].written + offset / kChunk] == 0)
+                continue;
+
+            VkDeviceSize size = std::min(kChunk, e->deviceSize - offset);
+            if (!regions.empty() && regions.back().srcOffset + regions.back().size == offset)
+                regions.back().size += size;
+            else
+                regions.push_back({offset, offset, size});
+        }
+
+        // a single part is already in the host mirror
+        if (!regions.empty() && e->deviceSize > kChunk)
+        {
+            vkCmdCopyBuffer(commandBuffer, e->device, e->staging, uint32_t(regions.size()), regions.data());
+            submitting = true;
+        }
+        copied[i] = regions;
+    }
+
+    barrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+    vkEndCommandBuffer(commandBuffer);
+
+    std::string reason = submitting ? submit() : "";
+    if (!reason.empty())
+        return reason;
+
+    for (size_t i = 0; i < uses.size(); ++i)
+    {
+        BufferEntry* e = uses[i].entry;
+        for (const VkBufferCopy& r : copied[i])
+        {
+            // the last word may be partly past the end of the Luau buffer
+            size_t bytes = size_t(std::min<VkDeviceSize>(r.size, e->size - std::min<VkDeviceSize>(r.srcOffset, e->size)));
+            memcpy(static_cast<uint8_t*>(uses[i].data) + r.srcOffset, static_cast<uint8_t*>(e->mapped) + r.srcOffset, bytes);
+            stats.downloadedBytes += bytes;
+        }
+    }
+
     return "";
 }
 
@@ -1125,6 +1225,20 @@ std::string VulkanBackend::Impl::prepare(lua_State* L, const KernelEntry& kernel
         useFor(entry, data);
     }
 
+    // a word per part of each buffer, for the kernel to set when it writes there
+    uint32_t words = 0;
+    for (Use& u : uses)
+    {
+        u.written = words;
+        words += uint32_t((u.entry->deviceSize + kChunk - 1) / kChunk);
+    }
+    if (words > written.words)
+    {
+        destroyHostWords(written);
+        if (!createHostWords(std::max(words, written.words * 2), written))
+            return "not enough memory to track what a run writes";
+    }
+
     if (descriptorSets < listed.size())
     {
         if (descriptorPool)
@@ -1134,7 +1248,7 @@ std::string VulkanBackend::Impl::prepare(lua_State* L, const KernelEntry& kernel
         while (sets < listed.size())
             sets *= 2;
 
-        VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sets * (kMaxKernelBuffers + 1)};
+        VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sets * kBindings};
         VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         dpci.maxSets = sets;
         dpci.poolSizeCount = 1;
@@ -1165,9 +1279,9 @@ void VulkanBackend::Impl::record(const KernelEntry& kernel, uint32_t runs)
         BufferEntry* e = u.entry;
         regions.clear();
 
-        for (VkDeviceSize offset = 0; offset < e->deviceSize; offset += kUploadChunk)
+        for (VkDeviceSize offset = 0; offset < e->deviceSize; offset += kChunk)
         {
-            VkDeviceSize size = std::min(kUploadChunk, e->deviceSize - offset);
+            VkDeviceSize size = std::min(kChunk, e->deviceSize - offset);
             // the last word may be partly past the end of the Luau buffer
             size_t bytes = size_t(std::min<VkDeviceSize>(size, e->size - std::min<VkDeviceSize>(offset, e->size)));
             uint8_t* mirror = static_cast<uint8_t*>(e->mapped) + offset;
@@ -1187,6 +1301,9 @@ void VulkanBackend::Impl::record(const KernelEntry& kernel, uint32_t runs)
             vkCmdCopyBuffer(commandBuffer, e->staging, e->device, uint32_t(regions.size()), regions.data());
         e->valid = true;
     }
+
+    // no part is written yet
+    vkCmdFillBuffer(commandBuffer, written.buffer, 0, VK_WHOLE_SIZE, 0);
 
     barrier(
         commandBuffer,
@@ -1222,9 +1339,11 @@ void VulkanBackend::Impl::record(const KernelEntry& kernel, uint32_t runs)
         VkDescriptorSet set;
         vkAllocateDescriptorSets(device, &dsai, &set);
 
-        VkDescriptorBufferInfo infos[2] = {{entry->device, 0, VK_WHOLE_SIZE}, {status.buffer, 0, VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet writes[2] = {};
-        for (uint32_t b = 0; b < 2; ++b)
+        VkDescriptorBufferInfo infos[kBindings] = {
+            {entry->device, 0, VK_WHOLE_SIZE}, {status.buffer, 0, VK_WHOLE_SIZE}, {written.buffer, 0, VK_WHOLE_SIZE}
+        };
+        VkWriteDescriptorSet writes[kBindings] = {};
+        for (uint32_t b = 0; b < kBindings; ++b)
         {
             writes[b] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             writes[b].dstSet = set;
@@ -1233,29 +1352,44 @@ void VulkanBackend::Impl::record(const KernelEntry& kernel, uint32_t runs)
             writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[b].pBufferInfo = &infos[b];
         }
-        vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+        vkUpdateDescriptorSets(device, kBindings, writes, 0, nullptr);
 
         PushConstants push = {};
         push.count = runs;
         push.loopBudget = options.loopBudget;
         push.lengths[0] = uint32_t(entry->size);
+        push.written = useFor(entry, nullptr)->written;
 
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipelineLayout, 0, 1, &set, 0, nullptr);
         vkCmdPushConstants(commandBuffer, kernel.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
         vkCmdDispatch(commandBuffer, groupsX, (groups + groupsX - 1) / groupsX, 1);
     }
 
-    barrier(
-        commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT
-    );
-
+    // buffers of a single part come back at once, which spares a submission; the host then reads the status and written parts
+    // words, and downloads the parts the kernel wrote of larger buffers
     if (kernel.written[0])
     {
+        barrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT
+        );
         for (Use& u : uses)
-            copyBuffer(commandBuffer, u.entry->device, u.entry->staging, u.entry->deviceSize);
+        {
+            if (u.entry->deviceSize <= kChunk)
+                copyBuffer(commandBuffer, u.entry->device, u.entry->staging, u.entry->deviceSize);
+        }
     }
 
-    barrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+    barrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        VK_ACCESS_HOST_READ_BIT
+    );
 
     vkEndCommandBuffer(commandBuffer);
 }

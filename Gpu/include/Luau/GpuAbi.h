@@ -11,6 +11,8 @@
 //     must be discarded: the run then fails, and leaves the Luau buffer as it was. The host sets 'stop' to a nonzero value
 //     to make invocations that start afterwards give up at once, and loops within 256 iterations, which bounds the GPU time
 //     a runaway kernel takes. Invocation 0 sets 'started', so that the host measures that time from when the run starts
+//   - binding 2: a word per 2^kWrittenChunkShift bytes of the buffer, from PushConstants::written; kernels set the word of
+//     each part of the buffer they write to a nonzero value, and the host only downloads those parts
 //   - push constants: GpuPushConstants
 //   - workgroups of kGpuWorkgroupSize invocations along x; invocation index = x + y * groupsX * kGpuWorkgroupSize
 namespace Luau
@@ -19,6 +21,10 @@ namespace Gpu
 {
 
 constexpr int kMaxKernelBuffers = 1;
+constexpr int kStatusBinding = kMaxKernelBuffers;
+constexpr int kWrittenBinding = kMaxKernelBuffers + 1;
+constexpr int kBindings = kMaxKernelBuffers + 2;
+constexpr int kWrittenChunkShift = 16;
 constexpr uint32_t kWorkgroupSize = 64;
 
 struct PushConstants
@@ -29,6 +35,8 @@ struct PushConstants
     uint32_t loopBudget;
     // size of the buffer in bytes
     uint32_t lengths[kMaxKernelBuffers];
+    // the word of the first part of the buffer in the binding of written parts
+    uint32_t written;
 };
 
 static_assert(sizeof(PushConstants) <= 128, "push constants must fit the minimum size guaranteed by Vulkan");

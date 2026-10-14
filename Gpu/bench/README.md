@@ -5,7 +5,7 @@
 | Mode | What runs |
 |---|---|
 | native loop | the kernel called from a plain Luau `for` loop, compiled to native code: what a script does without `gpu.run` |
-| gpu | `gpu.run` on the GPU, **including every transfer** (uploads of the parts that changed, downloads of the whole buffer) |
+| gpu | `gpu.run` on the GPU, **including every transfer** (uploads of the parts that changed, downloads of the parts written) |
 
 ```sh
 ./build/luau-gpu Gpu/bench/bench.luau            # every scenario
@@ -37,28 +37,31 @@ rounding, and n-body sums 4096 terms.
 2026-10-14, NVIDIA GeForce RTX 4080 (shared with another application using about 40% of it), AMD Ryzen 9 9950X3D,
 RelWithDebInfo build, scripts sandboxed with native code generation (as `luau --codegen` runs them):
 
-| Scenario | Size | Native loop ms | GPU ms | GPU median ms | Speedup vs native | Match |
-|---|---|---:|---:|---:|---:|---|
-| saxpy | 1000000 floats | 16.418 | 1.302 | 1.348 | 12.6x | yes |
-| tiny saxpy | 64 floats | 0.001 | 0.020 | 0.024 | 0.054x | yes |
-| mandelbrot | 1024x1024, 256 iterations | 253.954 | 0.657 | 0.736 | 386.5x | yes |
-| n-body | 4096 bodies | 340.830 | 0.541 | 0.764 | 629.8x | yes |
-| game of life | 1024x1024, 10 steps | 427.497 | 10.171 | 10.620 | 42.0x | yes |
-| histogram | 4000000 values, 256 bins | 122.477 | 3.591 | 4.074 | 34.1x | yes |
-| particles | 1000000 particles | 28.557 | 3.784 | 4.181 | 7.5x | yes |
-| blur 5x5 | 1024x1024 | 116.985 | 1.197 | 1.323 | 97.8x | yes |
+| Scenario | Size | Native loop ms | GPU ms | Speedup vs native | Match |
+|---|---|---:|---:|---:|---|
+| saxpy | 1000000 floats | 14.715 | 1.072 | 13.7x | yes |
+| tiny saxpy | 64 floats | 0.001 | 0.037 | 0.03x | yes |
+| mandelbrot | 1024x1024, 256 iterations | 254.000 | 0.781 | 325x | yes |
+| n-body | 4096 bodies | 340.761 | 0.578 | 590x | yes |
+| game of life | 1024x1024, 10 steps | 422.471 | 7.855 | 53.8x | yes |
+| histogram | 4000000 values, 256 bins | 120.938 | 2.811 | 43.0x | yes |
+| particles | 1000000 particles | 28.626 | 4.466 | 6.4x | yes |
+| blur 5x5 | 1024x1024 | 117.874 | 1.087 | 108x | yes |
+
+(medians of the best time of three runs of the script)
 
 What it shows:
 
 - **Compute bound kernels win by two orders of magnitude** (Mandelbrot, n-body, blur): the transfers are small next to
   the work.
-- **Memory bound kernels win much less** (saxpy, particles): most of the GPU time is copying the buffer back. Every run
-  downloads the whole buffer, inputs included: saxpy downloads x with y, the histogram its 16 MB of values with the 1 KB
-  of bins, the game of life both grids at each of its 10 steps.
-- **Uploads are cheap when little changes**: only the 64 KB parts of a buffer that differ from the GPU's copy are sent,
-  so the game of life, which only changes its header word between steps, uploads its grids once.
-- **Small runs lose**: about 20 µs of fixed cost per run (command buffer, submission, waiting for the GPU) against about a
-  microsecond of native code for the 64-element saxpy.
+- **Memory bound kernels win much less** (saxpy, particles): most of the GPU time is copying what the kernel wrote back.
+  Only the 64 KB parts a kernel writes come back, so inputs in the same buffer stay on the GPU: saxpy downloads y and not
+  x, the histogram its 1 KB of bins and not its 16 MB of values, the game of life the grid each step writes.
+- **Uploads are cheap when little changes**: only the parts of a buffer that differ from the GPU's copy are sent, so the
+  game of life, which only changes its header word between steps, uploads its grids once.
+- **Small runs lose**: a few tens of µs of fixed cost per run (command buffer, submission, waiting for the GPU) against
+  about a microsecond of native code for the 64-element saxpy. A run that writes more than 64 KB of a buffer costs a
+  second submission, to download the parts once the host knows which ones were written.
 - The native loop calls the kernel through a function value, as a generic loop would. For a trivial kernel like saxpy, a
   loop with the body written inline is faster still, which makes the GPU gain smaller.
 

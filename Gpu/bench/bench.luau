@@ -8,7 +8,7 @@
 --   loop      the kernel called from a plain Luau loop, compiled to native code: what a script would do without gpu.run
 --   gpu       gpu.run on the GPU
 -- A kernel only gets its buffer, so each scenario keeps its inputs and results in one. GPU timings include every transfer
--- a run makes (uploads of the parts that changed, downloads of the whole buffer), since that is what a script pays. Results
+-- a run makes (uploads of the parts that changed, downloads of the parts written), since that is what a script pays. Results
 -- are compared bit for bit when the computation is exact, and with a tolerance when the GPU's f32 math can differ from
 -- Luau's f64.
 

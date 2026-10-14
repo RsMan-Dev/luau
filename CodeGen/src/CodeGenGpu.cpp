@@ -21,6 +21,7 @@ namespace CodeGen
 
 // mirrors Gpu/include/Luau/GpuAbi.h
 constexpr int kGpuMaxBuffers = 1;
+constexpr int kGpuWrittenChunkShift = 16;
 constexpr unsigned kGpuWorkgroupSize = 64;
 
 namespace
@@ -2119,8 +2120,13 @@ struct GlslLowering
         // the same type and SPIRV-Cross would then declare with the block's name
         glsl += "layout(std430, set = 0, binding = " + std::to_string(buffers) +
                 ") coherent volatile buffer BS { uint err; int stop; uint started; } st;\n";
-        glsl += "layout(push_constant) uniform PC { uint n; uint budget; uint len[" + std::to_string(kGpuMaxBuffers) + "]; } pc;\n";
+        glsl += "layout(std430, set = 0, binding = " + std::to_string(buffers + 1) + ") buffer BW { uint d[]; } wr;\n";
+        glsl += "layout(push_constant) uniform PC { uint n; uint budget; uint len[" + std::to_string(kGpuMaxBuffers) + "]; uint written; } pc;\n";
         glsl += kPrelude;
+        // the host only downloads the parts of the buffer that kernels write; reading the word first is faster than storing
+        // it again from every invocation
+        glsl += "void l_mark(int off) { uint w = pc.written + (uint(off) >> " + std::to_string(kGpuWrittenChunkShift) +
+                "); if (wr.d[w] == 0u) wr.d[w] = 1u; }\n";
 
         for (int i = 0; i < buffers; i++)
         {
@@ -2129,14 +2135,15 @@ struct GlslLowering
             if (readBuffers[i])
                 glsl += "uint l_rd" + b + "(int off) { if ((off & 3) != 0) { l_fail(); return 0u; } return b" + b + ".d[off >> 2]; }\n";
             if (build.bufferWritten[i])
-                glsl += "void l_wr" + b + "(int off, uint v) { if ((off & 3) != 0) { l_fail(); return; } b" + b + ".d[off >> 2] = v; }\n";
+                glsl +=
+                    "void l_wr" + b + "(int off, uint v) { if ((off & 3) != 0) { l_fail(); return; } b" + b + ".d[off >> 2] = v; l_mark(off); }\n";
 
             static const char* const kAtomics[][2] = {{"add", "atomicAdd"}, {"min", "atomicMin"}};
             for (int op = 0; op < 2; op++)
             {
                 if (atomics[i] & (1 << op))
                     glsl += std::string("uint l_atomic") + kAtomics[op][0] + b + "(int off, uint v) { if (l_bad(off, " + b +
-                            ")) { l_fail(); return 0u; } return " + kAtomics[op][1] + "(b" + b + ".d[off >> 2], v); }\n";
+                            ")) { l_fail(); return 0u; } l_mark(off); return " + kAtomics[op][1] + "(b" + b + ".d[off >> 2], v); }\n";
             }
         }
 
