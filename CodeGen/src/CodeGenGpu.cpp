@@ -49,28 +49,31 @@ uint8_t classBit(NumClass c)
 
 const char* const kPrelude = R"(
 uint l_steps = 0u;
-void l_fail() { atomicOr(st.err, 1u); }
+// the first failure of a run gives its kind and source line, see GpuFailure
+uint l_at = 0u;
+void l_failat(uint kind, uint at) { atomicCompSwap(st.err, 0u, (kind << 24) | at); }
+void l_fail(uint kind) { l_failat(kind, l_at); }
 bool l_bad(int off, int b) { return off < 0 || (off & 3) != 0 || uint(off) + 4u > pc.len[b]; }
-int l_chk(bool bad, int r) { if (bad) l_fail(); return r; }
-uint l_chk(bool bad, uint r) { if (bad) l_fail(); return r; }
+int l_chk(bool bad, int r) { if (bad) l_fail(2u); return r; }
+uint l_chk(bool bad, uint r) { if (bad) l_fail(2u); return r; }
 int l_idivk(int a, int k) { int q = a / k; if (q * k != a && a < 0) q -= 1; return q; }
-int l_addi(int a, int b) { int r = a + b; if (((a ^ r) & (b ^ r)) < 0) l_fail(); return r; }
-int l_subi(int a, int b) { int r = a - b; if (((a ^ b) & (a ^ r)) < 0) l_fail(); return r; }
-int l_muli(int a, int b) { int hi, lo; imulExtended(a, b, hi, lo); if (hi != (lo >> 31)) l_fail(); return lo; }
-int l_negi(int a) { if (a == int(0x80000000u)) l_fail(); return -a; }
-int l_idivi(int a, int b) { if (b == 0 || (b == -1 && a == int(0x80000000u))) { l_fail(); return 0; } int q = a / b; if (q * b != a && ((a < 0) != (b < 0))) q -= 1; return q; }
-int l_modi(int a, int b) { if (b == 0) { l_fail(); return 0; } if (b == -1) return 0; return a - l_idivi(a, b) * b; }
-uint l_addu(uint a, uint b) { uint c; uint r = uaddCarry(a, b, c); if (c != 0u) l_fail(); return r; }
-uint l_mulu(uint a, uint b) { uint hi, lo; umulExtended(a, b, hi, lo); if (hi != 0u) l_fail(); return lo; }
-uint l_idivu(uint a, uint b) { if (b == 0u) { l_fail(); return 0u; } return a / b; }
-uint l_modu(uint a, uint b) { if (b == 0u) { l_fail(); return 0u; } return a % b; }
-int l_u2i(uint a) { if (a > 0x7fffffffu) l_fail(); return int(a); }
-uint l_i2u(int a) { if (a < 0) l_fail(); return uint(a); }
+int l_addi(int a, int b) { int r = a + b; if (((a ^ r) & (b ^ r)) < 0) l_fail(2u); return r; }
+int l_subi(int a, int b) { int r = a - b; if (((a ^ b) & (a ^ r)) < 0) l_fail(2u); return r; }
+int l_muli(int a, int b) { int hi, lo; imulExtended(a, b, hi, lo); if (hi != (lo >> 31)) l_fail(2u); return lo; }
+int l_negi(int a) { if (a == int(0x80000000u)) l_fail(2u); return -a; }
+int l_idivi(int a, int b) { if (b == 0 || (b == -1 && a == int(0x80000000u))) { l_fail(b == 0 ? 3u : 2u); return 0; } int q = a / b; if (q * b != a && ((a < 0) != (b < 0))) q -= 1; return q; }
+int l_modi(int a, int b) { if (b == 0) { l_fail(3u); return 0; } if (b == -1) return 0; return a - l_idivi(a, b) * b; }
+uint l_addu(uint a, uint b) { uint c; uint r = uaddCarry(a, b, c); if (c != 0u) l_fail(2u); return r; }
+uint l_mulu(uint a, uint b) { uint hi, lo; umulExtended(a, b, hi, lo); if (hi != 0u) l_fail(2u); return lo; }
+uint l_idivu(uint a, uint b) { if (b == 0u) { l_fail(3u); return 0u; } return a / b; }
+uint l_modu(uint a, uint b) { if (b == 0u) { l_fail(3u); return 0u; } return a % b; }
+int l_u2i(uint a) { if (a > 0x7fffffffu) l_fail(5u); return int(a); }
+uint l_i2u(int a) { if (a < 0) l_fail(5u); return uint(a); }
 // a float holds an integer exactly when its significant bits fit in 24
 bool l_exactu(uint a) { return a == 0u || (a >> findLSB(a)) < 0x1000000u; }
-float l_i2f(int a) { if (!l_exactu(a < 0 ? uint(-a) : uint(a))) l_fail(); return float(a); }
-float l_inexact(float a) { l_fail(); return a; }
-float l_u2f(uint a) { if (!l_exactu(a)) l_fail(); return float(a); }
+float l_i2f(int a) { if (!l_exactu(a < 0 ? uint(-a) : uint(a))) l_fail(4u); return float(a); }
+float l_inexact(float a) { l_fail(7u); return a; }
+float l_u2f(uint a) { if (!l_exactu(a)) l_fail(4u); return float(a); }
 // rounded to the nearest float, ties to even, as the VM rounds a double holding the integer
 float l_u2fr(uint a) {
     if (l_exactu(a)) return float(a);
@@ -91,8 +94,8 @@ float l_cmpuf(uint a, float b) {
 }
 float l_cmpif(int a, float b) { return a < 0 ? -l_cmpuf(uint(-a), -b) : l_cmpuf(uint(a), b); }
 int l_cmpiu(int a, uint b) { return a < 0 || uint(a) < b ? -1 : uint(a) > b ? 1 : 0; }
-int l_f2i(float a) { if (!(a >= -2147483648.0 && a < 2147483648.0)) { l_fail(); return 0; } return int(a); }
-uint l_f2u(float a) { if (!(a > -2147483649.0 && a < 4294967296.0)) { l_fail(); return 0u; } return a >= 0.0 ? uint(a) : uint(int(a)); }
+int l_f2i(float a) { if (!(a >= -2147483648.0 && a < 2147483648.0)) { l_fail(5u); return 0; } return int(a); }
+uint l_f2u(float a) { if (!(a > -2147483649.0 && a < 4294967296.0)) { l_fail(5u); return 0u; } return a >= 0.0 ? uint(a) : uint(int(a)); }
 float l_round(float a) { return sign(a) * floor(abs(a) + 0.5); }
 float l_log(float a) { return a < 0.0 ? uintBitsToFloat(0x7fc00000u) : a == 0.0 ? uintBitsToFloat(0xff800000u) : log(a); }
 float l_log2(float a) { return a < 0.0 ? uintBitsToFloat(0x7fc00000u) : a == 0.0 ? uintBitsToFloat(0xff800000u) : log2(a); }
@@ -268,17 +271,17 @@ float l_fsqrt(float a)
 // Overflows are noted rather than checked one by one, which would branch at every operation: the invocation fails once it
 // returns. Nothing it computed in between leaves the GPU, since a failed run is discarded, and it can't run for longer:
 // loops are bounded by the loop budget and the host's stop word whatever the values
-bool l_ovf = false;
+uint l_ovf = 0u; // line of the first float overflow, plus one
 bool l_finite(float x) { return !isinf(x) && !isnan(x); }
 // an infinity from operands that aren't infinite: NaN operands give NaN, not infinities
 bool l_overflow(float r, float a, float b) { return isinf(r) && max(abs(a), abs(b)) < uintBitsToFloat(0x7f800000u); }
-float l_addr(float a, float b) { precise float r = a + b; l_ovf = l_ovf || l_overflow(r, a, b); return r; }
-float l_subr(float a, float b) { precise float r = a - b; l_ovf = l_ovf || l_overflow(r, a, b); return r; }
-float l_mulr(float a, float b) { precise float r = a * b; l_ovf = l_ovf || l_overflow(r, a, b); return r; }
+float l_addr(float a, float b) { precise float r = a + b; l_ovf = l_ovf == 0u && (l_overflow(r, a, b)) ? l_at + 1u : l_ovf; return r; }
+float l_subr(float a, float b) { precise float r = a - b; l_ovf = l_ovf == 0u && (l_overflow(r, a, b)) ? l_at + 1u : l_ovf; return r; }
+float l_mulr(float a, float b) { precise float r = a * b; l_ovf = l_ovf == 0u && (l_overflow(r, a, b)) ? l_at + 1u : l_ovf; return r; }
 // dividing by zero gives an infinity in the VM too
-float l_divr(float a, float b) { float r = l_fdiv(a, b); l_ovf = l_ovf || (l_overflow(r, a, b) && b != 0.0); return r; }
-float l_expr(float a) { float r = exp(a); l_ovf = l_ovf || (isinf(r) && l_finite(a)); return r; }
-float l_rngr(float r, float a) { l_ovf = l_ovf || (isinf(r) && l_finite(a)); return r; }
+float l_divr(float a, float b) { float r = l_fdiv(a, b); l_ovf = l_ovf == 0u && ((l_overflow(r, a, b) && b != 0.0)) ? l_at + 1u : l_ovf; return r; }
+float l_expr(float a) { float r = exp(a); l_ovf = l_ovf == 0u && ((isinf(r) && l_finite(a))) ? l_at + 1u : l_ovf; return r; }
+float l_rngr(float r, float a) { l_ovf = l_ovf == 0u && ((isinf(r) && l_finite(a))) ? l_at + 1u : l_ovf; return r; }
 float l_fmod(float a, float b) { return b == 0.0 ? uintBitsToFloat(0x7fc00000u) : a - b * trunc(l_fdiv(a, b)); }
 )";
 
@@ -465,6 +468,11 @@ struct GlslLowering
     std::vector<bool> reached;
     std::vector<RegState> cur; // at the instruction being analyzed or lowered
     bool changed = false;
+
+    // while lowering an instruction: the line set in l_at last in the block, -1 when unknown, and the kind of failure of a
+    // check that falls back
+    int lastLine = -1;
+    GpuFailure failKind = GpuFailure::Fallback;
 
     // structured control flow, as in "Beyond Relooper" (Ramsey, 2022): the IR of Luau code is reducible, so each block is
     // emitted once, in its immediate dominator, inside a loop if it's a loop header, after the blocks that end where the
@@ -1447,7 +1455,7 @@ struct GlslLowering
         }
 
         // fallbacks, exits to the VM and aborts fail the run
-        return "{ l_fail(); return; }";
+        return "{ l_fail(" + std::to_string(int(failKind)) + "u); return; }";
     }
 
     bool backward(uint32_t from, uint32_t to)
@@ -1489,7 +1497,7 @@ struct GlslLowering
         }
 
         CODEGEN_ASSERT(!"jump to a construct that doesn't enclose it");
-        return "l_fail(); return;";
+        return "l_fail(" + std::to_string(int(GpuFailure::Fallback)) + "u); return;";
     }
 
     std::string branch(uint32_t target)
@@ -1646,6 +1654,9 @@ struct GlslLowering
         std::vector<Inlined>* outer = inlined;
         inlined = &targets;
 
+        int outerLine = lastLine;
+        lastLine = -1;
+
         IrBlock& block = function.blocks[blockIndex];
         for (uint32_t index = block.start; index <= block.finish && !failed; index++)
         {
@@ -1653,11 +1664,25 @@ struct GlslLowering
             if (isPseudo(inst.cmd))
                 continue;
 
+            // failures report the line of the instruction that failed, which the compiler tracks for free since it's
+            // constant between jumps
+            int pc = pcOfInst[index];
+            int at = pc >= 0 ? std::min(luaG_getline(proto, pc), 0xffffff) : 0;
+            if (at != lastLine)
+                line("l_at = " + std::to_string(std::max(at, 0)) + "u;");
+            lastLine = at;
+            failKind = inst.cmd == IrCmd::CHECK_BUFFER_LEN ? GpuFailure::Access : GpuFailure::Fallback;
+
             facts(inst, index);
             if (!lowerInst(inst, index))
                 break;
             effects(inst, index);
+
+            // code jumped to may set another line
+            if (isBlockTerminator(inst.cmd) || isNonTerminatingJump(inst.cmd))
+                lastLine = -1;
         }
+        lastLine = outerLine;
 
         inlined = outer;
         saved.swap(out);
@@ -2236,7 +2261,7 @@ struct GlslLowering
             std::string ta = tag(OP_A(inst)), tb = tag(OP_B(inst));
             IrCondition cond = conditionOp(OP_C(inst));
             std::string number = std::to_string(LUA_TNUMBER) + "u";
-            std::string fail = "(l_fail(), 0)";
+            std::string fail = "(l_fail(" + std::to_string(int(GpuFailure::Fallback)) + "u), 0)";
 
             if (cond == IrCondition::Equal)
                 line(
@@ -2364,7 +2389,10 @@ struct GlslLowering
         case IrCmd::INTERRUPT:
             // native code checks for interrupts here, at every loop iteration and before returning
             // and every 256 iterations, whether the host asked a run that takes too long to stop
-            line("if ((++l_steps > pc.budget && pc.budget != 0u) || ((l_steps & 255u) == 0u && st.stop != 0)) { l_fail(); return; }");
+            line(
+                "if ((++l_steps > pc.budget && pc.budget != 0u) || ((l_steps & 255u) == 0u && st.stop != 0)) { l_fail(st.stop != 0 ? " +
+                std::to_string(int(GpuFailure::Stopped)) + "u : " + std::to_string(int(GpuFailure::LoopBudget)) + "u); return; }"
+            );
             break;
         case IrCmd::RETURN:
             line("return;");
@@ -2484,7 +2512,7 @@ struct GlslLowering
         case LBF_MATH_POW:
             // 0 ^ -1 is infinite in the VM too
             line(v + " = l_pow(" + a + ", " + b + ");");
-            line("l_ovf = l_ovf || (" + a + " != 0.0 && l_finite(" + a + ") && l_finite(" + b + ") && isinf(" + v + "));");
+            line("l_ovf = l_ovf == 0u && " + a + " != 0.0 && l_finite(" + a + ") && l_finite(" + b + ") && isinf(" + v + ") ? l_at + 1u : l_ovf;");
             return true;
         case LBF_MATH_FMOD:
             line(v + " = l_fmod(" + a + ", " + b + ");");
@@ -2691,17 +2719,17 @@ struct GlslLowering
             std::string b = std::to_string(i);
             // reads and writes follow a CHECK_BUFFER_LEN that covers their bounds, as in native code; words must be aligned
             if (readBuffers[i])
-                glsl += "uint l_rd" + b + "(int off) { if ((off & 3) != 0) { l_fail(); return 0u; } return b" + b + ".d[off >> 2]; }\n";
+                glsl += "uint l_rd" + b + "(int off) { if ((off & 3) != 0) { l_fail(1u); return 0u; } return b" + b + ".d[off >> 2]; }\n";
             if (build.bufferWritten[i])
                 glsl +=
-                    "void l_wr" + b + "(int off, uint v) { if ((off & 3) != 0) { l_fail(); return; } b" + b + ".d[off >> 2] = v; l_mark(off); }\n";
+                    "void l_wr" + b + "(int off, uint v) { if ((off & 3) != 0) { l_fail(1u); return; } b" + b + ".d[off >> 2] = v; l_mark(off); }\n";
 
             static const char* const kAtomics[][2] = {{"add", "atomicAdd"}, {"min", "atomicMin"}};
             for (int op = 0; op < 2; op++)
             {
                 if (atomics[i] & (1 << op))
                     glsl += std::string("uint l_atomic") + kAtomics[op][0] + b + "(int off, uint v) { if (l_bad(off, " + b +
-                            ")) { l_fail(); return 0u; } l_mark(off); return " + kAtomics[op][1] + "(b" + b + ".d[off >> 2], v); }\n";
+                            ")) { l_fail(1u); return 0u; } l_mark(off); return " + kAtomics[op][1] + "(b" + b + ".d[off >> 2], v); }\n";
             }
         }
 
@@ -2717,8 +2745,8 @@ struct GlslLowering
         glsl +=
             "    uint gid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * " + std::to_string(kGpuWorkgroupSize) + "u;\n";
         // invocations that start after the host asked the run to stop give up at once
-        glsl += "    if (gid >= pc.n) return;\n    if (gid == 0u) st.started = 1u;\n    if (st.stop != 0) { l_fail(); return; }\n"
-                "    l_kernel(int(gid));\n    if (l_ovf) l_fail();\n}\n";
+        glsl += "    if (gid >= pc.n) return;\n    if (gid == 0u) st.started = 1u;\n    if (st.stop != 0) { l_fail(9u); return; }\n"
+                "    l_kernel(int(gid));\n    if (l_ovf != 0u) l_failat(6u, l_ovf - 1u);\n}\n";
 
         return true;
     }
@@ -2787,6 +2815,29 @@ static GpuKernel compileProto(Proto* proto, LuaTable* env)
     kernel.glsl = std::move(build.glsl);
     kernel.bufferWritten = std::move(build.bufferWritten);
     return kernel;
+}
+
+std::string describeGpuFailure(uint32_t status)
+{
+    static const char* const kKinds[] = {
+        "an unknown failure",
+        "out of bounds or unaligned buffer access",
+        "integer overflow",
+        "integer division by zero",
+        "integer too large for a float",
+        "number out of the range of 32-bit integers",
+        "float overflow",
+        "number beyond the range of floats",
+        "loop limit reached",
+        "stopped by the host",
+        "value of a type the kernel doesn't handle there",
+    };
+
+    uint32_t kind = status >> 24, line = status & 0xffffff;
+    std::string reason = std::string("the kernel failed on the GPU: ") + kKinds[kind < sizeof(kKinds) / sizeof(kKinds[0]) ? kind : 0];
+    if (line != 0)
+        reason += " at line " + std::to_string(line);
+    return reason;
 }
 
 bool isGpuEnvironmentSafe(lua_State* L, int idx)

@@ -443,6 +443,60 @@ assert(buffer.readu32(b, 0) == 3)
 )") == "");
 }
 
+TEST_CASE("failures_give_their_kind_and_source_line")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // each kernel fails on its third line, counted from the line of 'base'; float overflows are noted where they happen,
+    // though the run only fails once the invocation returns
+    CHECK(run(*backend, R"(
+local base = debug.info(1, "l") + 1
+
+@gpu
+local function overflow(b: buffer, i: number)
+    buffer.writeu32(b, 0, buffer.readu32(b, 0) * 65536 * 65536)
+end
+
+@gpu
+local function inexact(b: buffer, i: number)
+    buffer.writef32(b, 4, buffer.readu32(b, 0) + 0.5)
+end
+
+@gpu
+local function infinite(b: buffer, i: number)
+    buffer.writef32(b, 4, buffer.readf32(b, 8) * buffer.readf32(b, 8) + 1)
+end
+
+@gpu
+local function outside(b: buffer, i: number)
+    buffer.writeu32(b, 4096, 1)
+end
+
+@gpu
+local function zero(b: buffer, i: number)
+    buffer.writeu32(b, 4, buffer.readu32(b, 12) // buffer.readu32(b, 12))
+end
+
+local b = buffer.create(16)
+buffer.writeu32(b, 0, 16777217)
+buffer.writef32(b, 8, 1e30)
+local cases = {
+    { overflow, "integer overflow" },
+    { inexact, "integer too large for a float" },
+    { infinite, "float overflow" },
+    { outside, "out of bounds or unaligned buffer access" },
+    { zero, "integer division by zero" },
+}
+for n, c in cases do
+    local ok, err = gpu.run(c[1], { b }, 1)
+    local expected = "the kernel failed on the GPU: " .. c[2] .. " at line " .. base + (n - 1) * 5 + 3
+    assert(not ok and err == expected, tostring(err) .. ", expected " .. expected)
+end
+)") == "");
+}
+
 TEST_CASE("infinite_loops_fail_the_run")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();

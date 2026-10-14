@@ -3,6 +3,8 @@
 
 #include "Luau/CodeGen.h"
 
+#include <stdint.h>
+
 #include <string>
 #include <vector>
 
@@ -31,6 +33,26 @@ struct GpuKernel
     // whether the kernel writes its buffer (one entry)
     std::vector<bool> bufferWritten;
 };
+
+// Why a kernel failed. The status word holds the first failure of a run: its kind in the top 8 bits, its source line in the
+// others (0 when unknown). The kernel prelude writes these values.
+enum class GpuFailure : uint8_t
+{
+    None = 0,
+    Access = 1,          // out of bounds or unaligned buffer access
+    IntegerOverflow = 2, // an integer result 32 bits can't hold
+    DivisionByZero = 3,  // integer division or modulo by zero
+    InexactFloat = 4,    // an integer a float can't hold exactly, used in float math
+    IntegerRange = 5,    // a number out of the range of the 32-bit integer class it's converted to
+    FloatOverflow = 6,   // an infinity from finite operands, which f64 would have kept finite
+    FloatLiteral = 7,    // a literal beyond the range of floats
+    LoopBudget = 8,      // the run's loop iteration budget ran out
+    Stopped = 9,         // the host stopped the run
+    Fallback = 10,       // a value of a type the lowering doesn't handle there, which native code leaves to the VM
+};
+
+// The reason gpu.run gives for a status word, like "the kernel failed on the GPU: integer overflow at line 12"
+std::string describeGpuFailure(uint32_t status);
 
 // Lowers the Luau function at stack index idx, which must have the gpu attribute
 GpuKernel compileGpu(lua_State* L, int idx);

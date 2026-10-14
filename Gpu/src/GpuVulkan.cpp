@@ -1229,7 +1229,8 @@ std::string VulkanBackend::Impl::run(lua_State* L, int fn, int list, uint32_t ru
     reason = submit();
 
     // until the device copies are uploaded again, they can't be trusted
-    if (!reason.empty() || *(volatile uint32_t*)status.mapped != 0)
+    uint32_t failure = *(volatile uint32_t*)status.mapped;
+    if (!reason.empty() || failure != 0)
     {
         for (Use& u : uses)
             u.entry->valid = false;
@@ -1238,8 +1239,7 @@ std::string VulkanBackend::Impl::run(lua_State* L, int fn, int list, uint32_t ru
             return reason;
 
         stats.failures++;
-        return "the kernel failed on the GPU (out of bounds or unaligned access, integer overflow, inexact integer conversion, float "
-               "overflow or loop limit)";
+        return CodeGen::describeGpuFailure(failure);
     }
 
     // the parts the kernel didn't write are still those the Luau buffers have, since they were uploaded or found the same;

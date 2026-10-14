@@ -49,8 +49,11 @@ ordinary `buffer`s that can also be called from Luau, and data layouts are writt
 - `false, "Function cannot run in GPU"`: `fn` can't be lowered for the GPU: it isn't `@gpu`, uses what kernels don't
   support (see [Supported subset](#supported-subset)), or its environment isn't safe.
 - `false, reason` for everything else that only shows when the run is attempted: no device or a refused one, a buffer
-  over the device's limits, not enough memory, an error in the kernel (out of bounds or unaligned access, integer
-  overflow, inexact integer conversion, loop budget), a run that was stopped or timed out.
+  over the device's limits, not enough memory, an error in the kernel, a run that was stopped or timed out. An error in
+  the kernel gives the kind and source line of the run's first one, as in `the kernel failed on the GPU: integer too
+  large for a float at line 980`: out of bounds or unaligned buffer access, integer overflow, integer division by zero,
+  integer too large for a float, number out of the range of 32-bit integers, float overflow, number beyond the range of
+  floats, loop limit reached, or a value of a type the kernel doesn't handle there.
 - Arguments of the wrong type or out of range (`runs_per_buffer` must be an integer from 0 to 2^31-1, `buffers` an array
   of buffers) are mistakes in the script and raise errors, as in other libraries.
 

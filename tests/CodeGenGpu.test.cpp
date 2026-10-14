@@ -119,7 +119,7 @@ return k
 
 TEST_CASE("GpuKernelGuardsFailTheRun")
 {
-    // the result of the helper isn't known to be a number, so the IR guards it with a tag check and a fallback
+    // the buffer write is guarded by a bounds check whose fallback fails the run, telling why
     GpuKernel kernel = lowerGpu(R"(
 @gpu
 local function k(b: buffer, i: number)
@@ -130,7 +130,7 @@ return k
 )");
 
     REQUIRE_MESSAGE(kernel.reason.empty(), kernel.reason);
-    CHECK(contains(kernel.glsl, "{ l_fail(); return; }"));
+    CHECK(contains(kernel.glsl, "{ l_fail(1u); return; }"));
 }
 
 TEST_CASE("GpuKernelExactIntegersInFloatRegisters")
