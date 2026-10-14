@@ -16,8 +16,8 @@ namespace Gpu
 
 // Shader languages a kernel can be compiled to. Every target keeps the resource interface of GpuAbi.h:
 //   - SpirvVulkan: SPIR-V 1.0 for Vulkan 1.0 (desktop and Android); descriptor set 0, bindings as in GpuAbi.h
-//   - MslIos, MslMacos: Metal Shading Language 2.2 (iOS 13, macOS 10.15); the entry point is 'main0', kernel buffer i is
-//     [[buffer(i)]], the status word is [[buffer(buffers)]], push constants are a constant buffer at [[buffer(kMslPushConstantBuffer)]],
+//   - MslIos, MslMacos: Metal Shading Language 2.2 (iOS 13, macOS 10.15); the entry point is 'main0', the kernel's buffer is
+//     [[buffer(0)]], the status word is [[buffer(1)]], push constants are a constant buffer at [[buffer(kMslPushConstantBuffer)]],
 //     and threadgroups must have kWorkgroupSize threads along x
 //   - GlslEs: GLSL ES 3.10 compute shader for OpenGL ES 3.1 (Android); SSBOs keep their bindings, and push constants become the
 //     uniform struct 'pc' whose fields n, budget and len[] hold PushConstants::count, loopBudget and lengths (set with

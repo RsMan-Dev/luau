@@ -1,6 +1,7 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 
 // luau-gpu: runs a script with the gpu library backed by Vulkan, plus a small 'host' and 'window' library for demos and tests
+#include "Luau/GpuLibrary.h"
 #include "Luau/GpuShaderCompiler.h"
 #include "Luau/GpuVulkan.h"
 
@@ -26,7 +27,6 @@
 #include <vector>
 
 LUAU_FASTFLAG(LuauGpuKernels)
-LUAU_FASTFLAG(LuauGpuLibrary)
 
 static std::unique_ptr<Luau::Gpu::VulkanBackend> gBackend;
 
@@ -40,17 +40,6 @@ struct Window
 };
 
 static Window gWindow;
-
-static int host_setgpu(lua_State* L)
-{
-    bool enabled = lua_toboolean(L, 1);
-    if (enabled && gBackend)
-        gBackend->install(L);
-    else
-        lua_setgpubackend(L, nullptr);
-    lua_pushboolean(L, enabled && gBackend);
-    return 1;
-}
 
 static int host_gpuname(lua_State* L)
 {
@@ -81,13 +70,13 @@ static int host_stats(lua_State* L)
     lua_createtable(L, 0, 8);
     if (gBackend)
     {
-        Luau::Gpu::DispatchStats s = gBackend->stats();
-        lua_pushnumber(L, double(s.dispatches));
-        lua_setfield(L, -2, "dispatches");
-        lua_pushnumber(L, double(s.gpuDispatches));
-        lua_setfield(L, -2, "gpuDispatches");
-        lua_pushnumber(L, double(s.fallbacks));
-        lua_setfield(L, -2, "fallbacks");
+        Luau::Gpu::RunStats s = gBackend->stats();
+        lua_pushnumber(L, double(s.runs));
+        lua_setfield(L, -2, "runs");
+        lua_pushnumber(L, double(s.succeeded));
+        lua_setfield(L, -2, "succeeded");
+        lua_pushnumber(L, double(s.failures));
+        lua_setfield(L, -2, "failures");
         lua_pushnumber(L, double(s.uploadedBytes));
         lua_setfield(L, -2, "uploadedBytes");
         lua_pushnumber(L, double(s.downloadedBytes));
@@ -119,7 +108,6 @@ static int host_writefile(lua_State* L)
 static const luaL_Reg hostlib[] = {
     {"writefile", host_writefile},
     {"collect", host_collect},
-    {"setgpu", host_setgpu},
     {"gpuname", host_gpuname},
     {"clock", host_clock},
     {"stats", host_stats},
@@ -172,13 +160,15 @@ static int window_present(lua_State* L)
 {
     size_t len = 0;
     void* data = luaL_checkbuffer(L, 1, &len);
+    // the image may be a part of the buffer
+    size_t offset = size_t(luaL_optunsigned(L, 2, 0));
 
     if (!gWindow.window)
         luaL_error(L, "window is not open");
-    if (len < size_t(gWindow.width) * gWindow.height * 4)
+    if (offset > len || len - offset < size_t(gWindow.width) * gWindow.height * 4)
         luaL_error(L, "buffer is smaller than the window (%d x %d x 4 bytes)", gWindow.width, gWindow.height);
 
-    SDL_UpdateTexture(gWindow.texture, nullptr, data, gWindow.width * 4);
+    SDL_UpdateTexture(gWindow.texture, nullptr, (char*)data + offset, gWindow.width * 4);
     SDL_RenderClear(gWindow.renderer);
     SDL_RenderCopy(gWindow.renderer, gWindow.texture, nullptr, nullptr);
     SDL_RenderPresent(gWindow.renderer);
@@ -316,7 +306,6 @@ static int traceback(lua_State* L)
 int main(int argc, char** argv)
 {
     FFlag::LuauGpuKernels.value = true;
-    FFlag::LuauGpuLibrary.value = true;
 
     bool useGpu = true;
     bool useNative = true;
@@ -374,27 +363,18 @@ int main(int argc, char** argv)
     }
     lua_setglobal(L, "arg");
 
+    std::string unavailable = "the GPU is disabled (--vm)";
     if (useGpu && !emitTarget)
     {
-        std::string error;
-        gBackend = Luau::Gpu::VulkanBackend::create(error);
+        gBackend = Luau::Gpu::VulkanBackend::create(unavailable);
         if (!gBackend)
-            fprintf(stderr, "luau-gpu: no GPU backend (%s), kernels run in the VM\n", error.c_str());
+            fprintf(stderr, "luau-gpu: no GPU backend (%s), gpu.run returns false\n", unavailable.c_str());
     }
 
-    if (gBackend)
-    {
-        gBackend->setFallbackHandler(
-            [](const std::string& message)
-            {
-                fprintf(stderr, "luau-gpu: %s\n", message.c_str());
-            }
-        );
-        gBackend->install(L);
-    }
+    Luau::Gpu::openGpuLibrary(L, gBackend.get(), unavailable);
 
-    // like the luau REPL, run the script in a sandboxed thread; besides isolating it, a sandboxed environment lets the VM
-    // use its fast paths for builtins, which kernels running in the VM depend on
+    // like the luau REPL, run the script in a sandboxed thread; besides isolating it, a sandboxed environment is what kernels
+    // need, since their builtins must be the real ones
     luaL_sandbox(L);
     lua_State* T = lua_newthread(L);
     luaL_sandboxthread(T);

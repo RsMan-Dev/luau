@@ -13,7 +13,7 @@ namespace Luau
 namespace CodeGen
 {
 
-// A function marked @gpu lowered from its IR to a GLSL compute shader, invocation 'i' running f(i, ...buffers)
+// A function marked @gpu lowered from its IR to a GLSL compute shader, invocation 'index' running f(buffer, index)
 // The shader binds resources as described in Gpu/include/Luau/GpuAbi.h
 struct GpuKernel
 {
@@ -28,12 +28,16 @@ struct GpuKernel
 
     std::string glsl;
 
-    // one entry per buffer parameter (the parameters after the invocation index)
+    // whether the kernel writes its buffer (one entry)
     std::vector<bool> bufferWritten;
 };
 
 // Lowers the Luau function at stack index idx, which must have the gpu attribute
 GpuKernel compileGpu(lua_State* L, int idx);
+
+// Whether the builtins the function at stack index idx sees are still the real ones, which kernels rely on since they can't
+// check at run time
+bool isGpuEnvironmentSafe(lua_State* L, int idx);
 
 // Lowers every function with the gpu attribute defined in the module whose main function is at stack index idx
 std::vector<GpuKernel> compileGpuModule(lua_State* L, int idx);

@@ -3,30 +3,31 @@
 
 #include <stdint.h>
 
-// Interface between translated kernels and the backends that run them. Any backend (Vulkan, Metal, OpenGL ES, ...) binds
+// Interface between translated kernels and the backends that run them. A kernel is a function f(buffer, index) that
+// gpu.run calls for index = 0 .. runs-1 on each buffer it's given; any backend (Vulkan, Metal, OpenGL ES, ...) binds
 // resources this way:
-//   - bindings 0 .. buffers-1 (set 0): the kernel's buffers, as arrays of 32-bit words
-//   - binding 'buffers': three status words, 'err', 'stop' and 'started'. Kernels set 'err' to a nonzero value when the results
-//     must be discarded and the dispatch rerun in the VM. The host sets 'stop' to a nonzero value to make invocations that
-//     start afterwards give up at once, and loops within 256 iterations, which bounds the GPU time a runaway kernel takes.
-//     Invocation 0 sets 'started', so that the host measures that time from when the dispatch actually runs
+//   - binding 0 (set 0): the buffer, as an array of 32-bit words
+//   - binding 1: three status words, 'err', 'stop' and 'started'. Kernels set 'err' to a nonzero value when the results
+//     must be discarded: the run then fails, and leaves the Luau buffer as it was. The host sets 'stop' to a nonzero value
+//     to make invocations that start afterwards give up at once, and loops within 256 iterations, which bounds the GPU time
+//     a runaway kernel takes. Invocation 0 sets 'started', so that the host measures that time from when the run starts
 //   - push constants: GpuPushConstants
-//   - workgroups of kGpuWorkgroupSize invocations along x; invocation i = x + y * groupsX * kGpuWorkgroupSize
+//   - workgroups of kGpuWorkgroupSize invocations along x; invocation index = x + y * groupsX * kGpuWorkgroupSize
 namespace Luau
 {
 namespace Gpu
 {
 
-constexpr int kMaxKernelBuffers = 15;
+constexpr int kMaxKernelBuffers = 1;
 constexpr uint32_t kWorkgroupSize = 64;
 
 struct PushConstants
 {
     // number of invocations
     uint32_t count;
-    // maximum number of loop iterations per invocation before the dispatch is discarded, 0 for no limit
+    // maximum number of loop iterations per invocation before the run fails, 0 for no limit
     uint32_t loopBudget;
-    // size of each buffer in bytes
+    // size of the buffer in bytes
     uint32_t lengths[kMaxKernelBuffers];
 };
 

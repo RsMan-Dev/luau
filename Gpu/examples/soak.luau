@@ -14,23 +14,23 @@ local frame = 0
 while host.clock() - start < seconds do
     frame += 1
 
-    -- a different size every frame, so no two consecutive frames could share an allocation
-    local packet = buffer.create(256 * 1024 + (frame % 13) * 4096)
-    local image = buffer.create(512 * 1024)
+    -- a packet of 256 words, then the image; a different size every frame, so no two consecutive frames could share an
+    -- allocation
+    local data = buffer.create(1024 + 512 * 1024 + (frame % 13) * 4096)
     for o = 0, 1020, 4 do
-        buffer.writeu32(packet, o, frame + o)
+        buffer.writeu32(data, o, frame + o)
     end
 
     @gpu
-    local function shade(i: number, src: buffer, dst: buffer)
-        local v = buffer.readu32(src, (i % 256) * 4)
-        buffer.writeu32(dst, i * 4, bit32.bxor(v, i))
+    local function shade(b: buffer, i: number)
+        local v = buffer.readu32(b, (i % 256) * 4)
+        buffer.writeu32(b, 1024 + i * 4, bit32.bxor(v, i))
     end
 
     local t = host.clock()
-    gpu.dispatch({ { shade, 512 * 256, packet, image } }, { image })
+    assert(gpu.run(shade, { data }, 128 * 1024))
     frames[frame] = host.clock() - t
-    assert(buffer.readu32(image, 4) == bit32.bxor(frame + 4, 1))
+    assert(buffer.readu32(data, 1024 + 4) == bit32.bxor(frame + 4, 1))
 
     if frame % 100 == 0 then
         host.collect()
@@ -53,7 +53,7 @@ end
 local tenth = frame // 10
 local stats = host.stats()
 print(string.format(
-    "%d frames in %.0fs: first 10%% %.3f ms, last 10%% %.3f ms per dispatch; max cached %.1f MB, max memory %.1f MB, max kernels %d; gpu %d, fallbacks %d",
+    "%d frames in %.0fs: first 10%% %.3f ms, last 10%% %.3f ms per run; max cached %.1f MB, max memory %.1f MB, max kernels %d; succeeded %d, failures %d",
     frame,
     seconds,
     mean(1, tenth),
@@ -61,6 +61,6 @@ print(string.format(
     maxCached / 1e6,
     maxMemory / 1e6,
     maxKernels,
-    stats.gpuDispatches,
-    stats.fallbacks
+    stats.succeeded,
+    stats.failures
 ))

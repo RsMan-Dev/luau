@@ -3,6 +3,7 @@
 // only built with LUAU_BUILD_GPU, which provides the Vulkan backend and the shader compilers
 #if defined(LUAU_GPU_BACKEND_TESTS)
 
+#include "Luau/GpuLibrary.h"
 #include "Luau/GpuShaderCompiler.h"
 #include "Luau/GpuVulkan.h"
 
@@ -27,7 +28,6 @@ using namespace Luau;
 using namespace Luau::Gpu;
 
 LUAU_FASTFLAG(LuauGpuKernels)
-LUAU_FASTFLAG(LuauGpuLibrary)
 
 namespace
 {
@@ -54,22 +54,24 @@ std::unique_ptr<VulkanBackend> createBackend(const VulkanOptions& options = Vulk
 // stops the script after this many interrupts, like a host enforcing a script timeout
 int interruptsLeft = 0;
 
-// runs the chunk with the backend installed, like a sandboxed script compiled at -O2, and returns the error it raised
-std::string run(VulkanBackend& backend, const std::string& source, int interruptLimit = 0)
+// runs the chunk with the gpu library using the backend, like a sandboxed script compiled at -O2, and returns the error it
+// raised; without a backend, gpu.run returns false and "no device"
+std::string run(VulkanBackend* backend, const std::string& source, int interruptLimit = 0)
 {
-    ScopedFastFlag flags[] = {{FFlag::LuauGpuKernels, true}, {FFlag::LuauGpuLibrary, true}};
+    ScopedFastFlag flag{FFlag::LuauGpuKernels, true};
 
     lua_State* L = luaL_newstate();
     luaL_openlibs(L);
+    openGpuLibrary(L, backend, "no device");
 
     // backendstats() returns the device memory and the kernels the backend keeps, and the memory it allocated for buffers;
     // collect() runs a full GC cycle
-    lua_pushlightuserdata(L, &backend);
+    lua_pushlightuserdata(L, backend);
     lua_pushcclosure(
         L,
         [](lua_State* L)
         {
-            DispatchStats stats = static_cast<VulkanBackend*>(lua_tolightuserdata(L, lua_upvalueindex(1)))->stats();
+            RunStats stats = static_cast<VulkanBackend*>(lua_tolightuserdata(L, lua_upvalueindex(1)))->stats();
             lua_pushnumber(L, double(stats.cachedBytes));
             lua_pushnumber(L, double(stats.kernels));
             lua_pushnumber(L, double(stats.memoryBytes));
@@ -91,7 +93,6 @@ std::string run(VulkanBackend& backend, const std::string& source, int interrupt
     lua_setglobal(L, "collect");
 
     luaL_sandbox(L);
-    backend.install(L);
 
     if (interruptLimit > 0)
     {
@@ -122,10 +123,27 @@ std::string run(VulkanBackend& backend, const std::string& source, int interrupt
     return error;
 }
 
+std::string run(VulkanBackend& backend, const std::string& source, int interruptLimit = 0)
+{
+    return run(&backend, source, interruptLimit);
+}
+
+// square(b, i) writes i * i at word i; same(a, b) compares two buffers byte for byte
 const char* const kSquare = R"(
 @gpu
-local function square(i: number, out: buffer)
-    buffer.writeu32(out, i * 4, i * i)
+local function square(b: buffer, i: number)
+    buffer.writeu32(b, i * 4, i * i)
+    return b
+end
+
+local function same(a: buffer, b: buffer)
+    return buffer.len(a) == buffer.len(b) and buffer.readstring(a, 0, buffer.len(a)) == buffer.readstring(b, 0, buffer.len(b))
+end
+
+local function copy(b: buffer)
+    local c = buffer.create(buffer.len(b))
+    buffer.copy(c, 0, b)
+    return c
 end
 )";
 
@@ -135,7 +153,7 @@ TEST_SUITE_BEGIN("GpuBackend");
 
 TEST_CASE("examples_compile_for_every_target")
 {
-    ScopedFastFlag flags[] = {{FFlag::LuauGpuKernels, true}, {FFlag::LuauGpuLibrary, true}};
+    ScopedFastFlag flag{FFlag::LuauGpuKernels, true};
     ShaderCompiler compiler;
     int compiled = 0;
 
@@ -148,6 +166,7 @@ TEST_CASE("examples_compile_for_every_target")
 
         lua_State* L = luaL_newstate();
         luaL_openlibs(L);
+        openGpuLibrary(L, nullptr);
         luaL_sandbox(L);
 
         lua_CompileOptions options = {};
@@ -211,41 +230,94 @@ TEST_CASE("invalid_spirv_input_is_rejected")
     }
 }
 
-TEST_CASE("valid_kernels_run_on_the_gpu")
+TEST_CASE("run_calls_the_function_on_each_buffer_for_each_index")
 {
-    ScopedFastFlag sff{FFlag::LuauGpuKernels, true};
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
 
+    // the index is 0-based, the value returned is ignored, and buffers of different sizes run in one call
+    CHECK(run(*backend, std::string(kSquare) + R"(
+local a, b = buffer.create(40), buffer.create(16)
+local ok, err = gpu.run(square, { a, b }, 4)
+assert(ok == true and err == nil, err)
+for i = 0, 3 do
+    assert(buffer.readu32(a, i * 4) == i * i and buffer.readu32(b, i * 4) == i * i)
+end
+assert(buffer.readu32(a, 16) == 0)
+
+-- nothing to run
+assert(gpu.run(square, {}, 4) == true)
+assert(gpu.run(square, { a }, 0) == true)
+)") == "");
+
+    CHECK(backend->stats().succeeded == 1);
+}
+
+TEST_CASE("large_indices_are_exact_integers")
+{
+    VulkanOptions options;
+    options.minimumLimits = true;
+    std::unique_ptr<VulkanBackend> backend = createBackend(options);
+    if (!backend)
+        return;
+
+    // 2^24 + 1000 runs, over what f32 counts exactly and over the 65535 workgroups guaranteed along x; the last runs write
+    // their index, and its neighbors would collide if it were rounded
+    CHECK(run(*backend, R"(
+@gpu
+local function last(b: buffer, i: number)
+    local base = 16777216
+    if i >= base then
+        buffer.writeu32(b, (i - base) * 4, i)
+    end
+end
+
+local b = buffer.create(1000 * 4)
+assert(gpu.run(last, { b }, 16777216 + 1000))
+for k = 0, 999 do
+    assert(buffer.readu32(b, k * 4) == 16777216 + k, k)
+end
+)") == "");
+}
+
+TEST_CASE("functions_that_cant_run_on_the_gpu_return_false_and_leave_buffers_untouched")
+{
     std::unique_ptr<VulkanBackend> backend = createBackend();
     if (!backend)
         return;
 
     CHECK(run(*backend, std::string(kSquare) + R"(
-local b = buffer.create(40)
-gpu.dispatch(square, 10, b)
-assert(buffer.readu32(b, 36) == 81)
-assert(gpu.status(square) == "gpu")
+local b = buffer.create(16)
+buffer.writeu32(b, 0, 7)
+local before = copy(b)
+
+local function plain(b: buffer, i: number) buffer.writeu32(b, i * 4, 1) end
+@gpu local function usesTable(b: buffer, i: number) local t = { i } buffer.writeu32(b, i * 4, t[1]) end
+@gpu local function tooManyParameters(b: buffer, i: number, j: number) buffer.writeu32(b, i * 4, j) end
+local up = 3
+up += 1
+@gpu local function usesUpvalue(b: buffer, i: number) buffer.writeu32(b, i * 4, up) end
+
+for _, f in { plain, usesTable, tooManyParameters, usesUpvalue, print } do
+    local ok, err = gpu.run(f, { b }, 4)
+    assert(ok == false and err == "Function cannot run in GPU", err)
+    assert(same(b, before))
+end
+
+-- calling them from Luau still works
+usesTable(b, 1)
+assert(buffer.readu32(b, 4) == 1)
 )") == "");
 
-    CHECK(backend->stats().gpuDispatches == 1);
+    CHECK(backend->stats().succeeded == 0);
 }
 
-TEST_CASE("kernels_that_do_not_compile_run_in_the_vm")
+TEST_CASE("functions_whose_shader_does_not_compile_cant_run")
 {
-    ScopedFastFlag sff{FFlag::LuauGpuKernels, true};
-
     std::unique_ptr<VulkanBackend> backend = createBackend();
     if (!backend)
         return;
-
-    int reports = 0;
-    std::string report;
-    backend->setFallbackHandler(
-        [&](const std::string& message)
-        {
-            reports++;
-            report = message;
-        }
-    );
 
     backend->setLowering(
         [](lua_State* L, int idx)
@@ -257,189 +329,14 @@ TEST_CASE("kernels_that_do_not_compile_run_in_the_vm")
     );
 
     CHECK(run(*backend, std::string(kSquare) + R"(
-local b = buffer.create(40)
-gpu.dispatch(square, 10, b)
-gpu.dispatch(square, 10, b)
-assert(buffer.readu32(b, 36) == 81)
-local where, why = gpu.status(square)
-assert(where == "vm" and string.find(why, "doesn't compile", 1, true), why)
-)") == "");
-
-    CHECK(backend->stats().gpuDispatches == 0);
-    CHECK(reports == 1);
-    CHECK(report.find("'square' runs in the VM") != std::string::npos);
-}
-
-TEST_CASE("kernels_over_the_device_limits_run_in_the_vm")
-{
-    ScopedFastFlag sff{FFlag::LuauGpuKernels, true};
-
-    VulkanOptions options;
-    options.minimumLimits = true;
-    std::unique_ptr<VulkanBackend> backend = createBackend(options);
-    if (!backend)
-        return;
-
-    const char* source = R"(
-@gpu
-local function four(i: number, a: buffer, b: buffer, c: buffer, d: buffer)
-    buffer.writeu32(d, i * 4, buffer.readu32(a, i * 4) + buffer.readu32(b, i * 4) + buffer.readu32(c, i * 4))
-end
-
-@gpu
-local function two(i: number, a: buffer, b: buffer)
-    buffer.writeu32(b, i * 4, buffer.readu32(a, i * 4) + 1)
-end
-)";
-
-    CHECK(run(*backend, std::string(source) + R"(
-local a, b, c, d = buffer.create(16), buffer.create(16), buffer.create(16), buffer.create(16)
-buffer.writeu32(a, 0, 1)
-gpu.dispatch(four, 4, a, b, c, d)
-assert(buffer.readu32(d, 0) == 1)
-gpu.dispatch(two, 4, a, b)
-assert(buffer.readu32(b, 0) == 2)
-
-local where, why = gpu.status(four)
-assert(where == "vm" and string.find(why, "storage buffers", 1, true), why)
-assert(gpu.status(two) == "gpu")
-)") == "");
-
-    CHECK(backend->stats().gpuDispatches == 1);
-}
-
-TEST_CASE("dispatches_over_the_workgroup_count_limit_use_two_dimensions")
-{
-    ScopedFastFlag sff{FFlag::LuauGpuKernels, true};
-
-    VulkanOptions options;
-    options.minimumLimits = true;
-    std::unique_ptr<VulkanBackend> backend = createBackend(options);
-    if (!backend)
-        return;
-
-
-    // 5M invocations are 78125 workgroups, over the 65535 guaranteed along x
-    CHECK(run(*backend, R"(
-@gpu
-local function index(i: number, out: buffer)
-    buffer.writeu32(out, i * 4, i)
-end
-local n = 5000000
-local b = buffer.create(n * 4)
-gpu.dispatch(index, n, b)
-assert(buffer.readu32(b, 0) == 0)
-assert(buffer.readu32(b, 65535 * 64 * 4) == 65535 * 64)
-assert(buffer.readu32(b, (n - 1) * 4) == n - 1)
-)") == "");
-
-    CHECK(backend->stats().gpuDispatches == 1);
-}
-
-TEST_CASE("buffers_over_the_storage_range_run_in_the_vm")
-{
-    ScopedFastFlag sff{FFlag::LuauGpuKernels, true};
-
-    VulkanOptions options;
-    options.minimumLimits = true;
-    std::unique_ptr<VulkanBackend> backend = createBackend(options);
-    if (!backend)
-        return;
-
-
-    // 128 MiB + 4 is over the minimum guaranteed storage buffer range
-    CHECK(run(*backend, std::string(kSquare) + R"(
-local b = buffer.create(128 * 1024 * 1024 + 4)
-gpu.dispatch(square, 4, b)
-assert(buffer.readu32(b, 12) == 9)
-)") == "");
-
-    CHECK(backend->stats().gpuDispatches == 0);
-}
-
-TEST_CASE("errors_on_the_gpu_rerun_the_dispatch_in_the_vm")
-{
-    ScopedFastFlag sff{FFlag::LuauGpuKernels, true};
-
-    std::unique_ptr<VulkanBackend> backend = createBackend();
-    if (!backend)
-        return;
-
-    const char* source = R"(
-@gpu
-local function outOfBounds(i: number, out: buffer)
-    buffer.writeu32(out, i * 4 + 4, i)
-end
-)";
-
-    std::string error = run(*backend, std::string(source) + R"(
 local b = buffer.create(16)
-gpu.dispatch(outOfBounds, 4, b)
-)");
-
-    CHECK(error.find("out of bounds") != std::string::npos);
-    CHECK(backend->stats().fallbacks == 1);
-    CHECK(backend->stats().gpuDispatches == 0);
-}
-
-TEST_CASE("infinite_loops_stop_on_the_gpu_and_are_left_to_the_host_in_the_vm")
-{
-    ScopedFastFlag sff{FFlag::LuauGpuKernels, true};
-
-    std::unique_ptr<VulkanBackend> backend = createBackend();
-    if (!backend)
-        return;
-
-    const char* source = R"(
-@gpu
-local function spin(i: number, out: buffer)
-    local n = 0
-    while true do
-        n += 1
-        buffer.writeu32(out, i * 4, n)
-    end
-end
-
-gpu.dispatch(spin, 64, buffer.create(256))
-)";
-
-    // the GPU gives up once the loop budget is spent, then the VM reruns the dispatch and the host's interrupt stops it
-    CHECK(run(*backend, source, 100000).find("script timed out") != std::string::npos);
-    CHECK(backend->stats().fallbacks == 1);
-    CHECK(backend->stats().gpuDispatches == 0);
-}
-
-TEST_CASE("kernels_come_from_the_function_itself")
-{
-    std::unique_ptr<VulkanBackend> backend = createBackend();
-    if (!backend)
-        return;
-
-    // two kernels on one line, closures of the same function, and a function that isn't @gpu with a kernel's shape
-    CHECK(run(*backend, R"(
-local a, b = @gpu function(i: number, o: buffer) buffer.writeu32(o, i * 4, 1) end, @gpu function(i: number, o: buffer) buffer.writeu32(o, i * 4, 2) end
-local function plain(i: number, o: buffer) buffer.writeu32(o, i * 4, 3) end
-
-local out = buffer.create(16)
-gpu.dispatch(a, 4, out)
-assert(buffer.readu32(out, 12) == 1)
-gpu.dispatch(b, 4, out)
-assert(buffer.readu32(out, 12) == 2)
-gpu.dispatch(plain, 4, out)
-assert(buffer.readu32(out, 12) == 3)
-assert(gpu.status(a) == "gpu" and gpu.status(b) == "gpu" and gpu.status(plain) == "vm")
-
-for k = 1, 3 do
-    local f = @gpu function(i: number, o: buffer) buffer.writeu32(o, i * 4, i + 10) end
-    gpu.dispatch(f, 4, out)
-    assert(buffer.readu32(out, 12) == 13)
-end
+local ok, err = gpu.run(square, { b }, 4)
+assert(not ok and err == "Function cannot run in GPU", err)
+assert(buffer.readu32(b, 12) == 0)
 )") == "");
-
-    CHECK(backend->stats().gpuDispatches == 5);
 }
 
-TEST_CASE("functions_whose_environment_isnt_safe_run_in_the_vm")
+TEST_CASE("functions_whose_environment_isnt_safe_cant_run")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();
     if (!backend)
@@ -448,208 +345,185 @@ TEST_CASE("functions_whose_environment_isnt_safe_run_in_the_vm")
     // getfenv marks the environment unsafe, so the builtins a kernel uses can't be trusted anymore
     CHECK(run(*backend, std::string(kSquare) + R"(
 local b = buffer.create(16)
-gpu.dispatch(square, 4, b)
+assert(gpu.run(square, { b }, 4))
 getfenv(1)
-gpu.dispatch(square, 4, b)
-assert(buffer.readu32(b, 12) == 9)
-)") == "");
-
-    CHECK(backend->stats().gpuDispatches == 1);
-}
-
-TEST_CASE("fallback_handlers_can_throw_or_use_the_backend")
-{
-    ScopedFastFlag sff{FFlag::LuauGpuKernels, true};
-
-    std::unique_ptr<VulkanBackend> backend = createBackend();
-    if (!backend)
-        return;
-
-    const char* source = R"(
-@gpu
-local function first(i: number, out: buffer)
-    local t = {}
-    buffer.writeu32(out, i * 4, 1)
-end
-
-@gpu
-local function second(i: number, out: buffer)
-    local t = {}
-    buffer.writeu32(out, i * 4, 2)
-end
-)";
-
-    int calls = 0;
-    backend->setFallbackHandler(
-        [&](const std::string& message)
-        {
-            calls++;
-            // the handler runs outside of the backend's lock
-            backend->stats();
-            if (message.find("'first'") != std::string::npos)
-                throw std::runtime_error("handler failure");
-        }
-    );
-
-    CHECK(run(*backend, std::string(source) + R"(
-local b = buffer.create(16)
-gpu.dispatch(first, 4, b)
-assert(buffer.readu32(b, 12) == 1)
-gpu.dispatch(second, 4, b)
-assert(buffer.readu32(b, 12) == 2)
-)") == "");
-
-    CHECK(calls == 2);
-}
-
-TEST_CASE("kernels_run_in_the_vm_can_dispatch_and_coroutines_can_dispatch")
-{
-    ScopedFastFlag sff{FFlag::LuauGpuKernels, true};
-
-    std::unique_ptr<VulkanBackend> backend = createBackend();
-    if (!backend)
-        return;
-
-    const char* source = R"(
-@gpu
-local function inner(i: number, b: buffer)
-    buffer.writeu32(b, i * 4, i + 1)
-end
-
--- calls gpu.dispatch, so it runs in the VM, and dispatches inner on the GPU from inside a dispatch
-@gpu
-local function outer(i: number, b: buffer)
-    gpu.dispatch(inner, 4, b)
-end
-)";
-
-    CHECK(run(*backend, std::string(source) + R"(
-local b = buffer.create(16)
-gpu.dispatch(outer, 3, b)
-assert(buffer.readu32(b, 12) == 4)
-
-local co = coroutine.create(function()
-    gpu.dispatch(inner, 4, b)
-    coroutine.yield()
-    gpu.dispatch(inner, 4, b)
-end)
-assert(coroutine.resume(co))
-assert(coroutine.resume(co))
-
--- kernels that yield in the VM raise an error instead of leaving the dispatch half done
-local yielding = coroutine.create(function()
-    gpu.dispatch(function() coroutine.yield() end, 4, b)
-end)
-local ok, err = coroutine.resume(yielding)
-assert(not ok and string.find(err, "yield"), err)
-
--- an error in the middle of a dispatch in the VM leaves the backend working
-assert(not pcall(gpu.dispatch, function(i) if i == 2 then error("boom") end end, 4, b))
 buffer.fill(b, 0, 0)
-gpu.dispatch(inner, 4, b)
-assert(buffer.readu32(b, 12) == 4)
+local ok, err = gpu.run(square, { b }, 4)
+assert(not ok and err == "Function cannot run in GPU", err)
+assert(buffer.readu32(b, 12) == 0)
 )") == "");
 
-    CHECK(backend->stats().gpuDispatches == 6);
+    CHECK(backend->stats().succeeded == 1);
 }
 
-TEST_CASE("status_of_functions_without_kernels")
+TEST_CASE("invalid_arguments_raise_errors")
 {
-    ScopedFastFlag sff{FFlag::LuauGpuKernels, true};
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
 
+    CHECK(run(*backend, std::string(kSquare) + R"(
+local b = buffer.create(16)
+local function fails(...)
+    local ok, err = pcall(gpu.run, ...)
+    assert(not ok, "expected an error")
+    return err
+end
+assert(string.find(fails(nil, { b }, 4), "function expected"))
+assert(string.find(fails(square, b, 4), "table expected"))
+assert(string.find(fails(square, { b, "b" }, 4), "buffer expected at index 2, got string"))
+assert(string.find(fails(square, { b }, -1), "between 0 and 2147483647"))
+assert(string.find(fails(square, { b }, 1.5), "between 0 and 2147483647"))
+assert(string.find(fails(square, { b }, 2^31), "between 0 and 2147483647"))
+assert(string.find(fails(square, { b }), "number expected"))
+assert(buffer.readu32(b, 12) == 0)
+)") == "");
+}
+
+TEST_CASE("without_a_device_run_returns_false_and_why")
+{
+    CHECK(run(nullptr, std::string(kSquare) + R"(
+local b = buffer.create(16)
+local ok, err = gpu.run(square, { b }, 4)
+assert(ok == false and err == "no device", err)
+assert(buffer.readu32(b, 12) == 0)
+)") == "");
+}
+
+TEST_CASE("errors_on_the_gpu_return_false_and_leave_every_buffer_untouched")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // the second buffer is too small for the last index: no buffer of the call changes, and a later run starts from the
+    // Luau contents again
+    CHECK(run(*backend, std::string(kSquare) + R"(
+@gpu
+local function inc(b: buffer, i: number)
+    buffer.writeu32(b, i * 4, buffer.readu32(b, i * 4) + 1)
+end
+
+local a, b = buffer.create(16), buffer.create(12)
+buffer.writeu32(a, 0, 5)
+buffer.writeu32(b, 8, 9)
+local beforeA, beforeB = copy(a), copy(b)
+
+local ok, err = gpu.run(inc, { a, b }, 4)
+assert(not ok and string.find(err, "failed on the GPU", 1, true), err)
+assert(same(a, beforeA) and same(b, beforeB))
+
+assert(gpu.run(inc, { a }, 4))
+assert(buffer.readu32(a, 0) == 6 and buffer.readu32(a, 12) == 1)
+)") == "");
+
+    RunStats stats = backend->stats();
+    CHECK(stats.failures == 1);
+    CHECK(stats.succeeded == 1);
+}
+
+TEST_CASE("integer_overflows_and_inexact_conversions_fail_the_run")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // the VM computes these exactly in doubles, which 32-bit integers on the GPU can't
+    CHECK(run(*backend, std::string(kSquare) + R"(
+@gpu
+local function overflow(b: buffer, i: number)
+    buffer.writeu32(b, 0, (buffer.readu32(b, 0) + i) * 65536 * 65536 // 65536 // 65536)
+end
+
+local b = buffer.create(4)
+buffer.writeu32(b, 0, 3)
+local ok, err = gpu.run(overflow, { b }, 1)
+assert(not ok and string.find(err, "failed on the GPU", 1, true), err)
+assert(buffer.readu32(b, 0) == 3)
+)") == "");
+}
+
+TEST_CASE("infinite_loops_fail_the_run")
+{
     std::unique_ptr<VulkanBackend> backend = createBackend();
     if (!backend)
         return;
 
     CHECK(run(*backend, R"(
-local where, why = gpu.status(print)
-assert(where == "vm" and string.find(why, "not a Luau function"), why)
-where, why = gpu.status(function() end)
-assert(where == "vm" and string.find(why, "gpu attribute"), why)
+@gpu
+local function spin(b: buffer, i: number)
+    local n = 0
+    while true do
+        n += 1
+        buffer.writeu32(b, i * 4, n)
+    end
+end
+
+local b = buffer.create(256)
+local ok, err = gpu.run(spin, { b }, 64)
+assert(not ok and string.find(err, "failed on the GPU", 1, true), err)
+assert(buffer.readu32(b, 0) == 0)
 )") == "");
+
+    CHECK(backend->stats().failures == 1);
 }
 
-TEST_CASE("buffer_copies_stay_within_the_cache_budget")
+TEST_CASE("a_runaway_run_gives_the_gpu_back_quickly")
 {
-    ScopedFastFlag sff{FFlag::LuauGpuKernels, true};
-
+    // no loop budget: only the request to stop bounds the GPU time
     VulkanOptions options;
-    options.cacheBytes = 1 << 20;
+    options.loopBudget = 0;
     std::unique_ptr<VulkanBackend> backend = createBackend(options);
     if (!backend)
         return;
 
-
-    // 64 live buffers of 256 KiB, each dispatched once: 16 MiB if every copy were kept
-    CHECK(run(*backend, std::string(kSquare) + R"(
-local keep = {}
-for k = 1, 64 do
-    local b = buffer.create(256 * 1024)
-    keep[k] = b
-    gpu.dispatch(square, 64, b)
-    assert(buffer.readu32(b, 63 * 4) == 63 * 63)
-end
-)") == "");
-
-    DispatchStats stats = backend->stats();
-    CHECK(stats.gpuDispatches == 64);
-    CHECK(stats.cachedBytes <= options.cacheBytes);
-
-    // a single dispatch may need more than the budget
-    const char* three = R"(
+    auto start = std::chrono::steady_clock::now();
+    CHECK(run(*backend, R"(
 @gpu
-local function sum(i: number, a: buffer, b: buffer, c: buffer)
-    buffer.writeu32(c, i * 4, buffer.readu32(a, i * 4) + buffer.readu32(b, i * 4))
+local function spin(b: buffer, i: number)
+    local n = 0
+    while true do
+        n += 1
+        buffer.writeu32(b, (i % 64) * 4, n)
+    end
 end
-)";
-    CHECK(run(*backend, std::string(three) + R"(
-local a, b, c = buffer.create(512 * 1024), buffer.create(512 * 1024), buffer.create(512 * 1024)
-buffer.writeu32(a, 0, 2)
-buffer.writeu32(b, 0, 3)
-gpu.dispatch(sum, 4, a, b, c)
-assert(buffer.readu32(c, 0) == 5)
+
+local ok, err = gpu.run(spin, { buffer.create(256) }, 1000000)
+assert(not ok and string.find(err, "failed on the GPU", 1, true), err)
 )") == "");
-    CHECK(backend->stats().gpuDispatches == 65);
+    double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+
+    // the run stops shortly after abortMs
+    MESSAGE("runaway run took " << seconds * 1000 << " ms");
+    CHECK(seconds < 0.25);
+
+    // the backend is still usable
+    CHECK(run(*backend, std::string(kSquare) + R"(
+local b = buffer.create(16)
+assert(gpu.run(square, { b }, 4))
+assert(buffer.readu32(b, 12) == 9)
+)") == "");
 }
 
-TEST_CASE("buffers_reusing_an_address_are_uploaded_again")
+TEST_CASE("buffers_over_the_storage_range_fail_the_run")
 {
-    ScopedFastFlag sff{FFlag::LuauGpuKernels, true};
-
-    std::unique_ptr<VulkanBackend> backend = createBackend();
+    VulkanOptions options;
+    options.minimumLimits = true;
+    std::unique_ptr<VulkanBackend> backend = createBackend(options);
     if (!backend)
         return;
 
-    const char* source = R"(
-@gpu
-local function copy(i: number, src: buffer, dst: buffer)
-    buffer.writeu32(dst, i * 4, buffer.readu32(src, i * 4))
-end
-)";
-
-    // freed buffers of the same size usually get the same address back; the copy must still see the new contents
-    CHECK(run(*backend, std::string(source) + R"(
-local dst = buffer.create(1024)
-for k = 1, 20 do
-    local src = buffer.create(1024)
-    buffer.fill(src, 0, k)
-    gpu.dispatch(copy, 256, src, dst)
-    assert(buffer.readu8(dst, 1000) == k)
-    src = nil
-    -- garbage to make the collector run
-    for j = 1, 2000 do
-        local t = table.create(64, j)
-    end
-end
+    // 128 MiB + 4 is over the minimum guaranteed storage buffer range
+    CHECK(run(*backend, std::string(kSquare) + R"(
+local b = buffer.create(128 * 1024 * 1024 + 4)
+local ok, err = gpu.run(square, { buffer.create(16), b }, 4)
+assert(not ok and string.find(err, "storage buffer range", 1, true), err)
+assert(buffer.readu32(b, 12) == 0)
 )") == "");
-
-    CHECK(backend->stats().gpuDispatches == 20);
 }
 
-TEST_CASE("a_dispatch_over_the_timeout_disables_the_backend_without_copying_results")
+TEST_CASE("a_run_over_the_timeout_disables_the_backend_without_copying_results")
 {
-    ScopedFastFlag sff{FFlag::LuauGpuKernels, true};
-
     VulkanOptions options;
     options.timeoutMs = 1;
     options.loopBudget = 0;
@@ -657,66 +531,241 @@ TEST_CASE("a_dispatch_over_the_timeout_disables_the_backend_without_copying_resu
     if (!backend)
         return;
 
-    // takes tens of milliseconds on a fast GPU, far over the timeout, and much longer in the VM, where the host's interrupt
-    // stops it; short enough not to keep the GPU busy for the tests that follow
-    const char* source = R"(
+    // takes tens of milliseconds on a fast GPU, far over the timeout; short enough not to keep the GPU busy for the tests
+    // that follow
+    CHECK(run(*backend, R"(
 @gpu
-local function heavy(i: number, out: buffer)
+local function heavy(b: buffer, i: number)
     local x = 0
     for k = 1, 20000 do
         x = (x * 1664525 + k) % 65536
     end
-    buffer.writeu32(out, (i % 1024) * 4, x)
+    buffer.writeu32(b, (i % 1024) * 4, x)
 end
-)";
-    std::string error =
-        run(*backend,
-            std::string(source) + R"(
-local out = buffer.create(4096)
-gpu.dispatch(heavy, 65536, out)
-)",
-            100000);
-    CHECK(error.find("script timed out") != std::string::npos);
 
-    DispatchStats stats = backend->stats();
-    CHECK(stats.gpuDispatches == 0);
+local b = buffer.create(4096)
+local ok, err = gpu.run(heavy, { b }, 65536)
+assert(not ok and string.find(err, "disabled", 1, true), err)
+assert(buffer.readu32(b, 0) == 0)
+)") == "");
+
+    RunStats stats = backend->stats();
+    CHECK(stats.succeeded == 0);
     CHECK(stats.downloadedBytes == 0);
 
-    // the backend stays disabled, including for functions never dispatched before, and nothing touches the busy device
+    // the backend stays disabled, including for functions never run before, and nothing touches the busy device
     CHECK(run(*backend, std::string(kSquare) + R"(
 local b = buffer.create(16)
-gpu.dispatch(square, 4, b)
-assert(buffer.readu32(b, 12) == 9)
-local where, why = gpu.status(square)
-assert(where == "vm" and string.find(why, "disabled"), why)
+local ok, err = gpu.run(square, { b }, 4)
+assert(not ok and string.find(err, "disabled", 1, true), err)
 )") == "");
-    CHECK(backend->stats().gpuDispatches == 0);
+    CHECK(backend->stats().succeeded == 0);
 }
 
-TEST_CASE("the_backend_can_be_used_from_several_threads")
+TEST_CASE("kernels_come_from_the_function_itself")
 {
-    // set once here, since threads setting and restoring them would race
-    ScopedFastFlag flags[] = {{FFlag::LuauGpuKernels, true}, {FFlag::LuauGpuLibrary, true}};
-
     std::unique_ptr<VulkanBackend> backend = createBackend();
     if (!backend)
         return;
 
-    std::string fallback;
-    backend->setFallbackHandler(
-        [&](const std::string& message)
-        {
-            fallback = message;
-        }
-    );
+    // two kernels on one line, and closures of the same function
+    CHECK(run(*backend, R"(
+local a, b = @gpu function(o: buffer, i: number) buffer.writeu32(o, i * 4, 1) end, @gpu function(o: buffer, i: number) buffer.writeu32(o, i * 4, 2) end
+
+local out = buffer.create(16)
+assert(gpu.run(a, { out }, 4))
+assert(buffer.readu32(out, 12) == 1)
+assert(gpu.run(b, { out }, 4))
+assert(buffer.readu32(out, 12) == 2)
+
+for k = 1, 3 do
+    local f = @gpu function(o: buffer, i: number) buffer.writeu32(o, i * 4, i + 10) end
+    assert(gpu.run(f, { out }, 4))
+    assert(buffer.readu32(out, 12) == 13)
+end
+)") == "");
+
+    CHECK(backend->stats().succeeded == 5);
+}
+
+TEST_CASE("each_run_mutates_its_buffer_in_the_order_of_the_list")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // a buffer listed twice runs twice, the second time on the results of the first
+    CHECK(run(*backend, R"(
+@gpu
+local function double(b: buffer, i: number)
+    buffer.writeu32(b, i * 4, buffer.readu32(b, i * 4) * 2 + 1)
+end
+
+local a, b = buffer.create(16), buffer.create(16)
+assert(gpu.run(double, { a, b, a }, 4))
+assert(buffer.readu32(a, 12) == 3 and buffer.readu32(b, 12) == 1)
+)") == "");
+}
+
+TEST_CASE("buffers_stay_on_the_gpu_and_are_uploaded_again_only_when_luau_changes_them")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    CHECK(run(*backend, R"(
+@gpu
+local function inc(b: buffer, i: number)
+    buffer.writeu32(b, i * 4, buffer.readu32(b, i * 4) + i)
+end
+
+local b = buffer.create(64)
+for _ = 1, 5 do
+    assert(gpu.run(inc, { b }, 16))
+end
+assert(buffer.readu32(b, 60) == 75)
+
+-- Luau changes the buffer: the next run sees it
+buffer.writeu32(b, 60, 100)
+assert(gpu.run(inc, { b }, 16))
+assert(buffer.readu32(b, 60) == 115)
+)") == "");
+
+    RunStats stats = backend->stats();
+    CHECK(stats.succeeded == 6);
+    // once at first, then again after Luau changed it; every run downloads its results
+    CHECK(stats.uploadedBytes == 64 * 2);
+    CHECK(stats.downloadedBytes == 64 * 6);
+}
+
+TEST_CASE("buffers_reusing_an_address_are_uploaded_again")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // freed buffers of the same size usually get the same address back; the run must still see the new contents
+    CHECK(run(*backend, R"(
+@gpu
+local function incWords(b: buffer, i: number)
+    buffer.writeu32(b, i * 4, buffer.readu32(b, i * 4) + 1)
+end
+
+for k = 1, 20 do
+    local b = buffer.create(1024)
+    buffer.fill(b, 0, k)
+    assert(gpu.run(incWords, { b }, 256))
+    assert(buffer.readu8(b, 1000) == k + 1 and buffer.readu8(b, 1001) == k)
+    b = nil
+    -- garbage to make the collector run
+    for j = 1, 2000 do
+        local t = table.create(64, j)
+    end
+end
+)") == "");
+
+    CHECK(backend->stats().succeeded == 20);
+}
+
+TEST_CASE("atomics_are_atomic_on_the_gpu_and_plain_in_luau")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // invocations sharing words of the buffer must use atomics
+    CHECK(run(*backend, R"(
+@gpu
+local function histogram(b: buffer, i: number)
+    gpu.atomicadd(b, (i % 16) * 4, 1)
+    gpu.atomicmin(b, 64, (i * 7919) % 10007 + 5)
+end
+
+local b = buffer.create(68)
+buffer.writeu32(b, 64, 0xffffffff)
+assert(gpu.run(histogram, { b }, 16000))
+for k = 0, 15 do
+    assert(buffer.readu32(b, k * 4) == 1000)
+end
+assert(buffer.readu32(b, 64) == 5)
+
+-- from Luau, they return the previous value
+local c = buffer.create(8)
+assert(gpu.atomicadd(c, 0, 3) == 0 and gpu.atomicadd(c, 0, -1) == 3 and buffer.readu32(c, 0) == 2)
+assert(gpu.atomicmin(c, 4, 7) == 0 and buffer.readu32(c, 4) == 0)
+assert(not pcall(gpu.atomicadd, c, 8, 1))
+)") == "");
+}
+
+TEST_CASE("coroutines_can_run")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    CHECK(run(*backend, std::string(kSquare) + R"(
+local b = buffer.create(16)
+local co = coroutine.create(function()
+    assert(gpu.run(square, { b }, 4))
+    coroutine.yield()
+    assert(gpu.run(square, { b }, 4))
+end)
+assert(coroutine.resume(co))
+assert(coroutine.resume(co))
+assert(buffer.readu32(b, 12) == 9)
+)") == "");
+
+    CHECK(backend->stats().succeeded == 2);
+}
+
+TEST_CASE("buffer_copies_stay_within_the_cache_budget")
+{
+    VulkanOptions options;
+    options.cacheBytes = 1 << 20;
+    std::unique_ptr<VulkanBackend> backend = createBackend(options);
+    if (!backend)
+        return;
+
+    // 64 live buffers of 256 KiB, each run once: 16 MiB if every copy were kept
+    CHECK(run(*backend, std::string(kSquare) + R"(
+local keep = {}
+for k = 1, 64 do
+    local b = buffer.create(256 * 1024)
+    keep[k] = b
+    assert(gpu.run(square, { b }, 64))
+    assert(buffer.readu32(b, 63 * 4) == 63 * 63)
+end
+)") == "");
+
+    RunStats stats = backend->stats();
+    CHECK(stats.succeeded == 64);
+    CHECK(stats.cachedBytes <= options.cacheBytes);
+
+    // a single run may need more than the budget
+    CHECK(run(*backend, std::string(kSquare) + R"(
+local a, b, c = buffer.create(512 * 1024), buffer.create(512 * 1024), buffer.create(512 * 1024)
+assert(gpu.run(square, { a, b, c }, 4))
+assert(buffer.readu32(c, 12) == 9)
+)") == "");
+    CHECK(backend->stats().succeeded == 65);
+}
+
+TEST_CASE("the_backend_can_be_used_from_several_threads")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
 
     std::string script = std::string(kSquare) + R"(
 for k = 1, 50 do
     local b = buffer.create(4096)
-    gpu.dispatch(square, 1024, b)
+    assert(gpu.run(square, { b }, 1024))
     assert(buffer.readu32(b, 4092) == 1023 * 1023)
 end
 )";
+
+    // set once here, since threads setting and restoring it would race
+    ScopedFastFlag flag{FFlag::LuauGpuKernels, true};
 
     std::string errors[4];
     std::vector<std::thread> threads;
@@ -732,7 +781,7 @@ end
 
     for (const std::string& error : errors)
         CHECK(error == "");
-    CHECK_MESSAGE(backend->stats().gpuDispatches == 200, fallback);
+    CHECK(backend->stats().succeeded == 200);
 }
 
 TEST_CASE("registers_dead_at_a_join_dont_need_exact_conversions")
@@ -744,7 +793,7 @@ TEST_CASE("registers_dead_at_a_join_dont_need_exact_conversions")
     // 'big' doesn't fit a float exactly, and its register is reused for floats after the branch, where it's dead
     CHECK(run(*backend, R"(
 @gpu
-local function k(i: number, b: buffer)
+local function k(b: buffer, i: number)
     if i % 2 == 0 then
         local big = buffer.readu32(b, 0)
         buffer.writeu32(b, 4 + i * 4, big)
@@ -758,52 +807,8 @@ end
 
 local b = buffer.create(128)
 buffer.writeu32(b, 0, 0xfffffff1)
-gpu.dispatch(k, 8, b)
+assert(gpu.run(k, { b }, 8))
 assert(buffer.readu32(b, 4) == 0xfffffff1)
-)") == "");
-
-    DispatchStats stats = backend->stats();
-    CHECK(stats.gpuDispatches == 1);
-    CHECK(stats.fallbacks == 0);
-}
-
-TEST_CASE("a_runaway_dispatch_gives_the_gpu_back_quickly")
-{
-    // no loop budget: only the request to stop bounds the GPU time
-    VulkanOptions options;
-    options.loopBudget = 0;
-    std::unique_ptr<VulkanBackend> backend = createBackend(options);
-    if (!backend)
-        return;
-
-    const char* source = R"(
-@gpu
-local function spin(i: number, out: buffer)
-    local n = 0
-    while true do
-        n += 1
-        buffer.writeu32(out, (i % 64) * 4, n)
-    end
-end
-
-gpu.dispatch(spin, 1000000, buffer.create(256))
-)";
-
-    // the GPU attempt stops shortly after abortMs, then the VM reruns the dispatch and the host's interrupt stops it
-    auto start = std::chrono::steady_clock::now();
-    CHECK(run(*backend, source, 1000).find("script timed out") != std::string::npos);
-    double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-
-    MESSAGE("runaway dispatch and VM rerun took " << seconds * 1000 << " ms");
-    CHECK(seconds < 0.25);
-    DispatchStats stats = backend->stats();
-    CHECK(stats.fallbacks == 1);
-
-    // the backend is still usable
-    CHECK(run(*backend, std::string(kSquare) + R"(
-local b = buffer.create(16)
-gpu.dispatch(square, 4, b)
-assert(buffer.readu32(b, 12) == 9 and gpu.status(square) == "gpu")
 )") == "");
 }
 
@@ -853,8 +858,8 @@ TEST_CASE("devices_that_break_the_kernel_contract_are_refused")
 
     CHECK(run(*accepted, std::string(kSquare) + R"(
 local b = buffer.create(16)
-gpu.dispatch(square, 4, b)
-assert(buffer.readu32(b, 12) == 9 and gpu.status(square) == "gpu")
+assert(gpu.run(square, { b }, 4))
+assert(buffer.readu32(b, 12) == 9)
 )") == "");
 }
 
@@ -864,44 +869,43 @@ TEST_CASE("kernels_keep_nan_infinities_and_signed_zeros")
     if (!backend)
         return;
 
-    // without SignedZeroInfNanPreserve, drivers fold 0/0 to 0, x/x to 1, inf-inf to 0 and -0+0 to -0
+    // without SignedZeroInfNanPreserve, drivers fold 0/0 to 0, x/x to 1, inf-inf to 0 and -0+0 to -0; inputs are in the first
+    // 16 bytes, results after them
     CHECK(run(*backend, R"(
 @gpu
-local function k(i: number, src: buffer, out: buffer)
-    local z = buffer.readf32(src, 0)
-    local nz = buffer.readf32(src, 4)
-    local b = buffer.readi32(src, 8)
-    local h = buffer.readf32(src, 12)
-    buffer.writef32(out, 0, 0 / b)
-    buffer.writef32(out, 4, z / z)
-    buffer.writef32(out, 8, 1 / z)
-    buffer.writef32(out, 12, 1 / nz)
-    buffer.writef32(out, 16, h - h)
-    buffer.writef32(out, 20, h * 0)
-    buffer.writef32(out, 24, nz + 0)
-    buffer.writef32(out, 28, -z)
-    buffer.writeu32(out, 32, if z / z ~= z / z then 1 else 0)
-    buffer.writef32(out, 36, math.huge - math.huge)
+local function k(b: buffer, i: number)
+    local z = buffer.readf32(b, 0)
+    local nz = buffer.readf32(b, 4)
+    local n = buffer.readi32(b, 8)
+    local h = buffer.readf32(b, 12)
+    buffer.writef32(b, 16, 0 / n)
+    buffer.writef32(b, 20, z / z)
+    buffer.writef32(b, 24, 1 / z)
+    buffer.writef32(b, 28, 1 / nz)
+    buffer.writef32(b, 32, h - h)
+    buffer.writef32(b, 36, h * 0)
+    buffer.writef32(b, 40, nz + 0)
+    buffer.writef32(b, 44, -z)
+    buffer.writeu32(b, 48, if z / z ~= z / z then 1 else 0)
+    buffer.writef32(b, 52, math.huge - math.huge)
 end
 
-local src = buffer.create(16)
-buffer.writef32(src, 4, -0.0)
-buffer.writef32(src, 12, math.huge)
+local onGpu = buffer.create(56)
+buffer.writef32(onGpu, 4, -0.0)
+buffer.writef32(onGpu, 12, math.huge)
+local inLuau = buffer.create(56)
+buffer.copy(inLuau, 0, onGpu)
 
-local gpuOut, vmOut = buffer.create(40), buffer.create(40)
-gpu.dispatch(k, 1, src, gpuOut)
-assert(gpu.status(k) == "gpu")
-k(0, src, vmOut)
+assert(gpu.run(k, { onGpu }, 1))
+k(inLuau, 0)
 
-for o = 0, 36, 4 do
-    local x, y = buffer.readf32(gpuOut, o), buffer.readf32(vmOut, o)
+for o = 16, 52, 4 do
+    local x, y = buffer.readf32(onGpu, o), buffer.readf32(inLuau, o)
     -- NaN payloads are platform specific, in the VM too
-    local same = if x ~= x then y ~= y else buffer.readu32(gpuOut, o) == buffer.readu32(vmOut, o)
+    local same = if x ~= x then y ~= y else buffer.readu32(onGpu, o) == buffer.readu32(inLuau, o)
     assert(same, `offset {o}: gpu {x} vm {y}`)
 end
 )") == "");
-
-    CHECK(backend->stats().gpuDispatches == 1);
 }
 
 TEST_CASE("kernels_that_crashed_the_spirv_optimizer_run_on_the_gpu")
@@ -913,22 +917,20 @@ TEST_CASE("kernels_that_crashed_the_spirv_optimizer_run_on_the_gpu")
     // folding nested float multiplications and divisions crashed the SPIR-V optimizer, which is no longer used
     CHECK(run(*backend, R"(
 @gpu
-local function k(i: number, src: buffer, out: buffer)
-    local s = buffer.readf32(src, 0)
+local function k(b: buffer, i: number)
+    local s = buffer.readf32(b, 0)
     local r = vector.create(s, s, s)
     local w0 = (r * -2) / (vector.create(1, -2, 0.5) * r)
-    buffer.writef32(out, i * 4, w0.x + w0.y + w0.z)
+    buffer.writef32(b, 4 + i * 4, w0.x + w0.y + w0.z)
 end
 
-local src, gpuOut, vmOut = buffer.create(4), buffer.create(16), buffer.create(16)
-buffer.writef32(src, 0, 3)
-gpu.dispatch(k, 4, src, gpuOut)
-assert(gpu.status(k) == "gpu")
-for i = 0, 3 do k(i, src, vmOut) end
-assert(buffer.readf32(gpuOut, 12) == buffer.readf32(vmOut, 12), buffer.readf32(gpuOut, 12))
+local onGpu, inLuau = buffer.create(20), buffer.create(20)
+buffer.writef32(onGpu, 0, 3)
+buffer.writef32(inLuau, 0, 3)
+assert(gpu.run(k, { onGpu }, 4))
+for i = 0, 3 do k(inLuau, i) end
+assert(buffer.readf32(onGpu, 16) == buffer.readf32(inLuau, 16), buffer.readf32(onGpu, 16))
 )") == "");
-
-    CHECK(backend->stats().gpuDispatches == 1);
 }
 
 TEST_CASE("collected_buffers_and_functions_release_what_the_backend_holds_for_them")
@@ -939,32 +941,32 @@ TEST_CASE("collected_buffers_and_functions_release_what_the_backend_holds_for_th
 
     CHECK(run(*backend, R"(
 local function makeKernel()
-    return @gpu function(i: number, out: buffer)
-        buffer.writeu32(out, i * 4, i)
+    return @gpu function(b: buffer, i: number)
+        buffer.writeu32(b, i * 4, i)
     end
 end
 
 -- in a function, so that nothing on the stack keeps the buffer and the kernel alive once it returns
 local function use()
     local big = buffer.create(1024 * 1024)
-    gpu.dispatch(makeKernel(), 4, big)
+    assert(gpu.run(makeKernel(), { big }, 4))
     local cached, kernels = backendstats()
     assert(cached >= 1024 * 1024 and kernels == 1, `{cached} {kernels}`)
 end
 use()
 
 -- the GC collects the buffer and the function, then the sentinels of the weak tables, whose values it still marks in the
--- cycle where their keys die; the next call into the backend frees the copy and the kernel
+-- cycle where their keys die; the end of the next run frees the copy and the kernel
 collect()
 collect()
-gpu.status(print)
+assert(gpu.run(makeKernel(), {}, 0))
 local cached, _, memory = backendstats()
 assert(cached == 0 and memory == 0, `{cached} {memory}`)
 )") == "");
 
-    // a function without upvalues lives as long as its prototype, so kernels are released with the state; the next call into
-    // the backend frees them, leaving only the kernel of the function it is called with
-    CHECK(run(*backend, "gpu.status(print)") == "");
+    // a function without upvalues lives as long as its prototype, so kernels are released with the state; the next run
+    // frees them, leaving only the kernel of the function it runs
+    CHECK(run(*backend, "assert(gpu.run(@gpu function(b: buffer, i: number) end, {}, 0))") == "");
     CHECK(backend->stats().kernels == 1);
 }
 
@@ -976,8 +978,8 @@ TEST_CASE("fresh_buffers_every_iteration_keep_a_flat_cost_and_bounded_memory")
 
     CHECK(run(*backend, R"(
 @gpu
-local function fill(i: number, out: buffer)
-    buffer.writeu32(out, i * 4, i)
+local function fill(b: buffer, i: number)
+    buffer.writeu32(b, i * 4, i)
 end
 
 local n = 3000
@@ -986,7 +988,7 @@ local maxCached, maxMemory = 0, 0
 for k = 1, n do
     local b = buffer.create(64 * 1024 + (k % 7) * 1024)
     local t = os.clock()
-    gpu.dispatch(fill, 1024, b)
+    assert(gpu.run(fill, { b }, 1024))
     times[k] = os.clock() - t
     assert(buffer.readu32(b, 4092) == 1023)
     if k % 100 == 0 then
@@ -997,7 +999,7 @@ for k = 1, n do
     maxMemory = math.max(maxMemory, memory)
 end
 
--- medians, since other processes using the GPU make single dispatches slow at random
+-- medians, since other processes using the GPU make single runs slow at random
 local function median(a, b)
     local t = table.create(b - a + 1)
     for k = a, b do
@@ -1007,133 +1009,14 @@ local function median(a, b)
     return t[#t // 2 + 1]
 end
 
--- what is alive between two collections, not everything that was ever dispatched
+-- what is alive between two collections, not everything that ever ran
 assert(maxCached < 101 * 72 * 1024, `{maxCached}`)
 -- buffers share memory blocks for the device copies and host mirrors, which grow with what is alive
 assert(maxMemory <= 4 * 101 * 72 * 1024, `{maxMemory}`)
--- the cost of a dispatch doesn't grow with the number of buffers that came before
+-- the cost of a run doesn't grow with the number of buffers that came before
 local first, last = median(1, n // 10), median(n - n // 10 + 1, n)
 assert(last < first * 1.5 + 0.0002, `{first} {last}`)
 )") == "");
-}
-
-TEST_CASE("a_batch_is_the_steps_in_order_and_downloads_only_its_outputs")
-{
-    std::unique_ptr<VulkanBackend> backend = createBackend();
-    if (!backend)
-        return;
-
-    // three double buffered steps of a 1D cellular automaton; the intermediate generations stay on the GPU
-    CHECK(run(*backend, R"(
-@gpu
-local function step(i: number, src: buffer, dst: buffer)
-    local n = buffer.len(src) // 4
-    local l = buffer.readu32(src, ((i + n - 1) % n) * 4)
-    local r = buffer.readu32(src, ((i + 1) % n) * 4)
-    buffer.writeu32(dst, i * 4, bit32.bxor(l, r))
-end
-
-local n = 4096
-local a, b = buffer.create(n * 4), buffer.create(n * 4)
-buffer.writeu32(a, (n // 2) * 4, 1)
-
-local va, vb = buffer.create(n * 4), buffer.create(n * 4)
-buffer.copy(va, 0, a)
-for _ = 1, 3 do
-    for i = 0, n - 1 do step(i, va, vb) end
-    va, vb = vb, va
-end
-
-gpu.dispatch({ { step, n, a, b }, { step, n, b, a }, { step, n, a, b } }, { b })
-for o = 0, n * 4 - 4, 4 do
-    assert(buffer.readu32(b, o) == buffer.readu32(va, o))
-end
-)") == "");
-
-    DispatchStats stats = backend->stats();
-    CHECK(stats.gpuDispatches == 1);
-    CHECK(stats.downloadedBytes == 4096 * 4);
-}
-
-TEST_CASE("an_empty_batch_can_be_the_first_call_of_a_backend")
-{
-    std::unique_ptr<VulkanBackend> backend = createBackend();
-    if (!backend)
-        return;
-
-    // nothing has been dispatched yet, so no descriptor pool exists; scripts probe for batch support this way
-    CHECK(run(*backend, std::string(kSquare) + R"(
-assert(pcall(gpu.dispatch, {}, {}, {}))
-local b = buffer.create(40)
-gpu.dispatch({}, { b })
-gpu.dispatch({ { square, 10, b } }, { b })
-assert(buffer.readu32(b, 36) == 81)
-)") == "");
-}
-
-TEST_CASE("buffers_stay_on_the_gpu_between_batches_until_luau_changes_them")
-{
-    std::unique_ptr<VulkanBackend> backend = createBackend();
-    if (!backend)
-        return;
-
-    CHECK(run(*backend, R"(
-@gpu
-local function add(i: number, acc: buffer, inc: buffer)
-    buffer.writeu32(acc, i * 4, buffer.readu32(acc, i * 4) + buffer.readu32(inc, i * 4))
-end
-
-local acc, inc = buffer.create(64), buffer.create(64)
-for i = 0, 15 do buffer.writeu32(inc, i * 4, i) end
-
--- acc is accumulated on the GPU, and only read back when asked for
-for _ = 1, 5 do
-    gpu.dispatch({ { add, 16, acc, inc } })
-end
-gpu.dispatch({}, { acc })
-assert(buffer.readu32(acc, 60) == 75)
-
--- Luau changes inc: listing it in 'changed' makes the next batch see it
-for i = 0, 15 do buffer.writeu32(inc, i * 4, 100) end
-gpu.dispatch({ { add, 16, acc, inc } }, { acc }, { inc })
-assert(buffer.readu32(acc, 60) == 175)
-)") == "");
-
-    DispatchStats stats = backend->stats();
-    CHECK(stats.gpuDispatches == 7);
-    // acc and inc once each at first, then inc again after it changed
-    CHECK(stats.uploadedBytes == 64 * 3);
-}
-
-TEST_CASE("a_batch_that_fails_on_the_gpu_reruns_in_the_vm_from_the_contents_left_by_earlier_batches")
-{
-    std::unique_ptr<VulkanBackend> backend = createBackend();
-    if (!backend)
-        return;
-
-    CHECK(run(*backend, R"(
-@gpu
-local function inc(i: number, b: buffer)
-    buffer.writeu32(b, i * 4, buffer.readu32(b, i * 4) + 1)
-end
-
-@gpu
-local function outOfBounds(i: number, b: buffer)
-    buffer.writeu32(b, i * 4 + 4, 0)
-end
-
-local b = buffer.create(16)
-gpu.dispatch({ { inc, 4, b } }) -- b is 1 on the GPU only
--- inc runs on the GPU, then the second step fails: the VM reruns both from b = 1, and raises the error after writing
--- the first three words of the second step
-local ok, err = pcall(gpu.dispatch, { { inc, 4, b }, { outOfBounds, 4, b } }, { b })
-assert(not ok and string.find(err, "out of bounds"), err)
-assert(buffer.readu32(b, 0) == 2 and buffer.readu32(b, 4) == 0 and buffer.readu32(b, 12) == 0)
-)") == "");
-
-    DispatchStats stats = backend->stats();
-    CHECK(stats.gpuDispatches == 1);
-    CHECK(stats.fallbacks == 1);
 }
 
 TEST_CASE("large_kernels_with_many_loops_run_on_the_gpu")
@@ -1143,7 +1026,7 @@ TEST_CASE("large_kernels_with_many_loops_run_on_the_gpu")
         return;
 
     // about 600 lines: a chain of loops and branches, each depending on the previous result
-    std::string kernel = "@gpu\nlocal function big(i: number, out: buffer)\n    local x = i\n    local y = 0.5\n";
+    std::string kernel = "@gpu\nlocal function big(b: buffer, i: number)\n    local x = i\n    local y = 0.5\n";
     for (int k = 0; k < 100; k++)
     {
         kernel += "    for j = 1, " + std::to_string(k % 7 + 1) + " do\n";
@@ -1153,21 +1036,20 @@ TEST_CASE("large_kernels_with_many_loops_run_on_the_gpu")
         kernel += "    if x % 3 == " + std::to_string(k % 3) + " then x += " + std::to_string(k) + " end\n";
         kernel += "\n";
     }
-    kernel += "    buffer.writeu32(out, i * 8, x)\n    buffer.writef32(out, i * 8 + 4, y)\nend\n";
+    kernel += "    buffer.writeu32(b, i * 8, x)\n    buffer.writef32(b, i * 8 + 4, y)\nend\n";
 
     CHECK(run(*backend, kernel + R"(
 local n = 1024
-local gpuOut, vmOut = buffer.create(n * 8), buffer.create(n * 8)
-gpu.dispatch(big, n, gpuOut)
-assert(gpu.status(big) == "gpu", select(2, gpu.status(big)))
-for i = 0, n - 1 do big(i, vmOut) end
+local onGpu, inLuau = buffer.create(n * 8), buffer.create(n * 8)
+assert(gpu.run(big, { onGpu }, n))
+for i = 0, n - 1 do big(inLuau, i) end
 for i = 0, n - 1 do
-    assert(buffer.readu32(gpuOut, i * 8) == buffer.readu32(vmOut, i * 8))
-    assert(math.abs(buffer.readf32(gpuOut, i * 8 + 4) - buffer.readf32(vmOut, i * 8 + 4)) < 1e-4)
+    assert(buffer.readu32(onGpu, i * 8) == buffer.readu32(inLuau, i * 8))
+    assert(math.abs(buffer.readf32(onGpu, i * 8 + 4) - buffer.readf32(inLuau, i * 8 + 4)) < 1e-4)
 end
 )") == "");
 
-    CHECK(backend->stats().gpuDispatches == 1);
+    CHECK(backend->stats().succeeded == 1);
 }
 
 TEST_SUITE_END();

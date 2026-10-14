@@ -12,7 +12,7 @@
 #include <stdio.h>
 
 // Lowers the IR of a @gpu function to a GLSL compute shader, after the same IR translation, limits and optimizations as
-// native code. Every guard and fallback path of the IR fails the dispatch instead: the host then reruns it in the VM.
+// native code. Every guard and fallback path of the IR fails the run instead, which leaves its buffers as they were.
 
 namespace Luau
 {
@@ -20,13 +20,13 @@ namespace CodeGen
 {
 
 // mirrors Gpu/include/Luau/GpuAbi.h
-constexpr int kGpuMaxBuffers = 15;
+constexpr int kGpuMaxBuffers = 1;
 constexpr unsigned kGpuWorkgroupSize = 64;
 
 namespace
 {
 
-// Numbers are lowered to 32-bit types. Integers stay exact: an operation whose result doesn't fit fails the dispatch.
+// Numbers are lowered to 32-bit types. Integers stay exact: an operation whose result doesn't fit fails the run.
 // Ordered so that joining two classes is taking the larger one.
 enum class NumClass : uint8_t
 {
@@ -207,7 +207,6 @@ enum class GpuCall : int8_t
     Unknown,
     AtomicAdd,
     AtomicMin,
-    AtomicMax,
     BufferLen,
 };
 
@@ -239,7 +238,7 @@ struct GlslLowering
     Proto* proto;
     GlslBuilder& build;
 
-    std::vector<bool> lowered;       // per block: lowered, or a fallback/exit that fails the dispatch
+    std::vector<bool> lowered;       // per block: lowered, or a fallback/exit that fails the run
     std::vector<NumClass> instClass; // per instruction producing a double, or the number of a loaded TValue
     std::vector<int> instBuffer;     // per instruction producing a buffer pointer or TValue
     std::vector<GpuCall> instCall;   // per instruction loading a TValue: the import it holds
@@ -607,8 +606,6 @@ struct GlslLowering
             return GpuCall::AtomicAdd;
         if (l == "gpu" && n == "atomicmin")
             return GpuCall::AtomicMin;
-        if (l == "gpu" && n == "atomicmax")
-            return GpuCall::AtomicMax;
         if (l == "buffer" && n == "len")
             return GpuCall::BufferLen;
         return GpuCall::Unknown;
@@ -916,13 +913,14 @@ struct GlslLowering
         instTag.assign(size, -1);
         instRange.assign(size, Range());
 
+        // the parameters are the buffer and the index
         std::vector<RegState> start(proto->maxstacksize);
-        start[0].cls = NumClass::NonNeg;
-        start[0].tag = LUA_TNUMBER;
-        for (int i = 1; i < proto->numparams; i++)
+        start[0].buffer = 0;
+        start[0].tag = LUA_TBUFFER;
+        if (proto->numparams > 1)
         {
-            start[i].buffer = i - 1;
-            start[i].tag = LUA_TBUFFER;
+            start[1].cls = NumClass::NonNeg;
+            start[1].tag = LUA_TNUMBER;
         }
 
         entry.assign(function.blocks.size(), std::vector<RegState>(proto->maxstacksize));
@@ -999,7 +997,7 @@ struct GlslLowering
             return "{ " + moves + branch(target.index) + " }";
         }
 
-        // fallbacks, exits to the VM and aborts: the host reruns the dispatch in the VM
+        // fallbacks, exits to the VM and aborts fail the run
         return "{ l_fail(); return; }";
     }
 
@@ -1366,7 +1364,7 @@ struct GlslLowering
     bool binding(uint32_t index, IrOp op, int& b)
     {
         b = buffer(op);
-        return b >= 0 ? true : reject(index, "a buffer that isn't a parameter");
+        return b >= 0 ? true : reject(index, "a buffer other than the kernel's parameter");
     }
 
     static bool writesRegister(IrInst& inst)
@@ -1770,7 +1768,7 @@ struct GlslLowering
         }
         case IrCmd::NUM_TO_UINT:
         {
-            // out of range values are architecture specific in native code; here they fail the dispatch
+            // out of range values are architecture specific in native code; here they fail the run
             Num a = num(OP_A(inst));
             line(v + " = int(" + (a.cls == NumClass::Float ? "l_f2u(" + a.code + ")" : a.code) + ");");
             break;
@@ -1821,7 +1819,7 @@ struct GlslLowering
         }
         case IrCmd::INTERRUPT:
             // native code checks for interrupts here, at every loop iteration and before returning
-            // and every 256 iterations, whether the host asked a dispatch that runs for too long to stop
+            // and every 256 iterations, whether the host asked a run that takes too long to stop
             line("if ((++l_steps > pc.budget && pc.budget != 0u) || ((l_steps & 255u) == 0u && st.stop != 0)) { l_fail(); return; }");
             break;
         case IrCmd::RETURN:
@@ -1968,7 +1966,7 @@ struct GlslLowering
         std::string r = "r" + std::to_string(ra);
         int b = ra + 1 < int(cur.size()) ? cur[ra + 1].buffer : -1;
         if (b < 0)
-            return reject(index, "a buffer that isn't a parameter");
+            return reject(index, "a buffer other than the kernel's parameter");
 
         std::string value;
         if (call == GpuCall::BufferLen)
@@ -1990,11 +1988,11 @@ struct GlslLowering
                                   : val.cls == NumClass::Int ? "uint(" + val.code + ")"
                                                              : convert(val.code, val.cls, NumClass::Uint);
 
-            int op = call == GpuCall::AtomicAdd ? 0 : call == GpuCall::AtomicMin ? 1 : 2;
+            int op = call == GpuCall::AtomicAdd ? 0 : 1;
             atomics[b] |= uint8_t(1 << op);
             build.bufferWritten[b] = true;
 
-            static const char* const kNames[] = {"add", "min", "max"};
+            static const char* const kNames[] = {"add", "min"};
             value = "l_atomic" + std::string(kNames[op]) + std::to_string(b) + "(" + offset + ", " + operand + ")";
         }
 
@@ -2087,11 +2085,11 @@ struct GlslLowering
         if (proto->is_vararg)
             return reject(0, "a variadic function");
         if (proto->numparams == 0)
-            return reject(0, "a function without the invocation index parameter");
-        if (proto->numparams - 1 > kGpuMaxBuffers)
-            return reject(0, "a function with more than " + std::to_string(kGpuMaxBuffers) + " buffer parameters");
+            return reject(0, "a function without the buffer parameter");
+        if (proto->numparams > 2)
+            return reject(0, "a function with parameters other than the buffer and the index");
 
-        int buffers = proto->numparams - 1;
+        int buffers = kGpuMaxBuffers;
         build.bufferWritten.assign(buffers, false);
         readBuffers.assign(buffers, false);
         atomics.assign(buffers, 0);
@@ -2133,8 +2131,8 @@ struct GlslLowering
             if (build.bufferWritten[i])
                 glsl += "void l_wr" + b + "(int off, uint v) { if ((off & 3) != 0) { l_fail(); return; } b" + b + ".d[off >> 2] = v; }\n";
 
-            static const char* const kAtomics[][2] = {{"add", "atomicAdd"}, {"min", "atomicMin"}, {"max", "atomicMax"}};
-            for (int op = 0; op < 3; op++)
+            static const char* const kAtomics[][2] = {{"add", "atomicAdd"}, {"min", "atomicMin"}};
+            for (int op = 0; op < 2; op++)
             {
                 if (atomics[i] & (1 << op))
                     glsl += std::string("uint l_atomic") + kAtomics[op][0] + b + "(int off, uint v) { if (l_bad(off, " + b +
@@ -2143,9 +2141,9 @@ struct GlslLowering
         }
 
         glsl += "\nvoid l_kernel(int index)\n{\n" + declarations();
-        glsl += "    r0t = " + std::to_string(LUA_TNUMBER) + "u; r0a = index;\n";
-        for (int i = 1; i <= buffers; i++)
-            glsl += "    r" + std::to_string(i) + "t = " + std::to_string(LUA_TBUFFER) + "u;\n";
+        glsl += "    r0t = " + std::to_string(LUA_TBUFFER) + "u;\n";
+        if (proto->numparams > 1)
+            glsl += "    r1t = " + std::to_string(LUA_TNUMBER) + "u; r1a = index;\n";
 
         glsl += "    int l_jmp = 0;\n";
         glsl += body;
@@ -2153,7 +2151,7 @@ struct GlslLowering
         glsl += "void main()\n{\n";
         glsl +=
             "    uint gid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * " + std::to_string(kGpuWorkgroupSize) + "u;\n";
-        // invocations that start after the host asked the dispatch to stop give up at once
+        // invocations that start after the host asked the run to stop give up at once
         glsl += "    if (gid >= pc.n) return;\n    if (gid == 0u) st.started = 1u;\n    if (st.stop != 0) { l_fail(); return; }\n"
                 "    l_kernel(int(gid));\n}\n";
 
@@ -2224,6 +2222,11 @@ static GpuKernel compileProto(Proto* proto, LuaTable* env)
     kernel.glsl = std::move(build.glsl);
     kernel.bufferWritten = std::move(build.bufferWritten);
     return kernel;
+}
+
+bool isGpuEnvironmentSafe(lua_State* L, int idx)
+{
+    return lua_isLfunction(L, idx) && clvalue(luaA_toobject(L, idx))->env->safeenv;
 }
 
 GpuKernel compileGpu(lua_State* L, int idx)

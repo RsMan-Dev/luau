@@ -109,8 +109,10 @@ endif()
 if(TARGET Luau.Gpu.Vulkan)
     # Luau.Gpu.Vulkan Sources
     target_sources(Luau.Gpu.Vulkan PRIVATE
+        Gpu/include/Luau/GpuLibrary.h
         Gpu/include/Luau/GpuVulkan.h
 
+        Gpu/src/GpuLibrary.cpp
         Gpu/src/GpuVulkan.cpp
     )
 endif()

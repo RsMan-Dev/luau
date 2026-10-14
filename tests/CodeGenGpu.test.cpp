@@ -19,7 +19,6 @@
 #include <memory>
 
 LUAU_FASTFLAG(LuauGpuKernels)
-LUAU_FASTFLAG(LuauGpuLibrary)
 
 using namespace Luau::CodeGen;
 
@@ -69,28 +68,29 @@ TEST_CASE("GpuKernelBasics")
 {
     GpuKernel kernel = lowerGpu(R"(
 @gpu
-local function scale(i: number, src: buffer, dst: buffer)
+local function scale(b: buffer, i: number)
     local o = i * 4
-    buffer.writef32(dst, o, buffer.readf32(src, o) * 2)
+    buffer.writef32(b, o, buffer.readf32(b, o) * 2)
 end
 return scale
 )");
 
     REQUIRE_MESSAGE(kernel.reason.empty(), kernel.reason);
     CHECK(kernel.result == CodeGenCompilationResult::Success);
-    CHECK(kernel.bufferWritten == std::vector<bool>{false, true});
-    CHECK(contains(kernel.glsl, "layout(std430, set = 0, binding = 2) coherent volatile buffer BS { uint err; int stop; uint started; } st;"));
+    CHECK(kernel.bufferWritten == std::vector<bool>{true});
+    CHECK(contains(kernel.glsl, "layout(std430, set = 0, binding = 1) coherent volatile buffer BS { uint err; int stop; uint started; } st;"));
     CHECK(contains(kernel.glsl, "uint budget;"));
 
-    // offsets computed from the invocation index stay exact integers
-    CHECK(contains(kernel.glsl, "l_muli("));
+    // offsets computed from the index stay exact integers, with an overflow check
+    CHECK(contains(kernel.glsl, "r1a = index;"));
+    CHECK(contains(kernel.glsl, "l_chk("));
 }
 
 TEST_CASE("GpuKernelControlFlowAndBuiltins")
 {
     GpuKernel kernel = lowerGpu(R"(
 @gpu
-local function k(i: number, b: buffer)
+local function k(b: buffer, i: number)
     local s = 0
     for j = 1, i % 10 do
         if j % 3 == 0 then
@@ -115,15 +115,14 @@ return k
     // loops count against the budget where native code checks for interrupts
     CHECK(contains(kernel.glsl, "++l_steps > pc.budget"));
     CHECK(contains(kernel.glsl, "l_sqrt("));
-    CHECK(contains(kernel.glsl, "l_idivi("));
 }
 
-TEST_CASE("GpuKernelGuardsFailTheDispatch")
+TEST_CASE("GpuKernelGuardsFailTheRun")
 {
     // the result of the helper isn't known to be a number, so the IR guards it with a tag check and a fallback
     GpuKernel kernel = lowerGpu(R"(
 @gpu
-local function k(i: number, b: buffer)
+local function k(b: buffer, i: number)
     local x = if i > 3 then i else 1.5
     buffer.writef32(b, 0, x * 2)
 end
@@ -139,7 +138,7 @@ TEST_CASE("GpuKernelExactIntegersInFloatRegisters")
     // 'x' holds a float on one path and an integer offset on the other: the integer must reach the offset exactly
     GpuKernel kernel = lowerGpu(R"(
 @gpu
-local function k(i: number, b: buffer)
+local function k(b: buffer, i: number)
     local x = i / 2
     if i > 3 then
         x = i * 4
@@ -168,7 +167,7 @@ return f
         lowerGpu(
             R"(
 @gpu
-local function k(i: number, b: buffer) buffer.writeu32(b, 0, i) end
+local function k(b: buffer, i: number) buffer.writeu32(b, 0, i) end
 return k
 )",
             /* sandbox */ false
@@ -178,7 +177,7 @@ return k
 
     GpuKernel table = lowerGpu(R"(
 @gpu
-local function k(i: number, b: buffer)
+local function k(b: buffer, i: number)
     local t = { i }
     buffer.writeu32(b, 0, t[1])
 end
@@ -189,7 +188,7 @@ return k
 
     GpuKernel global = lowerGpu(R"(
 @gpu
-local function k(i: number, b: buffer)
+local function k(b: buffer, i: number)
     print(i)
 end
 return k
@@ -202,7 +201,7 @@ local function fib(n: number): number
 end
 
 @gpu
-local function k(i: number, b: buffer)
+local function k(b: buffer, i: number)
     buffer.writeu32(b, 0, fib(i))
 end
 return k
@@ -212,7 +211,7 @@ return k
 
     GpuKernel atomic = lowerGpu(R"(
 @gpu
-local function k(i: number, b: buffer)
+local function k(b: buffer, i: number)
     buffer.writeu8(b, i, 1)
 end
 return k
@@ -227,6 +226,15 @@ return k
 )")
             .reason == "a variadic function is not supported on the GPU (line 2)"
     );
+
+    CHECK(
+        lowerGpu(R"(
+@gpu
+local function k(b: buffer, i: number, j: number) end
+return k
+)")
+            .reason == "a function with parameters other than the buffer and the index is not supported on the GPU"
+    );
 }
 
 TEST_CASE("GpuKernelInlinedHelpers")
@@ -238,7 +246,7 @@ local function edge(ax: number, ay: number, bx: number, by: number, px: number, 
 end
 
 @gpu
-local function k(i: number, b: buffer)
+local function k(b: buffer, i: number)
     buffer.writef32(b, i * 4, edge(0, 0, 4, 3, i % 7, i // 7))
 end
 return k
@@ -249,11 +257,12 @@ return k
 
 #if defined(LUAU_GPU_BACKEND_TESTS)
 
-// Runs a kernel lowered from IR on the GPU and in the VM over the same input and checks that the buffers match
-// Returns false when there is no GPU; 'fallbacks' is the number of dispatches the backend discarded and reran in the VM
-static bool runOnGpuAndVm(const char* source, int count, int size, bool floats, uint64_t& fallbacks, std::string& vmError)
+// Runs a kernel lowered from IR on the GPU with gpu.run's backend, and calls it from Luau, for index 0 .. count-1 on the same
+// input, and checks that the buffers match. Returns false when there is no GPU; 'gpuError' is why the run failed, in which
+// case the buffer must be untouched, and 'vmError' the error the calls from Luau raised
+static bool runOnGpuAndVm(const char* source, int count, int size, bool floats, std::string& gpuError, std::string& vmError)
 {
-    ScopedFastFlag flags[] = {{FFlag::LuauGpuKernels, true}, {FFlag::LuauGpuLibrary, true}};
+    ScopedFastFlag flag{FFlag::LuauGpuKernels, true};
 
     std::string error;
     std::unique_ptr<Luau::Gpu::VulkanBackend> backend = Luau::Gpu::VulkanBackend::create(error);
@@ -275,41 +284,48 @@ static bool runOnGpuAndVm(const char* source, int count, int size, bool floats, 
     REQUIRE(luau_load(L, "=gpu", bytecode.data(), bytecode.size(), 0) == 0);
     REQUIRE(lua_pcall(L, 0, 1, 0) == 0);
 
-    // the backend lowers the function itself on its first dispatch
+    // the backend lowers the function itself on its first run
     GpuKernel lowered = compileGpu(L, -1);
     REQUIRE_MESSAGE(lowered.reason.empty(), lowered.reason);
 
-    // the same input for both runs: a pattern of small signed and large unsigned words
+    // the same input for both: a pattern of small signed and large unsigned words
     std::vector<uint32_t> input(size / 4);
     for (size_t i = 0; i < input.size(); i++)
         input[i] = uint32_t(i * 2654435761u) ^ uint32_t(i % 7 == 0 ? 0x80000000u : 0);
 
     std::vector<uint8_t> results[2];
-    for (int run = 0; run < 2; run++)
+
+    void* data = lua_newbuffer(L, size);
+    memcpy(data, input.data(), size);
+    lua_createtable(L, 1, 0);
+    lua_pushvalue(L, -2);
+    lua_rawseti(L, -2, 1);
+    gpuError = backend->run(L, -3, -1, count);
+    lua_pop(L, 2);
+    results[0].assign((uint8_t*)data, (uint8_t*)data + size);
+
+    data = lua_newbuffer(L, size);
+    memcpy(data, input.data(), size);
+    for (int i = 0; i < count && vmError.empty(); i++)
     {
-        if (run == 0)
-            backend->install(L);
-        else
-            lua_setgpubackend(L, nullptr);
-
-        lua_getglobal(L, "gpu");
-        lua_getfield(L, -1, "dispatch");
-        lua_pushvalue(L, -3);
-        lua_pushinteger(L, count);
-        void* data = lua_newbuffer(L, size);
-        memcpy(data, input.data(), size);
-
-        if (lua_pcall(L, 3, 0, 0) != 0)
+        lua_pushvalue(L, -2);
+        lua_pushvalue(L, -2);
+        lua_pushinteger(L, i);
+        if (lua_pcall(L, 2, 0, 0) != 0)
         {
             vmError = lua_tostring(L, -1);
             lua_pop(L, 1);
         }
-
-        lua_pop(L, 1);
-        results[run].assign((uint8_t*)data, (uint8_t*)data + size);
     }
+    results[1].assign((uint8_t*)data, (uint8_t*)data + size);
+    lua_pop(L, 1);
 
-    fallbacks = backend->stats().fallbacks;
+    // a failed run leaves the buffer as it was
+    if (!gpuError.empty())
+    {
+        CHECK(memcmp(results[0].data(), input.data(), size) == 0);
+        return true;
+    }
 
     for (int o = 0; o < size; o += 4)
     {
@@ -333,13 +349,12 @@ static bool runOnGpuAndVm(const char* source, int count, int size, bool floats, 
 
 TEST_CASE("GpuKernelMatchesTheVm")
 {
-    uint64_t fallbacks = 0;
-    std::string vmError;
+    std::string gpuError, vmError;
 
     if (!runOnGpuAndVm(
             R"(
 @gpu
-local function k(i: number, b: buffer)
+local function k(b: buffer, i: number)
     local a = i - 500
     local d = (i % 7) - 3
     local o = i * 16
@@ -355,12 +370,12 @@ return k
             1000,
             16000,
             false,
-            fallbacks,
+            gpuError,
             vmError
         ))
         return;
 
-    CHECK(fallbacks == 0);
+    CHECK(gpuError.empty());
     CHECK(vmError.empty());
 
     runOnGpuAndVm(
@@ -370,7 +385,7 @@ local function edge(ax: number, ay: number, bx: number, by: number, px: number, 
 end
 
 @gpu
-local function k(i: number, b: buffer)
+local function k(b: buffer, i: number)
     local x = (i - 500) / 37
     local s = 0
     for j = 1, i % 20 do
@@ -390,23 +405,22 @@ return k
         1000,
         16000,
         true,
-        fallbacks,
+        gpuError,
         vmError
     );
 
-    CHECK(fallbacks == 0);
+    CHECK(gpuError.empty());
 }
 
-TEST_CASE("GpuKernelFailuresRerunInTheVm")
+TEST_CASE("GpuKernelFailuresLeaveTheBufferUntouched")
 {
-    uint64_t fallbacks = 0;
-    std::string vmError;
+    std::string gpuError, vmError;
 
-    // an integer overflow on the GPU: the VM computes the exact result instead
+    // an integer overflow on the GPU, where the VM computes the exact result
     if (!runOnGpuAndVm(
             R"(
 @gpu
-local function k(i: number, b: buffer)
+local function k(b: buffer, i: number)
     buffer.writef32(b, i * 4, i * 1073741824 * 4)
 end
 return k
@@ -414,19 +428,20 @@ return k
             16,
             64,
             true,
-            fallbacks,
+            gpuError,
             vmError
         ))
         return;
 
-    CHECK(fallbacks == 1);
+    CHECK(!gpuError.empty());
     CHECK(vmError.empty());
 
-    // shifting by 32 or more exits to the VM builtin in native code, so it fails the dispatch here
+    // shifting by 32 or more exits to the VM builtin in native code, so it fails the run here
+    gpuError.clear();
     runOnGpuAndVm(
         R"(
 @gpu
-local function k(i: number, b: buffer)
+local function k(b: buffer, i: number)
     buffer.writeu32(b, i * 4, bit32.rshift(0xffffffff, i))
 end
 return k
@@ -434,17 +449,18 @@ return k
         40,
         160,
         false,
-        fallbacks,
+        gpuError,
         vmError
     );
 
-    CHECK(fallbacks == 1);
+    CHECK(!gpuError.empty());
 
-    // an out of bounds write: the VM raises the error
+    // an out of bounds write, for which the VM raises an error
+    gpuError.clear();
     runOnGpuAndVm(
         R"(
 @gpu
-local function k(i: number, b: buffer)
+local function k(b: buffer, i: number)
     buffer.writeu32(b, i * 4 + 4, i)
 end
 return k
@@ -452,19 +468,20 @@ return k
         16,
         64,
         false,
-        fallbacks,
+        gpuError,
         vmError
     );
 
-    CHECK(fallbacks == 1);
+    CHECK(!gpuError.empty());
     CHECK(vmError.find("buffer access out of bounds") != std::string::npos);
 
-    // a loop over the budget, which the VM then finishes
+    // a loop over the budget, which the VM finishes
+    gpuError.clear();
     vmError.clear();
     runOnGpuAndVm(
         R"(
 @gpu
-local function k(i: number, b: buffer)
+local function k(b: buffer, i: number)
     local n = 0
     while n < 20000000 do
         n += 1
@@ -476,11 +493,11 @@ return k
         2,
         8,
         false,
-        fallbacks,
+        gpuError,
         vmError
     );
 
-    CHECK(fallbacks == 1);
+    CHECK(!gpuError.empty());
     CHECK(vmError.empty());
 }
 

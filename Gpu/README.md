@@ -1,76 +1,93 @@
 # Luau GPU kernels (experimental fork)
 
-Functions marked `@gpu` can be dispatched to the GPU with a single primitive:
+Functions marked `@gpu` can run on the GPU with a single primitive:
 
 ```luau
-gpu.dispatch(fn, n, ...buffers)
+local ok, err = gpu.run(fn, buffers, runs_per_buffer)
 ```
 
-which has the semantics of
+which, when it returns true, has the effect of
 
 ```luau
-for i = 0, n - 1 do fn(i, ...buffers) end -- in an unspecified order
+for _, b in buffers do
+    for index = 0, runs_per_buffer - 1 do -- in an unspecified order, concurrently
+        fn(b, index)
+    end
+end
 ```
 
-When a GPU backend is installed and `fn` fits the supported subset, the invocations run in parallel as a Vulkan
-compute shader. Otherwise, they run in the VM with identical results (up to floating point precision, see below).
-`gpu.status(fn)` returns `"gpu"`, or `"vm"` and the reason why the function stays in the VM.
+`fn(b, index)` gets one buffer, which it reads and mutates, and an index, an exact integer from 0. Its return value is
+ignored. The invocations run in parallel as a Vulkan compute shader lowered from the function's IR by native code
+generation. Nothing ever runs in the VM instead: gpu.run either leaves every buffer with its results and returns true,
+or leaves every buffer byte for byte as it was and returns false and why.
 
 ```luau
+-- a time step, then positions and velocities
 @gpu
-local function move(i: number, pos: buffer, vel: buffer, params: buffer)
-    local o = i * 4
-    local dt = buffer.readf32(params, 0)
-    buffer.writef32(pos, o, buffer.readf32(pos, o) + buffer.readf32(vel, o) * dt)
+local function move(b: buffer, i: number)
+    local dt = buffer.readf32(b, 0)
+    local o = 16 + i * 8
+    buffer.writef32(b, o, buffer.readf32(b, o) + buffer.readf32(b, o + 4) * dt)
 end
 
-gpu.dispatch(move, 100000, positions, velocities, params)
+local ok, err = gpu.run(move, { particles }, 100000)
 ```
 
 The design goal is to stay as close to base Luau as possible: no new types, kernels are ordinary Luau functions over
-ordinary `buffer`s, and higher level constructs (data layouts, double buffering, 2D grids) are written in Luau on top
-of the primitive.
+ordinary `buffer`s that can also be called from Luau, and data layouts are written in Luau on top of the primitive.
 
 ## API
 
+`openGpuLibrary` (`Gpu/include/Luau/GpuLibrary.h`) opens the library in a host's state:
+
 | Function | Description |
 |---|---|
-| `gpu.dispatch(fn, n, ...buffers)` | runs `fn(i, ...buffers)` for `i = 0 .. n-1`; only buffers can be passed |
-| `gpu.status(fn)` | `"gpu"`, or `"vm", reason` |
+| `gpu.run(fn, buffers, runs_per_buffer)` | runs `fn(b, index)` for `index = 0 .. runs_per_buffer-1` on each buffer `b` of the array; returns `true`, or `false, reason` |
 | `gpu.atomicadd(b, offset, v)` | adds `v` to the u32 at `offset`, returns the previous value |
-| `gpu.atomicmin(b, offset, v)` / `gpu.atomicmax(b, offset, v)` | unsigned 32-bit min/max, returns the previous value |
+| `gpu.atomicmin(b, offset, v)` | unsigned 32-bit minimum, returns the previous value |
 
-Atomics work everywhere (they are plain read-modify-write operations in the VM) and are what kernels use to combine
-results from several invocations: counters, histograms, reductions, depth tests.
+- `false, "Function cannot run in GPU"`: `fn` can't be lowered for the GPU: it isn't `@gpu`, uses what kernels don't
+  support (see [Supported subset](#supported-subset)), or its environment isn't safe.
+- `false, reason` for everything else that only shows when the run is attempted: no device or a refused one, a buffer
+  over the device's limits, not enough memory, an error in the kernel (out of bounds or unaligned access, integer
+  overflow, inexact integer conversion, loop budget), a run that was stopped or timed out.
+- Arguments of the wrong type or out of range (`runs_per_buffer` must be an integer from 0 to 2^31-1, `buffers` an array
+  of buffers) are mistakes in the script and raise errors, as in other libraries.
+
+A buffer listed several times runs several times, in the order of the list; different buffers run concurrently.
 
 ## Contract
 
-- The result must not depend on the order of invocations. Two invocations writing the same location without atomics
-  give an undefined result on the GPU (the VM stays deterministic).
-- Numbers are 32-bit on the GPU: the translator types each value as `int`, `uint` or `float` from how it is produced
-  (integer literals, the invocation index, buffer offsets, `math.floor` and `bit32` give integers; `/`, `^` and `readf32`
-  give floats). Floating point math is f32 instead of f64, and integer overflow wraps instead of losing precision.
-- An out of bounds or unaligned buffer access, or an integer division by zero, discards the GPU results and reruns the
-  whole dispatch in the VM, which raises the error Luau would.
+- Each invocation must only write words of its buffer that no other invocation of the run reads or writes, unless it
+  uses the atomics: invocations run concurrently, and plain writes that race give an unspecified result on the GPU.
+  Atomics are what kernels use to combine results from several invocations: counters, histograms, depth tests. Called
+  from Luau, they are plain reads and writes.
+- Numbers are 32-bit on the GPU. Integers stay exact: the lowering types each value as `int`, `uint` or `float` from how
+  it's produced, and a result that wouldn't be the VM's (an integer overflow, a conversion that isn't exact) fails the
+  run. Floating point math is f32 instead of f64, and keeps NaN, infinities and signed zeros.
+- Buffers stay on the GPU between runs. A run only uploads the parts of a buffer that changed since the GPU last had it,
+  and downloads every buffer it was given.
 
 ## Safety
 
-A kernel can only touch the buffers it is given, and a dispatch either completes cleanly on the GPU or runs in the VM:
+A kernel can only touch the buffer it's given, and a run either completes cleanly on the GPU or changes nothing:
 
-- every buffer access and atomic is bounds and alignment checked against the real buffer size; a bad access, an
-  integer division by zero, `INT_MIN // -1` or another operation that is undefined on the GPU sets the status word, the
-  GPU results are discarded and the VM reruns the dispatch, raising the error Luau would
-- a dispatch that runs for more than `VulkanOptions::abortMs` (100 ms by default, counted from when it starts on the GPU)
-  is asked to stop: invocations that start afterwards give up at once and loops within 256 iterations, so a runaway kernel
-  gives the GPU back quickly; it is then discarded like an error, and in the VM the host's interrupt callback applies as for
-  any script. Loops also count against a per-invocation budget (`VulkanOptions::loopBudget`, 2^24 by default)
+- every buffer access and atomic is checked against the real buffer size, as native code does; a bad access, an
+  integer division by zero, `INT_MIN // -1` or another operation without the VM's result sets the status word, and the
+  run fails
+- a run going on for more than `VulkanOptions::abortMs` (100 ms by default, counted from when it starts on the GPU) is
+  asked to stop: invocations that start afterwards give up at once and loops within 256 iterations, so a runaway kernel
+  gives the GPU back quickly. Loops also count against a per-invocation budget (`VulkanOptions::loopBudget`, 2^24 by
+  default)
 - generated identifiers never come from user names, so nothing in a script can inject code or clash with reserved words
   of GLSL, GLSL ES, MSL or HLSL
-- the GPU path is all or nothing: translation, GLSL to SPIR-V compilation, SPIR-V validation, pipeline creation, device
-  limits (storage buffers per stage, storage buffer range, workgroup count, push constant size), allocation, submission
-  and a zero status word must all succeed, otherwise the VM runs the dispatch and `gpu.status` says why
-- a dispatch that doesn't finish within `VulkanOptions::timeoutMs` (5 s by default) or a lost device disables the backend
-  for good: its results are never copied back and every later dispatch runs in the VM
+- lowering, GLSL to SPIR-V compilation, SPIR-V validation, pipeline creation, device limits (storage buffer range,
+  workgroup count, push constant size), allocation, submission and a zero status word must all succeed
+- devices are checked when the backend is created: a probe kernel must keep NaN, infinities and signed zeros, and see the
+  host asking it to stop. Feature bits aren't enough: llvmpipe reports SignedZeroInfNanPreserve and folds `inf - inf` to 0.
+  A device that fails is refused
+- a run that doesn't finish within `VulkanOptions::timeoutMs` (5 s by default) or a lost device disables the backend for
+  good: its results are never copied back and every later run fails
 - the backend is thread-safe
 
 ## Other platforms
@@ -84,106 +101,73 @@ Kernels are compiled once to SPIR-V, which is then cross-compiled with SPIRV-Cro
 | OpenGL ES 3.1 (Android) | GLSL ES 3.10 compute shader | recompiled with glslang |
 | Metal (iOS 13+, macOS 10.15+) | MSL 2.2, entry point `main0` | no: Apple's Metal compiler only exists on Apple platforms |
 
-Resources follow `Gpu/include/Luau/GpuAbi.h` on every target; on Metal, buffer *i* is `[[buffer(i)]]`, the status word
-follows the buffers and the push constants are `[[buffer(16)]]`. Only the Vulkan backend exists; a Metal or OpenGL ES
-backend implements `lua_GpuBackend` with these shaders. `VulkanOptions::minimumLimits` simulates a device that only has
-the limits Vulkan guarantees, as on low-end Android hardware: kernels that need more storage buffers or larger buffers
-then run in the VM.
+Resources follow `Gpu/include/Luau/GpuAbi.h` on every target; on Metal, the buffer is `[[buffer(0)]]`, the status word
+`[[buffer(1)]]` and the push constants `[[buffer(2)]]`. Only the Vulkan backend exists; a Metal or OpenGL ES backend runs
+these shaders the same way. `VulkanOptions::minimumLimits` simulates a device that only has the limits Vulkan guarantees,
+as on low-end Android hardware.
 
 ## Supported subset
 
-Inside `@gpu` functions:
+Inside `@gpu` functions, and the functions they call, which the compiler inlines:
 
-- locals, assignments, compound assignments, `if`/`elseif`/`else`, `while`, `repeat`, numeric `for`, `break`,
-  `continue`, `return`, if-expressions
-- numbers, booleans and `vector`s; arithmetic, comparisons, `and`/`or`/`not` on booleans
-- `buffer.readf32/readu32/readi32`, `buffer.writef32/writeu32/writei32`, `buffer.len` on 4-byte aligned offsets
-- `math` (floor, ceil, round, abs, sign, min, max, clamp, sqrt, sin, cos, tan, asin, acos, atan, atan2, exp, log, pow,
-  fmod, lerp, huge, pi), `bit32` (band, bor, bxor, bnot, lshift, rshift, arshift, btest, extract),
-  `vector` (create, dot, cross, magnitude, normalize, floor, ceil, abs, min, max, `.x/.y/.z`)
-- calls to other `@gpu` local functions (specialized per argument types, one return value, no recursion)
+- locals, assignments, `if`, `while`, `repeat`, numeric `for`, `break`, `continue`, `return`, if-expressions
+- numbers, booleans and `vector`s; arithmetic, comparisons, `and`/`or`/`not`
+- `buffer.readf32/readu32/readi32`, `buffer.writef32/writeu32/writei32` on 4-byte aligned offsets, `buffer.len`
+- the `math`, `bit32` and `vector` builtins native code generation inlines
+- `gpu.atomicadd`, `gpu.atomicmin`
 - top-level `local` numeric constants
 
-Not supported (the function then runs in the VM): tables, strings, closures and upvalues other than numeric constants,
-multiple return values, generic `for`, 8/16-bit and f64 buffer accesses.
-
-## Tooling
-
-Like the `integer` library, the feature is split between two flags, off by default in the libraries (the Luau command
-line tools turn `Luau*` flags on by default):
-
-- `LuauGpuKernels` (language): the parser accepts `@gpu`, and the `GpuKernel` lint runs
-- `LuauGpuLibrary` (runtime): `luaL_openlibs` opens the `gpu` library
-- with both, the type checker knows the `gpu` library
-
-The `GpuKernel` lint reports `@gpu` functions that will run in the VM, with the reason and the location of the
-unsupported code:
-
-```
-selftest.luau(223,15): GpuKernel: @gpu function 'usesTable' will run in the VM: tables are not supported on the GPU
-```
-
-Functions called by other `@gpu` functions are helpers; their unsupported code is reported through the kernels that
-call them.
-
-Since `luau` has the `gpu` library without a GPU backend, scripts written for `luau-gpu` also run there, in the VM.
+Not supported: tables, strings, upvalues other than constants, calls that aren't inlined, 8/16-bit and f64 buffer
+accesses. `luau-gpu --emit=glsl` reports why each function can't run.
 
 ## Embedding
 
-The translator (`Luau.Gpu`) only depends on `Luau.Ast` and is always built. A host that wants GPU dispatches links
-`Luau.Gpu.Vulkan`, enables both flags (or calls `luaopen_gpu`), and registers each chunk before running it:
+The core only has what native code generation needs: the `@gpu` attribute (behind the `LuauGpuKernels` flag), the
+`LPF_GPU_FUNCTION` proto flag, the compiler inlining calls in `@gpu` functions, and the lowering
+(`CodeGen/include/Luau/CodeGenGpu.h`). The library and the backend are in the host:
 
 ```cpp
 std::string error;
 auto backend = Luau::Gpu::VulkanBackend::create(error); // nullptr if there is no usable device
-backend->setFallbackHandler([](const std::string& message) { fprintf(stderr, "%s\n", message.c_str()); });
-backend->load(chunkname, source.data(), source.size()); // chunkname as passed to luau_load
-backend->install(L);
+luaL_openlibs(L);
+Luau::Gpu::openGpuLibrary(L, backend.get(), error);       // without a backend, gpu.run returns false and 'error'
+luaL_sandbox(L);                                         // kernels need the real builtins
 ```
-
-Any other backend can implement `lua_GpuBackend` (`lualib.h`) and install it with `lua_setgpubackend`.
 
 ## Layout
 
-- `Ast`: the `@gpu` attribute
-- `VM/src/lgpulib.cpp`: the `gpu` library, the VM implementation and the `lua_GpuBackend` hooks (`lualib.h`)
-- `Gpu/src/GpuTranslate.cpp`: translates `@gpu` functions from the AST to GLSL compute shaders (`Luau.Gpu`)
-- `Analysis`: `gpu` type definitions and the `GpuKernel` lint
-- `Gpu/src/GpuVulkan.cpp`: Vulkan backend (`Luau.Gpu.Vulkan`); keeps a device copy of each buffer, uploads only buffers whose contents
-  changed and downloads only buffers the kernel writes
-- `Gpu/cli/Main.cpp`: `luau-gpu`, a host that runs a script with the backend and a small window library (SDL2)
-- `Gpu/examples/selftest.luau`: runs kernels on the GPU and in the VM and compares the results
-- `Gpu/examples/rasterizer.luau`: a software rasterizer drawing a 1M triangle model in real time
+- `Ast`, `Compiler`, `Common/include/Luau/Bytecode.h`: the `@gpu` attribute, inlining, `LPF_GPU_FUNCTION`
+- `CodeGen/src/CodeGenGpu.cpp`: lowers the IR of `@gpu` functions to GLSL compute shaders
+- `Gpu/src/GpuLibrary.cpp`: the `gpu` library
+- `Gpu/src/GpuVulkan.cpp`: Vulkan backend (`Luau.Gpu.Vulkan`); keeps a device copy of each buffer, which it frees with the
+  Luau buffer, and uploads only the parts that changed
 - `Gpu/src/GpuShaderCompiler.cpp`: SPIR-V compilation, validation and cross-compilation (`Luau.Gpu.Shaders`)
+- `Gpu/cli/Main.cpp`: `luau-gpu`, a host that runs a script with the backend and a small window library (SDL2)
+- `Gpu/examples/selftest.luau`: runs kernels on the GPU and from Luau and compares the results
+- `Gpu/examples/rasterizer.luau`: a software rasterizer drawing a 1M triangle model in real time
+- `Gpu/examples/soak.luau`: fresh buffers and kernels every frame, to check that memory and cost stay flat
 - `Gpu/bench/`: native Luau against GPU benchmarks, see [Gpu/bench/README.md](bench/README.md)
-- `tests/GpuTranslate.test.cpp`: translator tests that don't need a GPU (part of `Luau.UnitTest`)
-- `tests/GpuBackend.test.cpp`: shader compilation for every target, fallbacks, limits, threads (only with `LUAU_BUILD_GPU`)
+- `tests/CodeGenGpu.test.cpp`: lowering tests (part of `Luau.Conformance`)
+- `tests/GpuBackend.test.cpp`: gpu.run, shader compilation for every target, limits, failures, threads (only with
+  `LUAU_BUILD_GPU`)
 
 ## Building
 
 The Vulkan backend, the shader compilers and `luau-gpu` are behind `LUAU_BUILD_GPU` (off by default) and need Vulkan,
-shaderc, SPIRV-Tools, SPIRV-Cross, glslang and SDL2; the translator, lint and tests build everywhere, with CMake or the
-Makefile. On NixOS, `Gpu/shell.nix` provides them:
+shaderc, SPIRV-Tools, SPIRV-Cross, glslang and SDL2. On NixOS, `Gpu/shell.nix` provides them:
 
 ```sh
 nix-shell Gpu/shell.nix --run 'cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLUAU_BUILD_GPU=ON && ninja -C build luau-gpu'
 ./build/luau-gpu Gpu/examples/selftest.luau
-./build/luau-gpu Gpu/examples/rasterizer.luau     # drag to rotate, wheel to zoom, G to switch GPU/VM
-./build/luau-gpu --vm script.luau                  # run every kernel in the VM
+./build/luau-gpu Gpu/examples/rasterizer.luau     # drag to rotate, wheel to zoom, G to switch between the GPU and Luau
+./build/luau-gpu --vm script.luau                  # without the GPU: gpu.run returns false
 ```
 
 `luau-gpu --emit=<glsl|spirv|msl-ios|msl-macos|gles> script.luau` prints the shaders of every kernel for a target
 without running the script (see [Other platforms](#other-platforms)).
 
-On an RTX 4080, the rasterizer draws 1M triangles at 1280x720 in about 5 ms per frame on the GPU, against about
-760 ms per frame in the VM with native code generation. 99.8% of the pixels are identical between both. See
-[Gpu/bench/README.md](bench/README.md) for more workloads, including the ones where the GPU doesn't win.
-
 ## Known limitations
 
-- Every dispatch is synchronous and copies the buffers it writes back to the CPU; chaining dispatches without round
-  trips needs data that stays on the GPU between dispatches.
-- Kernels are translated from source when the host loads a chunk (`VulkanBackend::load`), and matched to compiled
-  functions by chunk name and line; two `@gpu` functions starting on the same line can't be told apart and stay in
-  the VM.
+- Every run is synchronous and downloads its buffers, even the parts the kernel didn't write: data used by several
+  passes in one buffer (as in the rasterizer, about 35 MB) is copied back after each pass.
 - Tools built on the upstream parser (luau-lsp, StyLua, selene) report `@gpu` as an invalid attribute.

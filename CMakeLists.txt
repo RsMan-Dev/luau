@@ -15,7 +15,7 @@ option(LUAU_EXTERN_C "Use extern C for all APIs" OFF)
 option(LUAU_BUILD_SHARED "Build as a shared library" OFF)
 
 # Compile time options for Luau features
-option(LUAU_BUILD_GPU "Build the Vulkan backend for gpu.dispatch, the shader compilers and the luau-gpu host (needs Vulkan, shaderc, SPIRV-Tools, SPIRV-Cross, glslang and SDL2)" OFF)
+option(LUAU_BUILD_GPU "Build the gpu library and its Vulkan backend, the shader compilers and the luau-gpu host (needs Vulkan, shaderc, SPIRV-Tools, SPIRV-Cross, glslang and SDL2)" OFF)
 option(LUAU_VECTOR_DOUBLE "Use 64-bit doubles for vector components" OFF)
 option(LUAU_VECTOR_FOUR_WIDE "Enable 4-wide mode for vectors, adding a 'w' component" OFF)
 

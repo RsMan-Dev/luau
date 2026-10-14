@@ -1,12 +1,15 @@
--- Software rasterizer written in Luau, running on the GPU through gpu.dispatch.
+-- Software rasterizer written in Luau, running on the GPU through gpu.run.
 --
 -- usage: luau-gpu Gpu/examples/rasterizer.luau [segments] [--frames N --save path.raw]
---   window controls: drag to rotate, wheel to zoom, space to pause, G to switch between GPU and VM
+--   window controls: drag to rotate, wheel to zoom, space to pause, G to switch between the GPU and Luau
 --
--- Every frame runs four kernels:
+-- Everything is in one buffer, the scene, which every kernel gets: a header with the view and where the other parts start,
+-- the vertices, the triangles, the projected vertices, and the depth, ids and image of the pixels. Every frame runs four
+-- kernels on it:
 --   1. transform  one invocation per vertex: rotate, project to the screen
 --   2. depth      one invocation per triangle: rasterize, keep the nearest depth per pixel (gpu.atomicmin)
---   3. resolve    one invocation per triangle: the triangle that owns the nearest depth claims the pixel (gpu.atomicmax)
+--   3. resolve    one invocation per triangle: of the triangles at the nearest depth, the first claims the pixel
+--                 (gpu.atomicmin)
 --   4. shade      one invocation per pixel: light the owning triangle, clear depth and ids for the next frame
 
 local W = 1280
@@ -15,6 +18,11 @@ local FOCAL = 900
 local NEAR = 0.5
 local DEPTH_SCALE = 4194304 -- depth keys are integers: view z * scale
 local CLEAR_DEPTH = 0x7f7f7f7f
+local NO_ID = 0xffffffff
+
+-- the header: the rotation matrix and the distance, then the offsets of the other parts
+local VERTS, TRIS, PROJ, DEPTH, IDS, IMAGE = 40, 44, 48, 52, 56, 60
+local HEADER = 64
 
 local args = arg :: { string }
 local segments = tonumber(args[1]) or 2000
@@ -42,7 +50,19 @@ local triangleCount = U * V * 2
 
 local t0 = os.clock()
 
-local verts = buffer.create(vertexCount * 12)
+local offsets = {}
+local size = HEADER
+for i, part in { vertexCount * 12, triangleCount * 12, vertexCount * 12, W * H * 4, W * H * 4, W * H * 4 } do
+    offsets[i] = size
+    size += part
+end
+
+local scene = buffer.create(size)
+for i, offset in offsets do
+    buffer.writeu32(scene, VERTS + (i - 1) * 4, offset)
+end
+
+local verts = offsets[1]
 for u = 0, U - 1 do
     local t = u / U * math.pi * 2
     local c = knot(t)
@@ -57,26 +77,26 @@ for u = 0, U - 1 do
         local bumps = 0.04 * math.sin(a * 12) * math.sin(t * 150) + 0.015 * math.sin(a * 40 + t * 400)
         local radius = 0.32 + bumps
         local p = c + (normal * math.cos(a) + binormal * math.sin(a)) * radius
-        local o = (u * V + v) * 12
-        buffer.writef32(verts, o, p.x)
-        buffer.writef32(verts, o + 4, p.y)
-        buffer.writef32(verts, o + 8, p.z)
+        local o = verts + (u * V + v) * 12
+        buffer.writef32(scene, o, p.x)
+        buffer.writef32(scene, o + 4, p.y)
+        buffer.writef32(scene, o + 8, p.z)
     end
 end
 
-local idx = buffer.create(triangleCount * 12)
+local tris = offsets[2]
 for u = 0, U - 1 do
     local u1 = (u + 1) % U
     for v = 0, V - 1 do
         local v1 = (v + 1) % V
         local a, b, c, d = u * V + v, u1 * V + v, u1 * V + v1, u * V + v1
-        local o = (u * V + v) * 24
-        buffer.writeu32(idx, o, a)
-        buffer.writeu32(idx, o + 4, b)
-        buffer.writeu32(idx, o + 8, c)
-        buffer.writeu32(idx, o + 12, a)
-        buffer.writeu32(idx, o + 16, c)
-        buffer.writeu32(idx, o + 20, d)
+        local o = tris + (u * V + v) * 24
+        buffer.writeu32(scene, o, a)
+        buffer.writeu32(scene, o + 4, b)
+        buffer.writeu32(scene, o + 8, c)
+        buffer.writeu32(scene, o + 12, a)
+        buffer.writeu32(scene, o + 16, c)
+        buffer.writeu32(scene, o + 20, d)
     end
 end
 
@@ -91,40 +111,43 @@ local function edge(ax: number, ay: number, bx: number, by: number, px: number, 
 end
 
 @gpu
-local function rotate(params: buffer, x: number, y: number, z: number): vector
+local function rotate(s: buffer, x: number, y: number, z: number): vector
     return vector.create(
-        buffer.readf32(params, 0) * x + buffer.readf32(params, 4) * y + buffer.readf32(params, 8) * z,
-        buffer.readf32(params, 12) * x + buffer.readf32(params, 16) * y + buffer.readf32(params, 20) * z,
-        buffer.readf32(params, 24) * x + buffer.readf32(params, 28) * y + buffer.readf32(params, 32) * z
+        buffer.readf32(s, 0) * x + buffer.readf32(s, 4) * y + buffer.readf32(s, 8) * z,
+        buffer.readf32(s, 12) * x + buffer.readf32(s, 16) * y + buffer.readf32(s, 20) * z,
+        buffer.readf32(s, 24) * x + buffer.readf32(s, 28) * y + buffer.readf32(s, 32) * z
     )
 end
 
 @gpu
-local function transform(i: number, verts: buffer, params: buffer, proj: buffer)
+local function transform(s: buffer, i: number)
     local o = i * 12
-    local p = rotate(params, buffer.readf32(verts, o), buffer.readf32(verts, o + 4), buffer.readf32(verts, o + 8))
-    local z = p.z + buffer.readf32(params, 36)
-    buffer.writef32(proj, o, W / 2 + FOCAL * p.x / z)
-    buffer.writef32(proj, o + 4, H / 2 - FOCAL * p.y / z)
-    buffer.writef32(proj, o + 8, z)
+    local v, out = buffer.readu32(s, VERTS) + o, buffer.readu32(s, PROJ) + o
+    local p = rotate(s, buffer.readf32(s, v), buffer.readf32(s, v + 4), buffer.readf32(s, v + 8))
+    local z = p.z + buffer.readf32(s, 36)
+    buffer.writef32(s, out, W / 2 + FOCAL * p.x / z)
+    buffer.writef32(s, out + 4, H / 2 - FOCAL * p.y / z)
+    buffer.writef32(s, out + 8, z)
 end
 
 -- shared by the depth and resolve passes so both compute exactly the same coverage and depth keys
 @gpu
-local function rasterize(t: number, idx: buffer, proj: buffer, depth: buffer, ids: buffer, resolve: boolean)
-    local o = t * 12
-    local i0 = buffer.readu32(idx, o) * 12
-    local i1 = buffer.readu32(idx, o + 4) * 12
-    local i2 = buffer.readu32(idx, o + 8) * 12
+local function rasterize(s: buffer, t: number, resolve: boolean)
+    local o = buffer.readu32(s, TRIS) + t * 12
+    local proj = buffer.readu32(s, PROJ)
+    local i0 = proj + buffer.readu32(s, o) * 12
+    local i1 = proj + buffer.readu32(s, o + 4) * 12
+    local i2 = proj + buffer.readu32(s, o + 8) * 12
 
-    local z0, z1, z2 = buffer.readf32(proj, i0 + 8), buffer.readf32(proj, i1 + 8), buffer.readf32(proj, i2 + 8)
+    local z0, z1, z2 = buffer.readf32(s, i0 + 8), buffer.readf32(s, i1 + 8), buffer.readf32(s, i2 + 8)
     if z0 < NEAR or z1 < NEAR or z2 < NEAR then
         return
     end
 
-    local x0, y0 = buffer.readf32(proj, i0), buffer.readf32(proj, i0 + 4)
-    local x1, y1 = buffer.readf32(proj, i1), buffer.readf32(proj, i1 + 4)
-    local x2, y2 = buffer.readf32(proj, i2), buffer.readf32(proj, i2 + 4)
+    local x0, y0 = buffer.readf32(s, i0), buffer.readf32(s, i0 + 4)
+    local x1, y1 = buffer.readf32(s, i1), buffer.readf32(s, i1 + 4)
+    local x2, y2 = buffer.readf32(s, i2), buffer.readf32(s, i2 + 4)
+    local depth, ids = buffer.readu32(s, DEPTH), buffer.readu32(s, IDS)
 
     local area = edge(x0, y0, x1, y1, x2, y2)
     if area <= 0 then
@@ -147,11 +170,11 @@ local function rasterize(t: number, idx: buffer, proj: buffer, depth: buffer, id
                 local key = math.floor((w0 * z0 + w1 * z1 + w2 * z2) / area * DEPTH_SCALE)
                 local p = (y * W + x) * 4
                 if resolve then
-                    if buffer.readu32(depth, p) == key then
-                        gpu.atomicmax(ids, p, t + 1)
+                    if buffer.readu32(s, depth + p) == key then
+                        gpu.atomicmin(s, ids + p, t)
                     end
                 else
-                    gpu.atomicmin(depth, p, key)
+                    gpu.atomicmin(s, depth + p, key)
                 end
             end
         end
@@ -159,13 +182,13 @@ local function rasterize(t: number, idx: buffer, proj: buffer, depth: buffer, id
 end
 
 @gpu
-local function depthPass(t: number, idx: buffer, proj: buffer, depth: buffer, ids: buffer)
-    rasterize(t, idx, proj, depth, ids, false)
+local function depthPass(s: buffer, t: number)
+    rasterize(s, t, false)
 end
 
 @gpu
-local function resolvePass(t: number, idx: buffer, proj: buffer, depth: buffer, ids: buffer)
-    rasterize(t, idx, proj, depth, ids, true)
+local function resolvePass(s: buffer, t: number)
+    rasterize(s, t, true)
 end
 
 @gpu
@@ -179,27 +202,31 @@ local function rgb(r: number, g: number, b: number)
 end
 
 @gpu
-local function shade(p: number, ids: buffer, depth: buffer, verts: buffer, idx: buffer, params: buffer, image: buffer)
+local function shade(s: buffer, p: number)
     local o = p * 4
-    local id = buffer.readu32(ids, o)
-    buffer.writeu32(ids, o, 0)
-    buffer.writeu32(depth, o, CLEAR_DEPTH)
+    local ids, image = buffer.readu32(s, IDS) + o, buffer.readu32(s, IMAGE) + o
+    local id = buffer.readu32(s, ids)
+    buffer.writeu32(s, ids, NO_ID)
+    buffer.writeu32(s, buffer.readu32(s, DEPTH) + o, CLEAR_DEPTH)
 
-    if id == 0 then
+    if id == NO_ID then
         local y = p // W
         local g = 0.08 + 0.12 * (1 - y / H)
-        buffer.writeu32(image, o, rgb(g * 0.6, g * 0.7, g))
+        buffer.writeu32(s, image, rgb(g * 0.6, g * 0.7, g))
         return
     end
 
-    local t = (id - 1) * 12
-    local a, b, c = buffer.readu32(idx, t) * 12, buffer.readu32(idx, t + 4) * 12, buffer.readu32(idx, t + 8) * 12
-    local pa = vector.create(buffer.readf32(verts, a), buffer.readf32(verts, a + 4), buffer.readf32(verts, a + 8))
-    local pb = vector.create(buffer.readf32(verts, b), buffer.readf32(verts, b + 4), buffer.readf32(verts, b + 8))
-    local pc = vector.create(buffer.readf32(verts, c), buffer.readf32(verts, c + 4), buffer.readf32(verts, c + 8))
+    local verts = buffer.readu32(s, VERTS)
+    local t = buffer.readu32(s, TRIS) + id * 12
+    local a = verts + buffer.readu32(s, t) * 12
+    local b = verts + buffer.readu32(s, t + 4) * 12
+    local c = verts + buffer.readu32(s, t + 8) * 12
+    local pa = vector.create(buffer.readf32(s, a), buffer.readf32(s, a + 4), buffer.readf32(s, a + 8))
+    local pb = vector.create(buffer.readf32(s, b), buffer.readf32(s, b + 4), buffer.readf32(s, b + 8))
+    local pc = vector.create(buffer.readf32(s, c), buffer.readf32(s, c + 4), buffer.readf32(s, c + 8))
 
     local n = vector.cross(pb - pa, pc - pa)
-    n = rotate(params, n.x, n.y, n.z)
+    n = rotate(s, n.x, n.y, n.z)
     n = vector.normalize(n)
 
     local light = vector.normalize(vector.create(-0.4, 0.6, -0.7))
@@ -215,39 +242,42 @@ local function shade(p: number, ids: buffer, depth: buffer, verts: buffer, idx: 
     local bl = 0.55 + 0.45 * math.sin(hue * 3 + 4.2)
 
     local k = 0.12 + 0.88 * diffuse
-    buffer.writeu32(image, o, rgb(r * k + specular + rim * 0.3, g * k + specular + rim * 0.35, bl * k + specular + rim * 0.5))
+    buffer.writeu32(s, image, rgb(r * k + specular + rim * 0.3, g * k + specular + rim * 0.35, bl * k + specular + rim * 0.5))
 end
 
 ---------------------------------------------------------------------------------------------------
 -- frame loop
 
-for _, k in { transform, depthPass, resolvePass, shade } do
-    local where, why = gpu.status(k)
-    if where ~= "gpu" then
-        print("kernel stays in the VM: " .. tostring(why))
-    end
-end
-
-local proj = buffer.create(vertexCount * 12)
-local depth = buffer.create(W * H * 4)
-local ids = buffer.create(W * H * 4)
-local image = buffer.create(W * H * 4)
-local params = buffer.create(64)
-buffer.fill(depth, 0, 0x7f)
+buffer.fill(scene, offsets[4], 0x7f, W * H * 4)
+buffer.fill(scene, offsets[5], 0xff, W * H * 4)
 
 local yaw, pitch, distance = 0.6, 0.35, 7.5
 local paused = false
 local useGpu = host.gpuname() ~= nil
-host.setgpu(useGpu)
+
+-- runs a pass on the GPU, or calls it from Luau
+local function pass(kernel, runs: number)
+    if not useGpu then
+        for i = 0, runs - 1 do
+            kernel(scene, i)
+        end
+        return
+    end
+
+    local ok, err = gpu.run(kernel, { scene }, runs)
+    if not ok then
+        error("the GPU can't render: " .. tostring(err))
+    end
+end
 
 local function setRotation()
     local cy, sy, cp, sp = math.cos(yaw), math.sin(yaw), math.cos(pitch), math.sin(pitch)
     -- rotation around y, then x
     local m = { cy, 0, sy, sp * sy, cp, -sp * cy, -cp * sy, sp, cp * cy }
     for i, v in m do
-        buffer.writef32(params, (i - 1) * 4, v)
+        buffer.writef32(scene, (i - 1) * 4, v)
     end
-    buffer.writef32(params, 36, distance)
+    buffer.writef32(scene, 36, distance)
 end
 
 local headless = framesToRun ~= nil
@@ -274,7 +304,7 @@ while true do
 
     for _, key in keys do
         if key == "G" then
-            useGpu = host.setgpu(not useGpu)
+            useGpu = not useGpu and host.gpuname() ~= nil
         elseif key == "Space" then
             paused = not paused
         end
@@ -282,7 +312,7 @@ while true do
 
     local now = host.clock()
     if headless then
-        yaw += 0.01 -- fixed steps, so GPU and VM runs render the same frames
+        yaw += 0.01 -- fixed steps, so the GPU and Luau render the same frames
     elseif not paused and dx == 0 and dy == 0 then
         yaw += (now - last) * 0.4
     end
@@ -293,25 +323,25 @@ while true do
     setRotation()
 
     local s = host.clock()
-    gpu.dispatch(transform, vertexCount, verts, params, proj)
+    pass(transform, vertexCount)
     local s1 = host.clock()
-    gpu.dispatch(depthPass, triangleCount, idx, proj, depth, ids)
+    pass(depthPass, triangleCount)
     local s2 = host.clock()
-    gpu.dispatch(resolvePass, triangleCount, idx, proj, depth, ids)
+    pass(resolvePass, triangleCount)
     local s3 = host.clock()
-    gpu.dispatch(shade, W * H, ids, depth, verts, idx, params, image)
+    pass(shade, W * H)
     local s4 = host.clock()
     timeKernels = { s1 - s, s2 - s1, s3 - s2, s4 - s3 }
 
     if not headless then
-        window.present(image)
+        window.present(scene, offsets[6])
     end
 
     frame += 1
     fpsFrames += 1
     local elapsed = host.clock() - fpsStart
     if elapsed > 0.5 or not useGpu then
-        local mode = if useGpu then "GPU " .. host.gpuname() else "VM"
+        local mode = if useGpu then "GPU " .. host.gpuname() else "Luau"
         local msg = string.format("%s | %d triangles | %.1f fps | transform %.1f  depth %.1f  resolve %.1f  shade %.1f ms",
             mode, triangleCount, fpsFrames / elapsed,
             timeKernels[1] * 1000, timeKernels[2] * 1000, timeKernels[3] * 1000, timeKernels[4] * 1000)
@@ -336,10 +366,12 @@ if headless then
 end
 
 if savePath then
+    local image = buffer.create(W * H * 4)
+    buffer.copy(image, 0, scene, offsets[6], W * H * 4)
     host.writefile(savePath, image)
     print("saved " .. savePath)
 end
 
 local st = host.stats()
-print(string.format("gpu dispatches %d / %d, fallbacks %d, uploaded %.1f MB, downloaded %.1f MB",
-    st.gpuDispatches or 0, st.dispatches or 0, st.fallbacks or 0, (st.uploadedBytes or 0) / 1e6, (st.downloadedBytes or 0) / 1e6))
+print(string.format("gpu runs %d / %d, failures %d, uploaded %.1f MB, downloaded %.1f MB",
+    st.succeeded or 0, st.runs or 0, st.failures or 0, (st.uploadedBytes or 0) / 1e6, (st.downloadedBytes or 0) / 1e6))
