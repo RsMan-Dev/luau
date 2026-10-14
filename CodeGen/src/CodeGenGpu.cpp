@@ -56,7 +56,8 @@ uint l_steps = 0u;
 // tells which check failed where. The other, which runs first, only notes that a check failed, a division or square root
 // needed the exact computation, or a float result is infinite, which an overflow would give; the host then runs the checked
 // variant instead, so that both give the same results and failures. The checks cost kernels twice their time otherwise, in
-// the registers they keep. Stopping, the loop budget and fallbacks, which end the invocation, are told in both
+// the registers they keep. Stopping, the loop budget and fallbacks, which end the invocation, are told in both, unless a check
+// failed before, which may have caused them: the checked variant then tells
 uint l_at = 0u;
 uint l_err = 0u;
 #ifdef L_EXACT
@@ -2919,7 +2920,7 @@ struct GlslLowering
         glsl += "    if (gid >= pc.n) return;\n    if (gid == 0u) st.started = 1u;\n    if (st.stop != 0)\n        l_fail(9u);\n    else\n        "
                 "l_kernel(int(gid));\n"
                 "    if (l_ovf != 0u && l_err == 0u)\n        l_err = (6u << 24) | (l_ovf - 1u);\n"
-                "#ifndef L_EXACT\n    if (l_flag && l_err == 0u)\n        l_err = 11u << 24;\n#endif\n"
+                "#ifndef L_EXACT\n    if (l_flag)\n        l_err = 11u << 24;\n#endif\n"
                 "    if (l_err != 0u)\n        atomicCompSwap(st.err, 0u, l_err);\n}\n";
 
         return true;

@@ -72,8 +72,8 @@ std::string run(VulkanBackend* backend, const std::string& source, int interrupt
     luaL_openlibs(L);
     openGpuLibrary(L, backend, "no device");
 
-    // backendstats() returns the device memory and the kernels the backend keeps, and the memory it allocated for buffers;
-    // collect() runs a full GC cycle
+    // backendstats() returns the device memory and the kernels the backend keeps, the memory it allocated for buffers, and
+    // the runs that ran again on the checked variant; collect() runs a full GC cycle
     lua_pushlightuserdata(L, backend);
     lua_pushcclosure(
         L,
@@ -83,7 +83,8 @@ std::string run(VulkanBackend* backend, const std::string& source, int interrupt
             lua_pushnumber(L, double(stats.cachedBytes));
             lua_pushnumber(L, double(stats.kernels));
             lua_pushnumber(L, double(stats.memoryBytes));
-            return 3;
+            lua_pushnumber(L, double(stats.checkedRuns));
+            return 4;
         },
         "backendstats",
         1
@@ -1503,6 +1504,138 @@ local c = buffer.create(8)
 buffer.writeu32(c, 0, 16777217)
 local ok, err = runReady(inexact, c, 1)
 assert(not ok and string.find(err, "integer too large for a float at line", 1, true), err)
+)") == "");
+}
+
+TEST_CASE("the_unchecked_variant_stays_in_its_buffer_and_its_runs_leave_no_trace")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // the unchecked variant still skips accesses out of the buffer or unaligned, whatever wrapped integers gave their offset;
+    // a run whose integers wrapped into a loop bound is stopped by the loop budget; and a run that ran again on the checked
+    // variant starts from the buffers as they were, whatever the first one wrote or added with atomics
+    CHECK(run(*backend, std::string(kSquare) + R"(
+@gpu
+local function copyWords(b: buffer, i: number)
+    buffer.writeu32(b, i * 4, buffer.readu32(b, i * 4))
+end
+
+@gpu
+local function wild1(b: buffer, i: number)
+    local v = buffer.readu32(b, 0)
+    local o = if buffer.readu32(b, 4) == 1 then v * 16 else v
+    buffer.writeu32(b, o, 0xdead0001)
+    buffer.writeu32(b, o + 4, 0xdead0001)
+    gpu.atomicadd(b, o + 8, 1)
+end
+@gpu
+local function wild2(b: buffer, i: number)
+    local v = buffer.readu32(b, 0)
+    local o = if buffer.readu32(b, 4) == 1 then v * 16 else v
+    buffer.writeu32(b, o, 0xdead0002)
+    buffer.writeu32(b, o + 4, 0xdead0002)
+    gpu.atomicadd(b, o + 8, 1)
+end
+@gpu
+local function wild3(b: buffer, i: number)
+    local v = buffer.readu32(b, 0)
+    local o = if buffer.readu32(b, 4) == 1 then v * 16 else v
+    buffer.writeu32(b, o, 0xdead0003)
+    buffer.writeu32(b, o + 4, 0xdead0003)
+    gpu.atomicadd(b, o + 8, 1)
+end
+@gpu
+local function wild4(b: buffer, i: number)
+    local v = buffer.readu32(b, 0)
+    local o = if buffer.readu32(b, 4) == 1 then v * 16 else v
+    buffer.writeu32(b, o, 0xdead0004)
+    buffer.writeu32(b, o + 4, 0xdead0004)
+    gpu.atomicadd(b, o + 8, 1)
+end
+@gpu
+local function wild5(b: buffer, i: number)
+    local v = buffer.readu32(b, 0)
+    local o = if buffer.readu32(b, 4) == 1 then v * 16 else v
+    buffer.writeu32(b, o, 0xdead0005)
+    buffer.writeu32(b, o + 4, 0xdead0005)
+    gpu.atomicadd(b, o + 8, 1)
+end
+
+-- a canary next to the buffer, which stays on the GPU between runs
+local canary = buffer.create(4096)
+for o = 0, 4092, 4 do
+    buffer.writeu32(canary, o, o * 7 + 1)
+end
+local expected = copy(canary)
+assert(gpu.run(copyWords, { canary }, 1024))
+
+-- each case has its kernel, whose next runs would otherwise start on the checked variant
+local cases = {
+    { 64, 0, "out of bounds or unaligned buffer access", wild1 }, -- just past the end
+    { 66, 0, "out of bounds or unaligned buffer access", wild2 }, -- unaligned
+    { 0xfffffff0, 0, "number out of the range of 32-bit integers", wild3 }, -- negative as an int
+    { 0x10000000, 1, "integer overflow", wild4 }, -- wraps to 0, inside the buffer
+    { 0x10000004, 1, "integer overflow", wild5 }, -- wraps to 64, just past the end
+}
+for _, c in cases do
+    local b = buffer.create(64)
+    buffer.writeu32(b, 0, c[1])
+    buffer.writeu32(b, 4, c[2])
+    local before = copy(b)
+    local _, _, _, checked = backendstats()
+    local ok, err = gpu.run(c[4], { b }, 1)
+    assert(select(4, backendstats()) == checked + 1, "the run didn't run again on the checked variant")
+    assert(not ok and string.find(err, c[3], 1, true), `{c[1]}: {err}`)
+    assert(same(b, before))
+    -- and its device copy is the buffer again, whatever the unchecked run wrote to it
+    assert(gpu.run(copyWords, { b }, 16))
+    assert(same(b, before))
+end
+assert(gpu.run(copyWords, { canary }, 1024))
+assert(same(canary, expected))
+
+-- a loop bound that wrapped: the loop budget stops it, and the checked variant tells why
+@gpu
+local function spin(b: buffer, i: number)
+    local n = buffer.readu32(b, 0) * 65536
+    local s = 0
+    for j = 1, n do
+        s += j
+    end
+    buffer.writeu32(b, 4, s % 7)
+end
+local b = buffer.create(8)
+buffer.writeu32(b, 0, 0x10001)
+local _, _, _, checked = backendstats()
+local ok, err = gpu.run(spin, { b }, 64)
+assert(not ok and string.find(err, "integer overflow", 1, true), err)
+assert(select(4, backendstats()) == checked + 1, "the run didn't run again on the checked variant")
+
+-- a histogram whose unchecked run notes an infinity late, in one invocation: the checked run counts from the original
+-- contents, with nothing counted twice
+local N = 100000
+@gpu
+local function histogram(b: buffer, i: number)
+    gpu.atomicadd(b, 64 + (i % 97) * 4, 1)
+    if i == N - 7 then
+        buffer.writef32(b, 0, i / buffer.readf32(b, 4))
+    end
+end
+local h = buffer.create(64 + 97 * 4)
+for o = 64, 64 + 96 * 4, 4 do
+    buffer.writeu32(h, o, 1000)
+end
+local vm = copy(h)
+for i = 0, N - 1 do
+    histogram(vm, i)
+end
+local _, _, _, checkedBefore = backendstats()
+assert(gpu.run(histogram, { h }, N))
+local _, _, _, checkedAfter = backendstats()
+assert(checkedAfter == checkedBefore + 1, "the run didn't run again on the checked variant")
+assert(same(h, vm))
 )") == "");
 }
 

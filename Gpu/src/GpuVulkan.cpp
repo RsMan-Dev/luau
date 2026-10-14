@@ -1543,6 +1543,7 @@ std::string VulkanBackend::Impl::run(lua_State* L, int fn, int list, uint32_t ru
         if (!exact->compileError.empty())
             return kCannotRun;
         kernel->preferExact = 64;
+        stats.checkedRuns++;
         used = exact;
     }
 

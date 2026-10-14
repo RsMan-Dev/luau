@@ -27,6 +27,7 @@ struct RunStats
     uint64_t cachedBytes = 0; // device memory currently holding copies of Luau buffers
     uint64_t memoryBytes = 0; // device and host memory currently allocated for those copies, which share it
     uint64_t kernels = 0;     // kernels kept for live functions, including the ones that can't run on the GPU
+    uint64_t checkedRuns = 0; // runs that ran again on the checked variant of their kernel
 };
 
 struct VulkanOptions
