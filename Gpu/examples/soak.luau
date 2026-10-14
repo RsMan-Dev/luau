@@ -7,7 +7,7 @@
 local seconds = tonumber((arg :: { string })[1]) or 60
 
 local frames = {}
-local maxCached, maxKernels = 0, 0
+local maxCached, maxMemory, maxKernels = 0, 0, 0
 local start = host.clock()
 local frame = 0
 
@@ -38,6 +38,7 @@ while host.clock() - start < seconds do
 
     local stats = host.stats()
     maxCached = math.max(maxCached, stats.cachedBytes)
+    maxMemory = math.max(maxMemory, stats.memoryBytes)
     maxKernels = math.max(maxKernels, stats.kernels)
 end
 
@@ -52,6 +53,14 @@ end
 local tenth = frame // 10
 local stats = host.stats()
 print(string.format(
-    "%d frames in %.0fs: first 10%% %.3f ms, last 10%% %.3f ms per dispatch; max cached %.1f MB, max kernels %d; gpu %d, fallbacks %d",
-    frame, seconds, mean(1, tenth), mean(frame - tenth + 1, frame), maxCached / 1e6, maxKernels, stats.gpuDispatches, stats.fallbacks
+    "%d frames in %.0fs: first 10%% %.3f ms, last 10%% %.3f ms per dispatch; max cached %.1f MB, max memory %.1f MB, max kernels %d; gpu %d, fallbacks %d",
+    frame,
+    seconds,
+    mean(1, tenth),
+    mean(frame - tenth + 1, frame),
+    maxCached / 1e6,
+    maxMemory / 1e6,
+    maxKernels,
+    stats.gpuDispatches,
+    stats.fallbacks
 ))

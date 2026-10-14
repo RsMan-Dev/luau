@@ -10,8 +10,10 @@
 
 #include <string.h>
 
+#include <algorithm>
 #include <chrono>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -44,15 +46,39 @@ struct KernelEntry
     VkPipeline pipeline = VK_NULL_HANDLE;
 };
 
+// memory that buffers share, since allocating memory takes longer than a dispatch on a buffer made for it; a block is freed
+// with the last buffer in it
+struct MemoryBlock
+{
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize size = 0;
+    uint32_t type = 0;
+    uint8_t* mapped = nullptr;
+    std::vector<std::pair<VkDeviceSize, VkDeviceSize>> free; // offset and size of the free ranges, by offset
+    uint32_t buffers = 0;
+};
+
+struct Memory
+{
+    MemoryBlock* block = nullptr;
+    VkDeviceSize offset = 0;
+    VkDeviceSize size = 0;
+
+    explicit operator bool() const
+    {
+        return block != nullptr;
+    }
+};
+
 // device memory for a Luau buffer and the host memory mirroring it
 struct Allocation
 {
     VkDeviceSize deviceSize = 0;
 
     VkBuffer device = VK_NULL_HANDLE;
-    VkDeviceMemory deviceMemory = VK_NULL_HANDLE;
+    Memory deviceMemory;
     VkBuffer staging = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    Memory stagingMemory;
     void* mapped = nullptr;
 };
 
@@ -63,7 +89,7 @@ struct BufferEntry : Allocation
 
     // contents of a dirty copy before the dispatch that is running, to restore them if it fails
     VkBuffer backup = VK_NULL_HANDLE;
-    VkDeviceMemory backupMemory = VK_NULL_HANDLE;
+    Memory backupMemory;
 
     // the device holds defined contents; when not dirty, they are those of the staging memory and the Luau buffer
     bool valid = false;
@@ -163,7 +189,14 @@ struct VulkanBackend::Impl
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     uint32_t descriptorSets = 0;
 
-    BufferEntry status;
+    struct
+    {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        void* mapped = nullptr;
+    } status;
+
+    std::vector<std::unique_ptr<MemoryBlock>> blocks;
 
     ShaderCompiler shaders;
     std::function<CodeGen::GpuKernel(lua_State*, int)> lowering = CodeGen::compileGpu;
@@ -207,7 +240,9 @@ struct VulkanBackend::Impl
 
     bool init(std::string& error);
     int findMemory(uint32_t typeBits, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred);
-    bool createBuffer(VkDeviceSize size, bool deviceLocal, VkBuffer& buffer, VkDeviceMemory& mem, void** mapped);
+    bool allocate(const VkMemoryRequirements& req, uint32_t type, bool map, Memory& mem);
+    void release(Memory& mem);
+    bool createBuffer(VkDeviceSize size, bool deviceLocal, VkBuffer& buffer, Memory& mem, void** mapped);
     void destroyAllocation(Allocation& alloc);
     void destroyBuffer(BufferEntry& entry);
 
@@ -367,9 +402,9 @@ bool VulkanBackend::Impl::init(std::string& error)
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = 12;
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    VK_CHECK(vkCreateBuffer(device, &bci, nullptr, &status.device));
+    VK_CHECK(vkCreateBuffer(device, &bci, nullptr, &status.buffer));
     VkMemoryRequirements req;
-    vkGetBufferMemoryRequirements(device, status.device, &req);
+    vkGetBufferMemoryRequirements(device, status.buffer, &req);
     int type = findMemory(
         req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
     );
@@ -381,9 +416,9 @@ bool VulkanBackend::Impl::init(std::string& error)
     VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = type;
-    VK_CHECK(vkAllocateMemory(device, &mai, nullptr, &status.deviceMemory));
-    VK_CHECK(vkBindBufferMemory(device, status.device, status.deviceMemory, 0));
-    VK_CHECK(vkMapMemory(device, status.deviceMemory, 0, 12, 0, &status.mapped));
+    VK_CHECK(vkAllocateMemory(device, &mai, nullptr, &status.memory));
+    VK_CHECK(vkBindBufferMemory(device, status.buffer, status.memory, 0));
+    VK_CHECK(vkMapMemory(device, status.memory, 0, 12, 0, &status.mapped));
 
     hooks.context = this;
     hooks.dispatch = [](void* context, lua_State* L, const lua_GpuStep* steps, int nsteps, int outputs, int changed)
@@ -422,8 +457,8 @@ VulkanBackend::Impl::~Impl()
         for (auto& [id, entry] : buffers)
             destroyBuffer(entry);
 
-        vkDestroyBuffer(device, status.device, nullptr);
-        vkFreeMemory(device, status.deviceMemory, nullptr);
+        vkDestroyBuffer(device, status.buffer, nullptr);
+        vkFreeMemory(device, status.memory, nullptr);
 
         vkDestroyDescriptorPool(device, descriptorPool, nullptr);
         vkDestroyFence(device, fence, nullptr);
@@ -449,8 +484,109 @@ int VulkanBackend::Impl::findMemory(uint32_t typeBits, VkMemoryPropertyFlags req
     return -1;
 }
 
+// blocks grow with the memory in use, up to a size large enough for many buffers of a typical dispatch; larger buffers get
+// a block of their own
+constexpr VkDeviceSize kMinBlockSize = 1 << 20;
+constexpr VkDeviceSize kBlockSize = 64 << 20;
+
+bool VulkanBackend::Impl::allocate(const VkMemoryRequirements& req, uint32_t type, bool map, Memory& mem)
+{
+    auto take = [&](MemoryBlock& block)
+    {
+        for (size_t i = 0; i < block.free.size(); ++i)
+        {
+            auto [offset, size] = block.free[i];
+            VkDeviceSize start = (offset + req.alignment - 1) / req.alignment * req.alignment;
+            if (start + req.size > offset + size)
+                continue;
+
+            // what's left before and after the buffer stays free
+            VkDeviceSize end = start + req.size;
+            block.free.erase(block.free.begin() + i);
+            if (end < offset + size)
+                block.free.insert(block.free.begin() + i, {end, offset + size - end});
+            if (start > offset)
+                block.free.insert(block.free.begin() + i, {offset, start - offset});
+
+            block.buffers++;
+            mem = {&block, start, req.size};
+            return true;
+        }
+        return false;
+    };
+
+    for (std::unique_ptr<MemoryBlock>& block : blocks)
+    {
+        if (block->type == type && take(*block))
+            return true;
+    }
+
+    VkDeviceSize used = 0;
+    for (std::unique_ptr<MemoryBlock>& block : blocks)
+        used += block->type == type ? block->size : 0;
+
+    VkDeviceSize size = kMinBlockSize;
+    while (size < kBlockSize && (size < req.size * 2 || size < used))
+        size *= 2;
+
+    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size > kBlockSize / 2 ? req.size : size;
+    mai.memoryTypeIndex = type;
+
+    std::unique_ptr<MemoryBlock> block = std::make_unique<MemoryBlock>();
+    block->type = type;
+    block->size = mai.allocationSize;
+    block->free = {{0, mai.allocationSize}};
+    if (vkAllocateMemory(device, &mai, nullptr, &block->memory) != VK_SUCCESS)
+        return false;
+    if (map && vkMapMemory(device, block->memory, 0, VK_WHOLE_SIZE, 0, (void**)&block->mapped) != VK_SUCCESS)
+    {
+        vkFreeMemory(device, block->memory, nullptr);
+        return false;
+    }
+
+    blocks.push_back(std::move(block));
+    return take(*blocks.back());
+}
+
+void VulkanBackend::Impl::release(Memory& mem)
+{
+    MemoryBlock* block = mem.block;
+    if (!block)
+        return;
+
+    // back into the free ranges, merged with its neighbors
+    auto& free = block->free;
+    auto it = std::lower_bound(free.begin(), free.end(), std::make_pair(mem.offset, VkDeviceSize(0)));
+    it = free.insert(it, {mem.offset, mem.size});
+    if (it + 1 != free.end() && it->first + it->second == (it + 1)->first)
+    {
+        it->second += (it + 1)->second;
+        free.erase(it + 1);
+    }
+    if (it != free.begin() && (it - 1)->first + (it - 1)->second == it->first)
+    {
+        (it - 1)->second += it->second;
+        free.erase(it);
+    }
+
+    mem = Memory();
+    if (--block->buffers > 0)
+        return;
+
+    vkFreeMemory(device, block->memory, nullptr);
+    for (size_t i = 0; i < blocks.size(); ++i)
+    {
+        if (blocks[i].get() == block)
+        {
+            blocks.erase(blocks.begin() + i);
+            break;
+        }
+    }
+}
+
 // device-local buffers hold the copies kernels use; host buffers are mapped and cached, since they are compared and read
-bool VulkanBackend::Impl::createBuffer(VkDeviceSize size, bool deviceLocal, VkBuffer& buffer, VkDeviceMemory& mem, void** mapped)
+bool VulkanBackend::Impl::createBuffer(VkDeviceSize size, bool deviceLocal, VkBuffer& buffer, Memory& mem, void** mapped)
 {
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = size;
@@ -473,34 +609,26 @@ bool VulkanBackend::Impl::createBuffer(VkDeviceSize size, bool deviceLocal, VkBu
     if (type < 0)
         return false;
 
-    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    mai.allocationSize = req.size;
-    mai.memoryTypeIndex = type;
-    if (vkAllocateMemory(device, &mai, nullptr, &mem) != VK_SUCCESS)
-    {
-        mem = VK_NULL_HANDLE;
+    if (!allocate(req, uint32_t(type), mapped != nullptr, mem))
         return false;
-    }
 
     if (deviceLocal)
         cachedBytes += size;
 
-    if (vkBindBufferMemory(device, buffer, mem, 0) != VK_SUCCESS)
-        return false;
+    if (mapped)
+        *mapped = mem.block->mapped + mem.offset;
 
-    return !mapped || vkMapMemory(device, mem, 0, size, 0, mapped) == VK_SUCCESS;
+    return vkBindBufferMemory(device, buffer, mem.block->memory, mem.offset) == VK_SUCCESS;
 }
 
 void VulkanBackend::Impl::destroyAllocation(Allocation& alloc)
 {
     if (alloc.deviceMemory)
         cachedBytes -= alloc.deviceSize;
-    if (alloc.mapped)
-        vkUnmapMemory(device, alloc.stagingMemory);
     vkDestroyBuffer(device, alloc.device, nullptr);
-    vkFreeMemory(device, alloc.deviceMemory, nullptr);
+    release(alloc.deviceMemory);
     vkDestroyBuffer(device, alloc.staging, nullptr);
-    vkFreeMemory(device, alloc.stagingMemory, nullptr);
+    release(alloc.stagingMemory);
     alloc = Allocation();
 }
 
@@ -511,7 +639,7 @@ void VulkanBackend::Impl::destroyBuffer(BufferEntry& entry)
     if (entry.backupMemory)
         cachedBytes -= entry.deviceSize;
     vkDestroyBuffer(device, entry.backup, nullptr);
-    vkFreeMemory(device, entry.backupMemory, nullptr);
+    release(entry.backupMemory);
     destroyAllocation(entry);
     entry = BufferEntry();
 }
@@ -771,6 +899,9 @@ BufferEntry* VulkanBackend::Impl::bufferFor(lua_State* L, int idx, bool create)
     // fails, free every copy this dispatch doesn't need and retry
     for (int attempt = 0; attempt < 2; ++attempt)
     {
+        if (attempt > 0 || cachedBytes + deviceSize > options.cacheBytes)
+            freeDeadBuffers();
+
         while ((attempt > 0 || cachedBytes + deviceSize > options.cacheBytes) && evictLeastRecent())
         {
         }
@@ -808,6 +939,10 @@ int VulkanBackend::Impl::dispatch(lua_State* L, const lua_GpuStep* steps, int ns
         std::lock_guard<std::mutex> lock(mutex);
         result = dispatchLocked(L, steps, nsteps, outputs, changed, fallback);
         handler = fallbackHandler;
+
+        // after the dispatch rather than before it, so that the memory blocks the buffers of an earlier dispatch leave hold
+        // the buffers made for this one instead of being freed and allocated again
+        freeDeadBuffers();
     }
 
     // outside of the lock, so the handler can use the backend; it only reports, so its failures don't affect the dispatch
@@ -828,7 +963,6 @@ int VulkanBackend::Impl::dispatch(lua_State* L, const lua_GpuStep* steps, int ns
 int VulkanBackend::Impl::dispatchLocked(lua_State* L, const lua_GpuStep* steps, int nsteps, int outputs, int changed, std::string& fallback)
 {
     stats.dispatches++;
-    freeDeadBuffers();
 
     bool batch = outputs != 0;
     dispatchCounter++;
@@ -1086,7 +1220,7 @@ void VulkanBackend::Impl::record(const lua_GpuStep* steps, int nsteps, bool batc
         size_t bindings = bound.size() + 1;
         for (size_t i = 0; i < bindings; ++i)
         {
-            infos[i].buffer = i < bound.size() ? bound[i]->device : status.device;
+            infos[i].buffer = i < bound.size() ? bound[i]->device : status.buffer;
             infos[i].range = VK_WHOLE_SIZE;
 
             writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1293,6 +1427,8 @@ DispatchStats VulkanBackend::stats() const
     std::lock_guard<std::mutex> lock(impl->mutex);
     DispatchStats s = impl->stats;
     s.cachedBytes = impl->cachedBytes;
+    for (const std::unique_ptr<MemoryBlock>& block : impl->blocks)
+        s.memoryBytes += block->size;
     s.kernels = impl->kernels.size();
     return s;
 }

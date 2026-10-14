@@ -78,7 +78,7 @@ static int host_clock(lua_State* L)
 
 static int host_stats(lua_State* L)
 {
-    lua_createtable(L, 0, 5);
+    lua_createtable(L, 0, 8);
     if (gBackend)
     {
         Luau::Gpu::DispatchStats s = gBackend->stats();
@@ -94,6 +94,8 @@ static int host_stats(lua_State* L)
         lua_setfield(L, -2, "downloadedBytes");
         lua_pushnumber(L, double(s.cachedBytes));
         lua_setfield(L, -2, "cachedBytes");
+        lua_pushnumber(L, double(s.memoryBytes));
+        lua_setfield(L, -2, "memoryBytes");
         lua_pushnumber(L, double(s.kernels));
         lua_setfield(L, -2, "kernels");
     }

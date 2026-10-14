@@ -62,7 +62,8 @@ std::string run(VulkanBackend& backend, const std::string& source, int interrupt
     lua_State* L = luaL_newstate();
     luaL_openlibs(L);
 
-    // backendstats() returns the device memory and the kernels the backend keeps; collect() runs a full GC cycle
+    // backendstats() returns the device memory and the kernels the backend keeps, and the memory it allocated for buffers;
+    // collect() runs a full GC cycle
     lua_pushlightuserdata(L, &backend);
     lua_pushcclosure(
         L,
@@ -71,7 +72,8 @@ std::string run(VulkanBackend& backend, const std::string& source, int interrupt
             DispatchStats stats = static_cast<VulkanBackend*>(lua_tolightuserdata(L, lua_upvalueindex(1)))->stats();
             lua_pushnumber(L, double(stats.cachedBytes));
             lua_pushnumber(L, double(stats.kernels));
-            return 2;
+            lua_pushnumber(L, double(stats.memoryBytes));
+            return 3;
         },
         "backendstats",
         1
@@ -905,8 +907,8 @@ use()
 collect()
 collect()
 gpu.status(print)
-local cached = backendstats()
-assert(cached == 0, `{cached}`)
+local cached, _, memory = backendstats()
+assert(cached == 0 and memory == 0, `{cached} {memory}`)
 )") == "");
 
     // a function without upvalues lives as long as its prototype, so kernels are released with the state; the next call into
@@ -929,7 +931,7 @@ end
 
 local n = 3000
 local times = table.create(n)
-local maxCached = 0
+local maxCached, maxMemory = 0, 0
 for k = 1, n do
     local b = buffer.create(64 * 1024 + (k % 7) * 1024)
     local t = os.clock()
@@ -939,7 +941,9 @@ for k = 1, n do
     if k % 100 == 0 then
         collect()
     end
-    maxCached = math.max(maxCached, (backendstats()))
+    local cached, _, memory = backendstats()
+    maxCached = math.max(maxCached, cached)
+    maxMemory = math.max(maxMemory, memory)
 end
 
 -- medians, since other processes using the GPU make single dispatches slow at random
@@ -954,6 +958,8 @@ end
 
 -- what is alive between two collections, not everything that was ever dispatched
 assert(maxCached < 101 * 72 * 1024, `{maxCached}`)
+-- buffers share memory blocks for the device copies and host mirrors, which grow with what is alive
+assert(maxMemory <= 4 * 101 * 72 * 1024, `{maxMemory}`)
 -- the cost of a dispatch doesn't grow with the number of buffers that came before
 local first, last = median(1, n // 10), median(n - n // 10 + 1, n)
 assert(last < first * 1.5 + 0.0002, `{first} {last}`)
