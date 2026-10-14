@@ -62,6 +62,14 @@ static bool contains(const std::string& s, const char* part)
     return s.find(part) != std::string::npos;
 }
 
+static int count(const std::string& s, const char* part)
+{
+    int n = 0;
+    for (size_t at = s.find(part); at != std::string::npos; at = s.find(part, at + 1))
+        n++;
+    return n;
+}
+
 TEST_SUITE_BEGIN("CodeGenGpu");
 
 TEST_CASE("GpuKernelBasics")
@@ -131,6 +139,27 @@ return k
 
     REQUIRE_MESSAGE(kernel.reason.empty(), kernel.reason);
     CHECK(contains(kernel.glsl, "{ l_fail(1u); return; }"));
+}
+
+TEST_CASE("GpuKernelChecksOnlyWhatIsntKnown")
+{
+    // drivers compile kernels in a time that grows faster than their code, with each check adding to it: accesses at a
+    // multiple of 4 from an offset an earlier access checked are aligned, and constants a class holds are written in it
+    GpuKernel kernel = lowerGpu(R"(
+@gpu
+local function k(b: buffer, i: number)
+    local o = buffer.readu32(b, 0) * 4
+    local x = buffer.readf32(b, o) + buffer.readf32(b, o + 4) + buffer.readf32(b, o + 8)
+    buffer.writef32(b, o + 12, x * 8192)
+end
+return k
+)");
+
+    REQUIRE_MESSAGE(kernel.reason.empty(), kernel.reason);
+    CHECK(count(kernel.glsl, "l_rd0(") == 2);  // the definition and the read at o
+    CHECK(count(kernel.glsl, "l_rda0(") == 4); // the definition and the reads at 0, o + 4 and o + 8
+    CHECK(contains(kernel.glsl, "l_wra0("));
+    CHECK(!contains(kernel.glsl, "l_i2f((8192))"));
 }
 
 TEST_CASE("GpuKernelExactIntegersInFloatRegisters")

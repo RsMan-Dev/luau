@@ -497,6 +497,33 @@ end
 )") == "");
 }
 
+TEST_CASE("unaligned_offsets_fail_the_run_with_the_accesses_that_follow_them")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // only the first access from an offset checks its alignment, the others being at multiples of 4 from it
+    CHECK(run(*backend, std::string(kSquare) + R"(
+@gpu
+local function k(b: buffer, i: number)
+    local o = buffer.readu32(b, 0)
+    buffer.writeu32(b, o, 1)
+    buffer.writeu32(b, o + 4, 2)
+end
+
+local b = buffer.create(16)
+buffer.writeu32(b, 0, 6)
+local before = copy(b)
+local ok, err = gpu.run(k, { b }, 1)
+assert(not ok and string.find(err, "out of bounds or unaligned buffer access", 1, true), err)
+assert(same(b, before))
+buffer.writeu32(b, 0, 4)
+assert(gpu.run(k, { b }, 1))
+assert(buffer.readu32(b, 4) == 1 and buffer.readu32(b, 8) == 2)
+)") == "");
+}
+
 TEST_CASE("infinite_loops_fail_the_run")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();

@@ -49,10 +49,12 @@ uint8_t classBit(NumClass c)
 
 const char* const kPrelude = R"(
 uint l_steps = 0u;
-// the first failure of a run gives its kind and source line, see GpuFailure
+// the first failure of a run gives its kind and source line, see GpuFailure. An invocation notes its first one and reports it
+// once it returns, which compiles much faster than an atomic at each check: drivers take a time growing faster than the code
+// with each side effect in a branch
 uint l_at = 0u;
-void l_failat(uint kind, uint at) { atomicCompSwap(st.err, 0u, (kind << 24) | at); }
-void l_fail(uint kind) { l_failat(kind, l_at); }
+uint l_err = 0u;
+void l_fail(uint kind) { if (l_err == 0u) l_err = (kind << 24) | l_at; }
 bool l_bad(int off, int b) { return off < 0 || (off & 3) != 0 || uint(off) + 4u > pc.len[b]; }
 int l_chk(bool bad, int r) { if (bad) l_fail(2u); return r; }
 uint l_chk(bool bad, uint r) { if (bad) l_fail(2u); return r; }
@@ -164,7 +166,7 @@ float l_fdivexact(float a, float b)
     }
     // q = floor(ma * 2^24 / mb), 25 bits, by long division with integers, 8 bits at a time: the remainder stays below mb < 2^24
     uint q = 1u, rem = ma - mb;
-    for (int k = 0; k < 3; k++)
+    [[dont_unroll]] for (int k = 0; k < 3; k++)
     {
         rem <<= 8;
         uint digit = rem / mb;
@@ -190,7 +192,7 @@ float l_fsqrtexact(float a)
     }
     // root = floor(sqrt(m * 2^25)), 25 bits, with integers, two bits of m * 2^25 at a time: the remainder stays below 2^27
     uint root = 0u, rem = 0u;
-    for (int k = 24; k >= 0; k--)
+    [[dont_unroll]] for (int k = 24; k >= 0; k--)
     {
         int at = 2 * k - 25;
         rem = (rem << 2) | ((at >= 0 ? m >> at : m << -at) & 3u);
@@ -268,20 +270,21 @@ float l_fsqrt(float a)
 // scalar math is f32 where the VM's is f64, so results are rounded more, but f32's narrower range would also change what they
 // are: a result that overflows to an infinity from finite operands fails the run. Underflows to zero or denormal numbers
 // aren't checked: kernels routinely produce them (falloffs, x ^ 40 of a small x), and failing those would fail them.
-// Overflows are noted rather than checked one by one, which would branch at every operation: the invocation fails once it
-// returns. Nothing it computed in between leaves the GPU, since a failed run is discarded, and it can't run for longer:
-// loops are bounded by the loop budget and the host's stop word whatever the values
-uint l_ovf = 0u; // line of the first float overflow, plus one
+// Like other failures, overflows are noted and the invocation fails once it returns. Nothing it computed in between leaves
+// the GPU, since a failed run is discarded, and it can't run for longer: loops are bounded by the loop budget and the host's
+// stop word whatever the values. An overflow notes its line plus one, the last one winning, which compiles faster than keeping
+// the first and is the same in practice: once infinite, a value doesn't overflow again
+uint l_ovf = 0u;
 bool l_finite(float x) { return !isinf(x) && !isnan(x); }
 // an infinity from operands that aren't infinite: NaN operands give NaN, not infinities
 bool l_overflow(float r, float a, float b) { return isinf(r) && max(abs(a), abs(b)) < uintBitsToFloat(0x7f800000u); }
-float l_addr(float a, float b) { precise float r = a + b; l_ovf = l_ovf == 0u && (l_overflow(r, a, b)) ? l_at + 1u : l_ovf; return r; }
-float l_subr(float a, float b) { precise float r = a - b; l_ovf = l_ovf == 0u && (l_overflow(r, a, b)) ? l_at + 1u : l_ovf; return r; }
-float l_mulr(float a, float b) { precise float r = a * b; l_ovf = l_ovf == 0u && (l_overflow(r, a, b)) ? l_at + 1u : l_ovf; return r; }
+float l_addr(float a, float b) { precise float r = a + b; if (l_overflow(r, a, b)) l_ovf = l_at + 1u; return r; }
+float l_subr(float a, float b) { precise float r = a - b; if (l_overflow(r, a, b)) l_ovf = l_at + 1u; return r; }
+float l_mulr(float a, float b) { precise float r = a * b; if (l_overflow(r, a, b)) l_ovf = l_at + 1u; return r; }
 // dividing by zero gives an infinity in the VM too
-float l_divr(float a, float b) { float r = l_fdiv(a, b); l_ovf = l_ovf == 0u && ((l_overflow(r, a, b) && b != 0.0)) ? l_at + 1u : l_ovf; return r; }
-float l_expr(float a) { float r = exp(a); l_ovf = l_ovf == 0u && ((isinf(r) && l_finite(a))) ? l_at + 1u : l_ovf; return r; }
-float l_rngr(float r, float a) { l_ovf = l_ovf == 0u && ((isinf(r) && l_finite(a))) ? l_at + 1u : l_ovf; return r; }
+float l_divr(float a, float b) { float r = l_fdiv(a, b); if (l_overflow(r, a, b) && b != 0.0) l_ovf = l_at + 1u; return r; }
+float l_expr(float a) { float r = exp(a); if (isinf(r) && l_finite(a)) l_ovf = l_at + 1u; return r; }
+float l_rngr(float r, float a) { if (isinf(r) && l_finite(a)) l_ovf = l_at + 1u; return r; }
 float l_fmod(float a, float b) { return b == 0.0 ? uintBitsToFloat(0x7fc00000u) : a - b * trunc(l_fdiv(a, b)); }
 )";
 
@@ -473,10 +476,13 @@ struct GlslLowering
     // check that falls back
     int lastLine = -1;
     GpuFailure failKind = GpuFailure::Fallback;
+    std::vector<uint32_t> alignedBases; // values whose alignment an access of the block checked
 
     // structured control flow, as in "Beyond Relooper" (Ramsey, 2022): the IR of Luau code is reducible, so each block is
     // emitted once, in its immediate dominator, inside a loop if it's a loop header, after the blocks that end where the
-    // block's dominator tree children with several predecessors start. Jumps across constructs go through l_jmp.
+    // block's dominator tree children with several predecessors start. Jumps across constructs go through l_jmp. Regions
+    // that only end where a merge starts are switches rather than loops left at once: drivers compile loops in a time that
+    // grows with the square of their number (NVIDIA: 0.6 s for 800, 0.14 s as switches)
     struct Construct
     {
         uint32_t block; // loop header, or block that follows
@@ -677,6 +683,19 @@ struct GlslLowering
     {
         std::string a = num(opa, c), b = num(opb, c);
 
+        // the checks repeat their operands: a conversion, with its own check, is computed once
+        auto once = [&](std::string& code, const char* suffix)
+        {
+            if (code.find('(') != std::string::npos && code[0] != '(')
+            {
+                std::string tmp = "v" + std::to_string(index) + suffix;
+                line(std::string(glslType(c)) + " " + tmp + " = " + code + ";");
+                code = tmp;
+            }
+        };
+        once(a, "_a");
+        once(b, "_b");
+
         // results that fit the class can't overflow
         Range r = instRange[index], domain = classRange(c);
         if (r.lo >= domain.lo && r.hi <= domain.hi && (cmd == IrCmd::ADD_NUM || cmd == IrCmd::SUB_NUM || cmd == IrCmd::MUL_NUM))
@@ -775,8 +794,31 @@ struct GlslLowering
         }
     }
 
+    // the value of a double constant operand
+    bool constNumber(IrOp op, double& v)
+    {
+        if (op.kind == IrOpKind::Constant && function.constOp(op).kind == IrConstKind::Double)
+            v = function.doubleOp(op);
+        else if (op.kind == IrOpKind::VmConst && ttisnumber(&proto->k[vmConstOp(op)]))
+            v = nvalue(&proto->k[vmConstOp(op)]);
+        else
+            return false;
+        return true;
+    }
+
     std::string num(IrOp op, NumClass to, bool exact = false)
     {
+        // a constant the class holds exactly is written in it, instead of converted with a check
+        double v;
+        if (constNumber(op, v) && to != NumClass::None && cls(op) != to)
+        {
+            bool fits = to == NumClass::Float ? v != v || double(float(v)) == v
+                                              : v == floor(v) && v >= (to == NumClass::Int ? -2147483648.0 : 0.0) &&
+                                                    v <= (to == NumClass::Uint ? 4294967295.0 : 2147483647.0);
+            if (fits)
+                return literal(v, to);
+        }
+
         return slots(
             op,
             [&](const std::string& code, NumClass from)
@@ -1487,7 +1529,11 @@ struct GlslLowering
             if (loop ? !c.loop || c.block != block : (c.loop ? c.exit : c.block) != block)
                 continue;
 
-            if (i == constructs.size())
+            // regions are switches, which a continue goes through
+            bool innermost = true;
+            for (size_t j = i; j < constructs.size(); j++)
+                innermost &= loop && !constructs[j].loop;
+            if (i == constructs.size() || innermost)
                 return loop ? "continue;" : "break;";
 
             (loop ? c.restarted : c.exited) = true;
@@ -1607,7 +1653,7 @@ struct GlslLowering
             constructs.push_back({exits[i], false});
             uint32_t after = fallsTo;
             fallsTo = exits[i];
-            std::string code = "for (;;)\n{\n" + around(header, exits, i + 1, inner) + "break;\n}\n";
+            std::string code = "switch (0)\n{\ndefault:\n" + around(header, exits, i + 1, inner) + "break;\n}\n";
             fallsTo = after;
             Construct region = constructs.back();
             constructs.pop_back();
@@ -1635,7 +1681,7 @@ struct GlslLowering
         constructs.push_back({merges[i], false});
         uint32_t after = fallsTo;
         fallsTo = merges[i];
-        std::string code = "for (;;)\n{\n" + within(block, merges, i + 1) + "break;\n}\n";
+        std::string code = "switch (0)\n{\ndefault:\n" + within(block, merges, i + 1) + "break;\n}\n";
         fallsTo = after;
         Construct region = constructs.back();
         constructs.pop_back();
@@ -1656,6 +1702,8 @@ struct GlslLowering
 
         int outerLine = lastLine;
         lastLine = -1;
+        std::vector<uint32_t> outerBases;
+        outerBases.swap(alignedBases);
 
         IrBlock& block = function.blocks[blockIndex];
         for (uint32_t index = block.start; index <= block.finish && !failed; index++)
@@ -1683,6 +1731,7 @@ struct GlslLowering
                 lastLine = -1;
         }
         lastLine = outerLine;
+        alignedBases.swap(outerBases);
 
         inlined = outer;
         saved.swap(out);
@@ -1827,11 +1876,7 @@ struct GlslLowering
             return false;
 
         double k;
-        if (b.kind == IrOpKind::Constant && function.constOp(b).kind == IrConstKind::Double)
-            k = function.doubleOp(b);
-        else if (b.kind == IrOpKind::VmConst && ttisnumber(&proto->k[vmConstOp(b)]))
-            k = nvalue(&proto->k[vmConstOp(b)]);
-        else
+        if (!constNumber(b, k))
             return false;
 
         // nonzero products of integers below 2^32 stay normal floats
@@ -1899,15 +1944,44 @@ struct GlslLowering
         return compare(convert(x, cx, c), convert(y, cy, c), cond);
     }
 
-    std::string access(int binding, const std::string& offset, const char* op, const std::string& value = "")
+    // an offset as a value plus a constant, the value being ~0u when the offset is a constant
+    void offsetParts(IrOp op, uint32_t& base, int64_t& k)
+    {
+        k = 0;
+        while (op.kind == IrOpKind::Inst && (function.instOp(op).cmd == IrCmd::ADD_INT || function.instOp(op).cmd == IrCmd::SUB_INT) &&
+               OP_B(function.instOp(op)).kind == IrOpKind::Constant)
+        {
+            IrInst& add = function.instOp(op);
+            k += add.cmd == IrCmd::ADD_INT ? function.intOp(OP_B(add)) : -int64_t(function.intOp(OP_B(add)));
+            op = OP_A(add);
+        }
+
+        base = ~0u;
+        if (op.kind == IrOpKind::Constant)
+            k += function.intOp(op);
+        else if (op.kind == IrOpKind::Inst)
+            base = op.index;
+    }
+
+    std::string access(int binding, IrOp offset, const char* op, const std::string& value = "")
     {
         if (op[0] == 'r')
             readBuffers[binding] = true;
         else
             build.bufferWritten[binding] = true;
 
+        // an access at a multiple of 4 from a value an earlier access of the block checked is aligned too: the check that
+        // offset passed, or the run fails anyway
+        uint32_t base;
+        int64_t k;
+        offsetParts(offset, base, k);
+        bool aligned = (k & 3) == 0 && (base == ~0u || std::find(alignedBases.begin(), alignedBases.end(), base) != alignedBases.end());
+        if ((k & 3) == 0 && base != ~0u && !aligned)
+            alignedBases.push_back(base);
+
         std::string b = std::to_string(binding);
-        return value.empty() ? "l_rd" + b + "(" + offset + ")" : "l_wr" + b + "(" + offset + ", " + value + ")";
+        std::string name = std::string(op[0] == 'r' ? "l_rd" : "l_wr") + (aligned ? "a" : "") + b;
+        return value.empty() ? name + "(" + intv(offset) + ")" : name + "(" + intv(offset) + ", " + value + ")";
     }
 
     bool binding(uint32_t index, IrOp op, int& b)
@@ -2404,7 +2478,7 @@ struct GlslLowering
             if (!binding(index, OP_A(inst), b))
                 return false;
 
-            std::string raw = access(b, intv(OP_B(inst)), "r");
+            std::string raw = access(b, OP_B(inst), "r");
             line(v + " = " + (inst.cmd == IrCmd::BUFFER_READF32 ? "uintBitsToFloat(" + raw + ")" : "int(" + raw + ")") + ";");
             break;
         }
@@ -2416,7 +2490,7 @@ struct GlslLowering
                 return false;
 
             std::string value = inst.cmd == IrCmd::BUFFER_WRITEF32 ? "floatBitsToUint(" + floatv(OP_C(inst)) + ")" : "uint(" + intv(OP_C(inst)) + ")";
-            line(access(b, intv(OP_B(inst)), "w", value) + ";");
+            line(access(b, OP_B(inst), "w", value) + ";");
             break;
         }
         case IrCmd::BITAND_UINT:
@@ -2512,7 +2586,7 @@ struct GlslLowering
         case LBF_MATH_POW:
             // 0 ^ -1 is infinite in the VM too
             line(v + " = l_pow(" + a + ", " + b + ");");
-            line("l_ovf = l_ovf == 0u && " + a + " != 0.0 && l_finite(" + a + ") && l_finite(" + b + ") && isinf(" + v + ") ? l_at + 1u : l_ovf;");
+            line("if (" + a + " != 0.0 && l_finite(" + a + ") && l_finite(" + b + ") && isinf(" + v + ")) l_ovf = l_at + 1u;");
             return true;
         case LBF_MATH_FMOD:
             line(v + " = l_fmod(" + a + ", " + b + ");");
@@ -2719,10 +2793,11 @@ struct GlslLowering
             std::string b = std::to_string(i);
             // reads and writes follow a CHECK_BUFFER_LEN that covers their bounds, as in native code; words must be aligned
             if (readBuffers[i])
-                glsl += "uint l_rd" + b + "(int off) { if ((off & 3) != 0) { l_fail(1u); return 0u; } return b" + b + ".d[off >> 2]; }\n";
+                glsl += "uint l_rd" + b + "(int off) { if ((off & 3) != 0) { l_fail(1u); return 0u; } return b" + b + ".d[off >> 2]; }\n" +
+                        "uint l_rda" + b + "(int off) { return b" + b + ".d[off >> 2]; }\n";
             if (build.bufferWritten[i])
-                glsl +=
-                    "void l_wr" + b + "(int off, uint v) { if ((off & 3) != 0) { l_fail(1u); return; } b" + b + ".d[off >> 2] = v; l_mark(off); }\n";
+                glsl += "void l_wr" + b + "(int off, uint v) { if ((off & 3) != 0) { l_fail(1u); return; } b" + b +
+                        ".d[off >> 2] = v; l_mark(off); }\n" + "void l_wra" + b + "(int off, uint v) { b" + b + ".d[off >> 2] = v; l_mark(off); }\n";
 
             static const char* const kAtomics[][2] = {{"add", "atomicAdd"}, {"min", "atomicMin"}};
             for (int op = 0; op < 2; op++)
@@ -2745,8 +2820,10 @@ struct GlslLowering
         glsl +=
             "    uint gid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * " + std::to_string(kGpuWorkgroupSize) + "u;\n";
         // invocations that start after the host asked the run to stop give up at once
-        glsl += "    if (gid >= pc.n) return;\n    if (gid == 0u) st.started = 1u;\n    if (st.stop != 0) { l_fail(9u); return; }\n"
-                "    l_kernel(int(gid));\n    if (l_ovf != 0u) l_failat(6u, l_ovf - 1u);\n}\n";
+        glsl += "    if (gid >= pc.n) return;\n    if (gid == 0u) st.started = 1u;\n    if (st.stop != 0)\n        l_fail(9u);\n    else\n        "
+                "l_kernel(int(gid));\n"
+                "    if (l_ovf != 0u && l_err == 0u)\n        l_err = (6u << 24) | (l_ovf - 1u);\n"
+                "    if (l_err != 0u)\n        atomicCompSwap(st.err, 0u, l_err);\n}\n";
 
         return true;
     }
