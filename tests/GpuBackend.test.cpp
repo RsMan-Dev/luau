@@ -1199,6 +1199,22 @@ for _, k in { product, power } do
     assert(same(b, before))
 end
 
+-- overflows are noted and fail the invocation once it returns: one that loops on an infinity is still stopped, and what it
+-- wrote, including the infinity, never leaves the GPU
+@gpu
+local function spin(b: buffer, i: number)
+    local x = buffer.readf32(b, 4)
+    while x == x do
+        x = x * 1e10
+        buffer.writef32(b, 12, x)
+    end
+end
+for _, k in { spin } do
+    local ok, err = gpu.run(k, { b }, 1)
+    assert(not ok and string.find(err, "failed on the GPU", 1, true), err)
+    assert(same(b, before))
+end
+
 -- infinities the VM gets too, and underflows, are results
 @gpu
 local function legit(b: buffer, i: number)

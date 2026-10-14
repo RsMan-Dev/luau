@@ -233,35 +233,21 @@ float l_fsqrt(float a)
 }
 // scalar math is f32 where the VM's is f64, so results are rounded more, but f32's narrower range would also change what they
 // are: a result that overflows to an infinity from finite operands fails the run. Underflows to zero or denormal numbers
-// aren't checked: kernels routinely produce them (falloffs, x ^ 40 of a small x), and failing those would fail them
+// aren't checked: kernels routinely produce them (falloffs, x ^ 40 of a small x), and failing those would fail them.
+// Overflows are noted rather than checked one by one, which would branch at every operation: the invocation fails once it
+// returns. Nothing it computed in between leaves the GPU, since a failed run is discarded, and it can't run for longer:
+// loops are bounded by the loop budget and the host's stop word whatever the values
+bool l_ovf = false;
 bool l_finite(float x) { return !isinf(x) && !isnan(x); }
 // an infinity from operands that aren't infinite: NaN operands give NaN, not infinities
-bool l_overflow(float r, float a, float b) { return isinf(r) && !isinf(a) && !isinf(b); }
-float l_addr(float a, float b) { precise float r = a + b; if (l_overflow(r, a, b)) l_fail(); return r; }
-float l_subr(float a, float b) { precise float r = a - b; if (l_overflow(r, a, b)) l_fail(); return r; }
-float l_mulr(float a, float b)
-{
-    precise float r = a * b;
-    if (l_overflow(r, a, b))
-        l_fail();
-    return r;
-}
-float l_divr(float a, float b)
-{
-    float r = l_fdiv(a, b);
-    // dividing by zero gives an infinity in the VM too
-    if (isinf(r) && l_finite(a) && l_finite(b) && b != 0.0)
-        l_fail();
-    return r;
-}
-float l_expr(float a)
-{
-    float r = exp(a);
-    if (isinf(r) && l_finite(a))
-        l_fail();
-    return r;
-}
-float l_rngr(float r, float a) { if (isinf(r) && l_finite(a)) l_fail(); return r; }
+bool l_overflow(float r, float a, float b) { return isinf(r) && max(abs(a), abs(b)) < uintBitsToFloat(0x7f800000u); }
+float l_addr(float a, float b) { precise float r = a + b; l_ovf = l_ovf || l_overflow(r, a, b); return r; }
+float l_subr(float a, float b) { precise float r = a - b; l_ovf = l_ovf || l_overflow(r, a, b); return r; }
+float l_mulr(float a, float b) { precise float r = a * b; l_ovf = l_ovf || l_overflow(r, a, b); return r; }
+// dividing by zero gives an infinity in the VM too
+float l_divr(float a, float b) { float r = l_fdiv(a, b); l_ovf = l_ovf || (l_overflow(r, a, b) && b != 0.0); return r; }
+float l_expr(float a) { float r = exp(a); l_ovf = l_ovf || (isinf(r) && l_finite(a)); return r; }
+float l_rngr(float r, float a) { l_ovf = l_ovf || (isinf(r) && l_finite(a)); return r; }
 float l_fmod(float a, float b) { return b == 0.0 ? uintBitsToFloat(0x7fc00000u) : a - b * trunc(l_fdiv(a, b)); }
 )";
 
@@ -2145,7 +2131,7 @@ struct GlslLowering
         case LBF_MATH_POW:
             // 0 ^ -1 is infinite in the VM too
             line(v + " = l_pow(" + a + ", " + b + ");");
-            line("if (" + a + " != 0.0 && l_finite(" + a + ") && l_finite(" + b + ") && isinf(" + v + ")) l_fail();");
+            line("l_ovf = l_ovf || (" + a + " != 0.0 && l_finite(" + a + ") && l_finite(" + b + ") && isinf(" + v + "));");
             return true;
         case LBF_MATH_FMOD:
             line(v + " = l_fmod(" + a + ", " + b + ");");
@@ -2375,7 +2361,7 @@ struct GlslLowering
             "    uint gid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * " + std::to_string(kGpuWorkgroupSize) + "u;\n";
         // invocations that start after the host asked the run to stop give up at once
         glsl += "    if (gid >= pc.n) return;\n    if (gid == 0u) st.started = 1u;\n    if (st.stop != 0) { l_fail(); return; }\n"
-                "    l_kernel(int(gid));\n}\n";
+                "    l_kernel(int(gid));\n    if (l_ovf) l_fail();\n}\n";
 
         return true;
     }
