@@ -109,28 +109,6 @@ float l_fround(uint sign, int e, uint m, bool sticky)
     // a carry into the exponent is right: it only makes the significand 2^23, which encodes the next binade
     return uintBitsToFloat(sign | ((e == 0 ? 0u : uint(e - 1) << 23) + r));
 }
-// the significand of a quotient or square root: 'q' estimates floor(n / d) within a few units, the exact remainder n - q * d
-// is far below 2^31 so 32 bits hold it, and q is corrected to the exact floor
-uint l_fcorrect(uint q, uint nlo, uint d, out bool sticky)
-{
-    int r = int(nlo - q * d);
-    // one step brings q within a unit, which spares divergent loops
-    int step = int(floor(float(r) / float(d)));
-    q += uint(step);
-    r -= step * int(d);
-    while (r < 0)
-    {
-        q -= 1u;
-        r += int(d);
-    }
-    while (r >= int(d))
-    {
-        q += 1u;
-        r -= int(d);
-    }
-    sticky = r != 0;
-    return q;
-}
 float l_fdivexact(float a, float b)
 {
     uint ua = floatBitsToUint(a), ub = floatBitsToUint(b);
@@ -150,10 +128,16 @@ float l_fdivexact(float a, float b)
         ma <<= 1;
         e -= 1;
     }
-    // q = floor(ma * 2^24 / mb), 25 bits
-    bool sticky;
-    uint q = l_fcorrect(uint(float(ma) / float(mb) * 16777216.0), ma << 24, mb, sticky);
-    return l_fround(sign, e, q, sticky);
+    // q = floor(ma * 2^24 / mb), 25 bits, by long division with integers, 8 bits at a time: the remainder stays below mb < 2^24
+    uint q = 1u, rem = ma - mb;
+    for (int k = 0; k < 3; k++)
+    {
+        rem <<= 8;
+        uint digit = rem / mb;
+        rem -= digit * mb;
+        q = (q << 8) | digit;
+    }
+    return l_fround(sign, e, q, rem != 0u);
 }
 float l_fsqrtexact(float a)
 {
@@ -170,27 +154,27 @@ float l_fsqrtexact(float a)
         m <<= 1;
         e -= 1;
     }
-    // root = floor(sqrt(m * 2^25)), 25 bits, from the hardware's estimate within a few units; x - root^2 is far below 2^31
-    uint root = uint(sqrt(float(m) * 33554432.0));
-    int r = int((m << 25) - root * root);
-    int step = int(floor(float(r) / float(2u * root)));
-    root += uint(step);
-    r = int((m << 25) - root * root);
-    while (r < 0)
+    // root = floor(sqrt(m * 2^25)), 25 bits, with integers, two bits of m * 2^25 at a time: the remainder stays below 2^27
+    uint root = 0u, rem = 0u;
+    for (int k = 24; k >= 0; k--)
     {
-        root -= 1u;
-        r += int(2u * root + 1u);
+        int at = 2 * k - 25;
+        rem = (rem << 2) | ((at >= 0 ? m >> at : m << -at) & 3u);
+        uint trial = (root << 2) | 1u;
+        root <<= 1;
+        if (rem >= trial)
+        {
+            rem -= trial;
+            root |= 1u;
+        }
     }
-    while (r >= int(2u * root + 1u))
-    {
-        r -= int(2u * root + 1u);
-        root += 1u;
-    }
-    return l_fround(0u, (e - 127) / 2 + 127, root, r != 0);
+    return l_fround(0u, (e - 127) / 2 + 127, root, rem != 0u);
 }
-// the hardware's results are within a few units of the correctly rounded ones, which one integer remainder tells: with normal
-// operands and results, the remainder gives how many units to move the result by, and checks that the exact quotient or root
-// is then within half a unit of it; anything else, rare, goes to the exact computation
+// the hardware's results are usually within a few units of the correctly rounded ones, which one integer remainder tells: with
+// normal operands and results, the remainder gives how many units to move the result by, and checks that the exact quotient
+// or root is then within half a unit of it; anything else, rare, goes to the exact computation, which only uses integers. The
+// remainder is computed in 32 bits, so the result must first be close enough for it to fit: an estimate of the remainder in
+// floats, off by at most 2^24, must be below 2^29. A result that far off goes to the exact computation too
 bool l_fdivfast(float a, float b, out float result)
 {
     float q = a / b;
@@ -202,7 +186,8 @@ bool l_fdivfast(float a, float b, out float result)
     int r = int((ma << (s & 31)) - qm * mb);
     int k = int(floor(float(r) * (1.0 / float(mb)) + 0.5));
     r -= k * int(mb);
-    bool normal = ea - 1u < 254u && eb - 1u < 254u && eq - 1u < 254u && uint(s - 23) <= 1u;
+    bool close = abs(float(ma) * (s == 23 ? 8388608.0 : 16777216.0) - float(qm) * float(mb)) < 536870912.0;
+    bool normal = ea - 1u < 254u && eb - 1u < 254u && eq - 1u < 254u && uint(s - 23) <= 1u && close;
     // the significand stays in its binade, where the remainder's scale holds
     result = uintBitsToFloat(uq + uint(k));
     if (normal && qm + uint(k) - 0x800000u < 0x800000u && uint(abs(r)) * 2u < mb)
@@ -240,7 +225,8 @@ float l_fsqrt(float a)
     int k = int(floor(float(int(x - qm * qm)) * (0.5 / float(qm)) + 0.5));
     uint root = qm + uint(k);
     int r = int(x - root * root);
-    bool normal = ua - 0x00800000u < 0x7f000000u && uint(t - 23) <= 1u;
+    bool close = abs(float(m) * (t == 23 ? 8388608.0 : 16777216.0) - float(qm) * float(qm)) < 536870912.0;
+    bool normal = ua - 0x00800000u < 0x7f000000u && uint(t - 23) <= 1u && close;
     if (normal && root - 0x800000u < 0x800000u && r > -int(root) && r <= int(root))
         return uintBitsToFloat(uq + uint(k));
     return l_fsqrtexact(a);

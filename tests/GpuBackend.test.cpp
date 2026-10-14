@@ -1057,6 +1057,80 @@ end
 )") == "");
 }
 
+TEST_CASE("division_and_square_roots_stay_exact_whatever_the_hardware_gives")
+{
+    // the hardware's division and square root only seed the exact ones: shaders whose seeds are a few units off, or hundreds
+    // (where a 32-bit remainder would wrap around), must still give the VM's bits
+    for (const char* error : {"1.0000003", "1.00005", "0.9998", "2.0"})
+    {
+        INFO("hardware results scaled by " << std::string(error));
+
+        std::unique_ptr<VulkanBackend> backend = createBackend();
+        if (!backend)
+            return;
+
+        std::string scale = error;
+        backend->setLowering(
+            [scale](lua_State* L, int idx)
+            {
+                CodeGen::GpuKernel kernel = CodeGen::compileGpu(L, idx);
+                for (std::string from : {"    float q = a / b;", "    float q = sqrt(a);"})
+                {
+                    size_t at = kernel.glsl.find(from);
+                    REQUIRE(at != std::string::npos);
+                    std::string to = from.substr(0, from.size() - 1) + " * " + scale + ";";
+                    kernel.glsl.replace(at, from.size(), to);
+                }
+                return kernel;
+            }
+        );
+
+        CHECK(run(*backend, R"(
+local N = 65536
+
+@gpu
+local function k(b: buffer, i: number)
+    local o = i * 16
+    local x, y = buffer.readf32(b, o), buffer.readf32(b, o + 4)
+    buffer.writef32(b, o + 8, (vector.create(x, 1, 1) / vector.create(y, 1, 1)).x)
+    buffer.writef32(b, o + 12, vector.magnitude(vector.create(x, 0, 0)))
+end
+
+local seed = 11
+local function rnd()
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    return seed
+end
+
+local onGpu = buffer.create(N * 16)
+for i = 0, N - 1 do
+    for w = 0, 1 do
+        local bits = (rnd() * 2 + rnd() % 2) % 4294967296
+        if rnd() % 2 == 0 then
+            bits = bit32.bor(bit32.band(bits, 0x807fffff), bit32.lshift(117 + rnd() % 20, 23))
+        end
+        buffer.writeu32(onGpu, i * 16 + w * 4, bits)
+    end
+end
+local inLuau = buffer.create(N * 16)
+buffer.copy(inLuau, 0, onGpu)
+
+assert(gpu.run(k, { onGpu }, N))
+for i = 0, N - 1 do
+    k(inLuau, i)
+end
+
+for i = 0, N - 1 do
+    for o = i * 16 + 8, i * 16 + 12, 4 do
+        local x, y = buffer.readf32(onGpu, o), buffer.readf32(inLuau, o)
+        local same = if x ~= x then y ~= y else buffer.readu32(onGpu, o) == buffer.readu32(inLuau, o)
+        assert(same, `index {i} word {(o - i * 16) // 4}: gpu {x} luau {y}`)
+    end
+end
+)") == "");
+    }
+}
+
 TEST_CASE("integers_that_floats_cant_hold_fail_the_run")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();
