@@ -249,12 +249,14 @@ float l_fsqrt(float a)
 // are: a result that overflows to an infinity from finite operands fails the run. Underflows to zero or denormal numbers
 // aren't checked: kernels routinely produce them (falloffs, x ^ 40 of a small x), and failing those would fail them
 bool l_finite(float x) { return !isinf(x) && !isnan(x); }
-float l_addr(float a, float b) { precise float r = a + b; if (isinf(r) && l_finite(a) && l_finite(b)) l_fail(); return r; }
-float l_subr(float a, float b) { precise float r = a - b; if (isinf(r) && l_finite(a) && l_finite(b)) l_fail(); return r; }
+// an infinity from operands that aren't infinite: NaN operands give NaN, not infinities
+bool l_overflow(float r, float a, float b) { return isinf(r) && !isinf(a) && !isinf(b); }
+float l_addr(float a, float b) { precise float r = a + b; if (l_overflow(r, a, b)) l_fail(); return r; }
+float l_subr(float a, float b) { precise float r = a - b; if (l_overflow(r, a, b)) l_fail(); return r; }
 float l_mulr(float a, float b)
 {
     precise float r = a * b;
-    if (isinf(r) && l_finite(a) && l_finite(b))
+    if (l_overflow(r, a, b))
         l_fail();
     return r;
 }
