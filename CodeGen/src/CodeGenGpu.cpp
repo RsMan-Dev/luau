@@ -909,6 +909,12 @@ struct GlslLowering
         }
     }
 
+    static bool powerOfTwo(double k)
+    {
+        int e;
+        return k != 0 && std::isfinite(k) && fabs(frexp(k, &e)) == 0.5;
+    }
+
     // the value of a double constant operand
     bool constNumber(IrOp op, double& v)
     {
@@ -2386,6 +2392,9 @@ struct GlslLowering
             // correctly rounded, so that quotients the VM gets exactly, like 37 / 37, are exact here too
             if (std::string scaled; scaledInt(OP_A(inst), OP_B(inst), true, scaled))
                 line(v + " = " + scaled + ";");
+            else if (double k; constNumber(OP_B(inst), k) && powerOfTwo(k) && fabs(k) >= 0x1p-126 && fabs(k) <= 0x1p126)
+                // dividing by a power of two is multiplying by its inverse, which is one too: both round the same quotient
+                line(v + " = l_mulr(" + num(OP_A(inst), c) + ", " + literal(1 / k, NumClass::Float) + ");");
             else
                 line(v + " = l_divr(" + num(OP_A(inst), c) + ", " + num(OP_B(inst), c) + ");");
             break;

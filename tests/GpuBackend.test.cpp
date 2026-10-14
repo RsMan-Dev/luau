@@ -1575,6 +1575,49 @@ end
 )") == "");
 }
 
+TEST_CASE("divisions_by_powers_of_two_are_exact_multiplications")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // x / 4 is x * 0.25, which rounds the same quotient, denormal ones included; one that overflows still fails the run
+    CHECK(run(*backend, std::string(kSquare) + R"(
+@gpu
+local function k(b: buffer, i: number)
+    local x = buffer.readf32(b, i * 16)
+    buffer.writef32(b, i * 16 + 4, x / 4)
+    buffer.writef32(b, i * 16 + 8, x / -0.5)
+    buffer.writef32(b, i * 16 + 12, x / 1024)
+end
+
+local values = { 0, -0, 1, 3, 1 / 0, 0 / 0, 1e-38, 3e-39, 1.4e-45, 1e38, -2.5e37 }
+local b = buffer.create(#values * 16)
+for i, x in values do
+    buffer.writef32(b, (i - 1) * 16, x)
+end
+local vm = copy(b)
+for i = 0, #values - 1 do
+    k(vm, i)
+end
+assert(gpu.run(k, { b }, #values))
+for i = 0, #values * 4 - 1 do
+    local g, v = buffer.readu32(b, i * 4), buffer.readu32(vm, i * 4)
+    local nan = bit32.band(g, 0x7f800000) == 0x7f800000 and bit32.band(g, 0x7fffff) ~= 0
+    assert(g == v or nan, `{i}: {g} vs {v}`)
+end
+
+@gpu
+local function overflow(b: buffer, i: number)
+    buffer.writef32(b, 4, buffer.readf32(b, 0) / 0.25)
+end
+local c = buffer.create(8)
+buffer.writef32(c, 0, 3e38)
+local ok, err = gpu.run(overflow, { c }, 1)
+assert(not ok and string.find(err, "float overflow", 1, true), err)
+)") == "");
+}
+
 TEST_CASE("runs_the_unchecked_variant_flags_run_again_checked")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend(VulkanOptions());
