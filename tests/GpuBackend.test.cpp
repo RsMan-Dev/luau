@@ -891,6 +891,116 @@ assert(buffer.readu32(b, 4) == 0xfffffff1)
 )") == "");
 }
 
+TEST_CASE("registers_holding_integers_and_floats_convert_only_where_a_class_is_needed")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // which numbers share a register depends on how the compiler allocates them, not on the code's meaning: joining paths
+    // converts nothing, comparisons are exact whatever the classes, and integers convert to floats where float math uses them
+    CHECK(run(*backend, std::string(kSquare) + R"(
+local function check(k, n: number, init)
+    local b = buffer.create(256)
+    init(b)
+    local vm = copy(b)
+    local ok, err = gpu.run(k, { b }, n)
+    for i = 0, n - 1 do
+        k(vm, i)
+    end
+    return ok, err, same(b, vm)
+end
+
+-- -1, then uints above 2^31
+@gpu
+local function best(b: buffer, i: number)
+    local bestKey = -1
+    for k = 0, 3 do
+        local key = buffer.readu32(b, k * 4)
+        if key > bestKey then
+            bestKey = key
+        end
+    end
+    buffer.writeu32(b, 16, bestKey)
+end
+local ok, err, matches = check(best, 1, function(b)
+    for k = 0, 3 do
+        buffer.writeu32(b, k * 4, 0x81000001 + k * 0x10000003)
+    end
+end)
+assert(ok and matches, err)
+
+-- an integer on a path and a float on another, compared, converted to an integer, or used in float math
+@gpu
+local function mixed(b: buffer, i: number)
+    local x = buffer.readf32(b, 0)
+    local k = buffer.readu32(b, 4 + i * 4)
+    if k > 0 then
+        x = k
+    end
+    if x > 16777216.5 then
+        buffer.writeu32(b, 64 + i * 4, x)
+    end
+    if buffer.readu32(b, 128) == 1 then
+        buffer.writef32(b, 96 + i * 4, x + 0.5)
+    end
+end
+local function init(big, useMath)
+    return function(b)
+        buffer.writef32(b, 0, 0.25)
+        buffer.writeu32(b, 8, big)
+        buffer.writeu32(b, 128, useMath)
+    end
+end
+ok, err, matches = check(mixed, 2, init(0x81000001, 0))
+assert(ok and matches, err)
+ok, err, matches = check(mixed, 2, init(0x40000000, 1))
+assert(ok and matches, err)
+-- float math on an integer a float can't hold still fails
+ok, err = check(mixed, 2, init(0x40000001, 1))
+assert(not ok and string.find(err, "failed on the GPU", 1, true), err)
+
+-- an integer from its halves times or divided by a power of two, or stored as a float, is rounded once as the VM rounds it
+@gpu
+local function halves(b: buffer, i: number)
+    local k = buffer.readu32(b, i * 4)
+    buffer.writef32(b, 64 + i * 4, (bit32.rshift(k, 8) * 256 + bit32.band(k, 255)) / 134217728)
+    buffer.writef32(b, 128 + i * 4, k * 0.5)
+    buffer.writef32(b, 192 + i * 4, k)
+end
+ok, err, matches = check(halves, 4, function(b)
+    for i, k in { 0x01000001, 0x7fffffff, 0xffffffff, 0x01000003 } do
+        buffer.writeu32(b, (i - 1) * 4, k)
+    end
+end)
+assert(ok and matches, err)
+
+-- uints above 2^24 against floats, and ints against uints
+@gpu
+local function compares(b: buffer, i: number)
+    local k = buffer.readu32(b, i * 4)
+    local f = buffer.readf32(b, 16 + i * 4)
+    local n = buffer.readi32(b, 32 + i * 4)
+    local r = 0
+    if k < f then r += 1 end
+    if k == f then r += 2 end
+    if k <= f then r += 4 end
+    if n < k then r += 8 end
+    if n == k then r += 16 end
+    buffer.writeu32(b, 64 + i * 4, r)
+end
+ok, err, matches = check(compares, 4, function(b)
+    local ks, fs, ns = { 0x01000001, 0x01000001, 0xffffffff, 7 }, { 16777216, 16777218, 4294967296, 7.5 }, { -1, 0x01000001, -5, 7 }
+    for i = 0, 3 do
+        buffer.writeu32(b, i * 4, ks[i + 1])
+        buffer.writef32(b, 16 + i * 4, fs[i + 1])
+        buffer.writei32(b, 32 + i * 4, ns[i + 1])
+    end
+end)
+assert(ok and matches, err)
+)") == "");
+}
+
 TEST_CASE("devices_that_break_the_kernel_contract_are_refused")
 {
 #if !defined(_WIN32)

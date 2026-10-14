@@ -65,16 +65,21 @@ A buffer listed several times runs several times, in the order of the list; diff
 - Numbers are 32-bit on the GPU. Integers stay exact: the lowering types each value as `int`, `uint` or `float` from how
   it's produced, and a result that wouldn't be the VM's (an integer overflow, an integer a float can't hold) fails the
   run. Whether a float holds an integer is a matter of its significant bits, not its magnitude: `2^26` and `0xffffff00`
-  convert, `16777217` doesn't. Vectors give the VM's bits: the VM computes them in f32 too, and the GPU rounds every operation the same way,
-  divisions and square roots included (computed with integers, since Vulkan only bounds their error), without
-  reordering them, and keeping NaN, infinities, signed zeros and denormal numbers. Other floating point math is f32
-  instead of the VM's f64, with every operation correctly rounded (division and square roots included): results differ
-  from the VM's by f32 rounding. Float literals round to f32 like any other result (`1e30`, `0.1`). A result whose class f32's narrower range changes fails the run when it overflows: an
-  infinity from finite operands (`1e30 * 1e10`, `math.exp(100)`, a literal beyond f32's range), which f64 would have kept
-  finite. Underflows don't: a product or quotient that f32 rounds to 0 or a denormal number where f64 has a tiny normal
-  number stays a result, since legitimate kernels produce them all the time (a falloff, `x ^ 40` of a small `x`; failing
-  them failed the rasterizer's shading). A later step can then still differ from the VM's in kind, as dividing by that
-  0, which is the one way scalar float results can be categorically different from the VM's.
+  convert, `16777217` doesn't. Numbers convert only where an operation needs another class: a register holding an
+  integer on a path and a float on another keeps each as it is, which joining the paths doesn't convert, and comparisons
+  between integers and floats, or ints and uints, are exact. Where the VM rounds the integer once, the GPU does too, so
+  it needn't be exact there: stored as a float (`buffer.writef32`, a vector component), or multiplied or divided by a
+  power of two (`k / 2^27`). Vectors give the VM's bits: the VM computes them in f32 too, and the GPU rounds every
+  operation the same way, divisions and square roots included (computed with integers, since Vulkan only bounds their
+  error), without reordering them, and keeping NaN, infinities, signed zeros and denormal numbers. Other floating point
+  math is f32 instead of the VM's f64, with every operation correctly rounded (division and square roots included):
+  results differ from the VM's by f32 rounding. Float literals round to f32 like any other result (`1e30`, `0.1`). A
+  result whose class f32's narrower range changes fails the run when it overflows: an infinity from finite operands
+  (`1e30 * 1e10`, `math.exp(100)`, a literal beyond f32's range), which f64 would have kept finite. Underflows don't: a
+  product or quotient that f32 rounds to 0 or a denormal number where f64 has a tiny normal number stays a result, since
+  legitimate kernels produce them all the time (a falloff, `x ^ 40` of a small `x`; failing them failed the rasterizer's
+  shading). A later step can then still differ from the VM's in kind, as dividing by that 0, which is the one way scalar
+  float results can be categorically different from the VM's.
 - Buffers stay on the GPU between runs. A run only uploads the 64 KB parts of a buffer that changed since the GPU last had
   it, and only downloads the parts its kernel wrote: kernels mark each part they write to, and the parts they don't are
   still those of the Luau buffer.

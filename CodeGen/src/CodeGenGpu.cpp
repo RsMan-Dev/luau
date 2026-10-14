@@ -36,7 +36,16 @@ enum class NumClass : uint8_t
     Uint,
     Int,
     Float,
+    // a register or loaded value holding numbers of several classes that no single one holds exactly, an integer on a path
+    // and a float on another, or a negative integer and a uint: each class keeps its variable and a marker tells which one
+    // holds the number, so that joining paths converts nothing and only an operation needing one class converts to it
+    Mixed,
 };
+
+uint8_t classBit(NumClass c)
+{
+    return c == NumClass::None || c == NumClass::Mixed ? 0 : uint8_t(1 << int(c));
+}
 
 const char* const kPrelude = R"(
 uint l_steps = 0u;
@@ -62,6 +71,26 @@ bool l_exactu(uint a) { return a == 0u || (a >> findLSB(a)) < 0x1000000u; }
 float l_i2f(int a) { if (!l_exactu(a < 0 ? uint(-a) : uint(a))) l_fail(); return float(a); }
 float l_inexact(float a) { l_fail(); return a; }
 float l_u2f(uint a) { if (!l_exactu(a)) l_fail(); return float(a); }
+// rounded to the nearest float, ties to even, as the VM rounds a double holding the integer
+float l_u2fr(uint a) {
+    if (l_exactu(a)) return float(a);
+    int e = findMSB(a) - 23;
+    uint m = a >> e, rest = a - (m << e), mid = 1u << (e - 1);
+    if (rest > mid || (rest == mid && (m & 1u) != 0u)) m++;
+    return float(m) * uintBitsToFloat(uint(127 + e) << 23);
+}
+float l_i2fr(int a) { float r = l_u2fr(a < 0 ? uint(-a) : uint(a)); return a < 0 ? -r : r; }
+// signs of a - b, compared exactly whatever the classes, NaN when unordered
+float l_cmpf(float a, float b) { return a < b ? -1.0 : a > b ? 1.0 : a == b ? 0.0 : uintBitsToFloat(0x7fc00000u); }
+float l_cmpuf(uint a, float b) {
+    if (l_exactu(a)) return l_cmpf(float(a), b);
+    if (!(b >= 0.0)) return b < 0.0 ? 1.0 : b;
+    if (b >= 4294967296.0) return -1.0;
+    uint t = uint(b);
+    return a < t ? -1.0 : a > t ? 1.0 : trunc(b) == b ? 0.0 : -1.0;
+}
+float l_cmpif(int a, float b) { return a < 0 ? -l_cmpuf(uint(-a), -b) : l_cmpuf(uint(a), b); }
+int l_cmpiu(int a, uint b) { return a < 0 || uint(a) < b ? -1 : uint(a) > b ? 1 : 0; }
 int l_f2i(float a) { if (!(a >= -2147483648.0 && a < 2147483648.0)) { l_fail(); return 0; } return int(a); }
 uint l_f2u(float a) { if (!(a > -2147483649.0 && a < 4294967296.0)) { l_fail(); return 0u; } return a >= 0.0 ? uint(a) : uint(int(a)); }
 float l_round(float a) { return sign(a) * floor(abs(a) + 0.5); }
@@ -404,6 +433,8 @@ struct RegState
     int buffer = -1;               // binding of its buffer, -1 for none, -2 when it isn't known statically
     GpuCall call = GpuCall::None;  // import it holds
     int tag = -1;                  // its tag, -1 when it isn't known statically
+    uint8_t kinds = 0;             // for Mixed, the classes of the numbers it may hold, as classBit
+    bool small = false;            // its integers are known to be within 2^24, which floats hold exactly
 };
 
 struct GlslLowering
@@ -417,6 +448,9 @@ struct GlslLowering
     std::vector<int> instBuffer;     // per instruction producing a buffer pointer or TValue
     std::vector<GpuCall> instCall;   // per instruction loading a TValue: the import it holds
     std::vector<int> instTag;        // per instruction loading a tag or TValue: the tag, -1 when it isn't known statically
+    std::vector<uint8_t> instKinds;  // per instruction of class Mixed: the classes of the numbers it may hold
+    std::vector<bool> instSmall;     // per instruction loading a TValue: its integers are known to be within 2^24
+    std::vector<bool> keepsMixed;    // per instruction: each use handles a number of class Mixed without converting it
 
     // bounds of the integer an instruction produces, which spare overflow checks when they fit its class
     struct Range
@@ -497,7 +531,7 @@ struct GlslLowering
         case IrOpKind::Inst:
             if (isTvalue(op) && function.instOp(op).cmd != IrCmd::LOAD_TVALUE)
                 return NumClass::Float;
-            return instClass[op.index];
+            return instClass[op.index] == NumClass::Mixed ? kindsClass(instKinds[op.index]) : instClass[op.index];
         case IrOpKind::Constant:
         {
             IrConst& c = function.constOp(op);
@@ -508,7 +542,7 @@ struct GlslLowering
             return NumClass::Float;
         }
         case IrOpKind::VmReg:
-            return cur[vmRegOp(op)].cls;
+            return cur[vmRegOp(op)].cls == NumClass::Mixed ? kindsClass(cur[vmRegOp(op)].kinds) : cur[vmRegOp(op)].cls;
         case IrOpKind::VmConst:
         {
             TValue* k = &proto->k[vmConstOp(op)];
@@ -519,10 +553,79 @@ struct GlslLowering
         }
     }
 
+    // the class numbers of several classes convert to for arithmetic
+    static NumClass kindsClass(uint8_t kinds)
+    {
+        NumClass c = NumClass::None;
+        for (NumClass k : {NumClass::NonNeg, NumClass::Uint, NumClass::Int, NumClass::Float})
+            if (kinds & classBit(k))
+                c = join(c, k);
+        return c;
+    }
+
+    // the variables of an operand of class Mixed: r<n> or v<n>, followed by a, u, f and m
+    bool mixed(IrOp op, std::string& base, uint8_t& kinds)
+    {
+        if (op.kind == IrOpKind::VmReg && cur[vmRegOp(op)].cls == NumClass::Mixed)
+        {
+            base = "r" + std::to_string(vmRegOp(op));
+            kinds = cur[vmRegOp(op)].kinds;
+            return true;
+        }
+        if (op.kind == IrOpKind::Inst && instClass[op.index] == NumClass::Mixed)
+        {
+            base = "v" + std::to_string(op.index);
+            kinds = instKinds[op.index];
+            return true;
+        }
+        return false;
+    }
+
+    // what f gives for the number of an operand, given its code and class; for an operand of class Mixed, that of the variable
+    // its marker designates: 0 for integers (a), 1 for floats (f), 2 for uints (u)
+    template<typename F>
+    std::string slots(IrOp op, F f)
+    {
+        std::string base;
+        uint8_t kinds;
+        if (!mixed(op, base, kinds))
+        {
+            Num n = num(op);
+            return f(n.code, n.cls);
+        }
+
+        std::vector<std::pair<std::string, std::string>> alts;
+        if (kinds & (classBit(NumClass::NonNeg) | classBit(NumClass::Int)))
+            alts.push_back({"0u", f(base + "a", kinds & classBit(NumClass::Int) ? NumClass::Int : NumClass::NonNeg)});
+        if (kinds & classBit(NumClass::Uint))
+            alts.push_back({"2u", f(base + "u", NumClass::Uint)});
+        if (kinds & classBit(NumClass::Float))
+            alts.push_back({"1u", f(base + "f", NumClass::Float)});
+
+        std::string code = alts.back().second;
+        for (size_t i = alts.size() - 1; i-- > 0;)
+            code = "(" + base + "m == " + alts[i].first + " ? " + alts[i].second + " : " + code + ")";
+        return code;
+    }
+
     // value of a double operand, in its own class
     Num num(IrOp op)
     {
         NumClass c = cls(op);
+
+        std::string base;
+        uint8_t kinds;
+        if (mixed(op, base, kinds))
+            return {
+                slots(
+                    op,
+                    [&](const std::string& code, NumClass from)
+                    {
+                        return convert(code, from, c, true);
+                    }
+                ),
+                c
+            };
 
         switch (op.kind)
         {
@@ -666,8 +769,64 @@ struct GlslLowering
 
     std::string num(IrOp op, NumClass to, bool exact = false)
     {
-        Num n = num(op);
-        return convert(n.code, n.cls, to, exact);
+        return slots(
+            op,
+            [&](const std::string& code, NumClass from)
+            {
+                return convert(code, from, to, exact);
+            }
+        );
+    }
+
+    // the double operand rounded to a float, as the VM rounds doubles to store them as floats: integers needn't be exact
+    std::string rounded(IrOp op)
+    {
+        return slots(
+            op,
+            [](const std::string& code, NumClass from)
+            {
+                return from == NumClass::Float ? code : from == NumClass::Uint ? "l_u2fr(" + code + ")" : "l_i2fr(" + code + ")";
+            }
+        );
+    }
+
+    // the double operand as NUM_TO_INT converts it, failing out of the range of ints, or as NUM_TO_UINT does, giving the bits
+    // of a uint, negative numbers wrapping
+    std::string toInt(IrOp op, bool bits)
+    {
+        return slots(
+            op,
+            [&](const std::string& code, NumClass from)
+            {
+                if (from == NumClass::Float)
+                    return bits ? "int(l_f2u(" + code + "))" : "l_f2i(" + code + ")";
+                return bits ? "int(" + code + ")" : convert(code, from, NumClass::Int);
+            }
+        );
+    }
+
+    // copies the variables of a number of class Mixed: those of the classes it may hold, and the marker
+    static std::string copyMixed(const std::string& to, const std::string& from, uint8_t kinds)
+    {
+        std::string code;
+        if (kinds & (classBit(NumClass::NonNeg) | classBit(NumClass::Int)))
+            code += to + "a = " + from + "a; ";
+        if (kinds & classBit(NumClass::Uint))
+            code += to + "u = " + from + "u; ";
+        if (kinds & classBit(NumClass::Float))
+            code += to + "f = " + from + "f; ";
+        return code + to + "m = " + from + "m;";
+    }
+
+    std::string storeNumber(int reg, IrOp value)
+    {
+        std::string base;
+        uint8_t kinds;
+        if (mixed(value, base, kinds))
+            return copyMixed("r" + std::to_string(reg), base, kinds);
+
+        Num n = num(value);
+        return numReg(reg, n.cls) + " = " + n.code + ";";
     }
 
     // the variable holding the number of a register when it's of that class
@@ -852,7 +1011,10 @@ struct GlslLowering
             double v = nvalue(&proto->k[vmConstOp(op)]);
             return v == floor(v) ? Range{v, v} : Range{};
         }
-        return classRange(cls(op));
+        Range r = classRange(cls(op));
+        if (op.kind == IrOpKind::VmReg && cur[vmRegOp(op)].small && r.lo > -INFINITY)
+            r = {std::max(r.lo, -16777216.0), std::min(r.hi, 16777216.0)};
+        return r;
     }
 
     Range resultRange(IrInst& inst)
@@ -927,8 +1089,16 @@ struct GlslLowering
         if (getCmdValueKind(inst.cmd) == IrValueKind::Double)
             instClass[index] = resultClass(inst);
 
+        // a register of class Mixed is loaded as it is when nothing needs one class of its numbers
+        if (inst.cmd == IrCmd::LOAD_DOUBLE && OP_A(inst).kind == IrOpKind::VmReg && cur[vmRegOp(OP_A(inst))].cls == NumClass::Mixed &&
+            keepsMixed[index])
+        {
+            instClass[index] = NumClass::Mixed;
+            instKinds[index] = cur[vmRegOp(OP_A(inst))].kinds;
+        }
+
         // only integers computed exactly have bounds; f32 rounding would move those of floats
-        if ((getCmdValueKind(inst.cmd) == IrValueKind::Double && instClass[index] != NumClass::Float) ||
+        if ((getCmdValueKind(inst.cmd) == IrValueKind::Double && instClass[index] != NumClass::Float && instClass[index] != NumClass::Mixed) ||
             getCmdValueKind(inst.cmd) == IrValueKind::Int)
             instRange[index] = resultRange(inst);
 
@@ -942,7 +1112,42 @@ struct GlslLowering
         {
             instClass[index] = cls(OP_A(inst));
             instCall[index] = OP_A(inst).kind == IrOpKind::VmReg ? cur[vmRegOp(OP_A(inst))].call : GpuCall::Unknown;
+            instSmall[index] = OP_A(inst).kind == IrOpKind::VmReg && cur[vmRegOp(OP_A(inst))].small;
+            if (OP_A(inst).kind == IrOpKind::VmReg && cur[vmRegOp(OP_A(inst))].cls == NumClass::Mixed)
+            {
+                instClass[index] = NumClass::Mixed;
+                instKinds[index] = cur[vmRegOp(OP_A(inst))].kinds;
+            }
         }
+    }
+
+    // integers within 2^24, which floats hold exactly
+    static bool small(Range r)
+    {
+        return r.lo >= -16777216.0 && r.hi <= 16777216.0;
+    }
+
+    // the classes of the numbers a register may hold, and whether its integers are small
+    static uint8_t kindsOf(const RegState& s)
+    {
+        return s.cls == NumClass::Mixed ? s.kinds : classBit(s.cls);
+    }
+
+    static bool smallInts(const RegState& s)
+    {
+        return s.small || (kindsOf(s) & ~classBit(NumClass::Float)) == 0;
+    }
+
+    // the class of a register holding numbers of these classes: one class when it holds them all exactly, which it does when
+    // integers are small enough for the larger class, otherwise Mixed
+    static void classify(RegState& s, uint8_t kinds, bool smallInts)
+    {
+        uint8_t ints = classBit(NumClass::NonNeg) | classBit(NumClass::Uint) | classBit(NumClass::Int);
+        bool split =
+            ((kinds & classBit(NumClass::Float)) && (kinds & ints)) || ((kinds & classBit(NumClass::Int)) && (kinds & classBit(NumClass::Uint)));
+        s.cls = split && !smallInts ? NumClass::Mixed : kindsClass(kinds);
+        s.kinds = s.cls == NumClass::Mixed ? kinds : 0;
+        s.small = smallInts;
     }
 
     // what registers hold after an instruction
@@ -973,11 +1178,13 @@ struct GlslLowering
             s.tag = knownTag(OP_B(inst));
             break;
         case IrCmd::STORE_DOUBLE:
-            s.cls = cls(OP_B(inst));
+            storeNumber(s, OP_B(inst));
             s.tag = cur[r].tag;
             break;
         case IrCmd::STORE_INT:
             s.cls = cur[r].cls;
+            s.kinds = cur[r].kinds;
+            s.small = cur[r].small;
             s.tag = cur[r].tag;
             break;
         case IrCmd::STORE_VECTOR:
@@ -987,13 +1194,20 @@ struct GlslLowering
         {
             IrOp src = OP_B(inst);
             if (src.kind == IrOpKind::Inst && function.instOp(src).cmd == IrCmd::LOAD_TVALUE)
-                s = {instClass[src.index], instBuffer[src.index] >= 0 ? instBuffer[src.index] : -1, instCall[src.index], instTag[src.index]};
+                s = {
+                    instClass[src.index],
+                    instBuffer[src.index] >= 0 ? instBuffer[src.index] : -1,
+                    instCall[src.index],
+                    instTag[src.index],
+                    instClass[src.index] == NumClass::Mixed ? instKinds[src.index] : uint8_t(0),
+                    instSmall[src.index]
+                };
             break;
         }
         case IrCmd::STORE_SPLIT_TVALUE:
             s.tag = knownTag(OP_B(inst));
             if (function.tagOp(OP_B(inst)) == LUA_TNUMBER)
-                s.cls = cls(OP_C(inst));
+                storeNumber(s, OP_C(inst));
             else if (function.tagOp(OP_B(inst)) == LUA_TBUFFER)
                 s.buffer = buffer(OP_C(inst));
             break;
@@ -1020,6 +1234,16 @@ struct GlslLowering
         cur[r] = s;
     }
 
+    void storeNumber(RegState& s, IrOp value)
+    {
+        std::string base;
+        if (mixed(value, base, s.kinds))
+            s.cls = NumClass::Mixed;
+        else
+            s.cls = cls(value);
+        s.small = s.cls != NumClass::Mixed && small(range(value));
+    }
+
     // merges what registers hold at a jump into what they hold when the target block starts
     void reach(IrOp target)
     {
@@ -1044,12 +1268,14 @@ struct GlslLowering
             }
 
             RegState m = {
-                join(to[r].cls, cur[r].cls),
+                NumClass::None,
                 to[r].buffer == cur[r].buffer ? to[r].buffer : -2,
                 to[r].call == cur[r].call ? to[r].call : GpuCall::Unknown,
                 to[r].tag == cur[r].tag ? to[r].tag : -1
             };
-            changed |= m.cls != to[r].cls || m.buffer != to[r].buffer || m.call != to[r].call || m.tag != to[r].tag;
+            classify(m, kindsOf(to[r]) | kindsOf(cur[r]), smallInts(to[r]) && smallInts(cur[r]));
+            changed |= m.cls != to[r].cls || m.kinds != to[r].kinds || m.small != to[r].small || m.buffer != to[r].buffer || m.call != to[r].call ||
+                       m.tag != to[r].tag;
             to[r] = m;
         }
     }
@@ -1086,6 +1312,46 @@ struct GlslLowering
         instCall.assign(size, GpuCall::None);
         instTag.assign(size, -1);
         instRange.assign(size, Range());
+        instKinds.assign(size, 0);
+        instSmall.assign(size, false);
+
+        // the uses that handle numbers of class Mixed: conversions to integers, comparisons and copies to registers
+        keepsMixed.assign(size, true);
+        for (IrInst& user : function.instructions)
+        {
+            for (size_t i = 0; i < user.ops.size(); i++)
+            {
+                IrOp op = user.ops[i];
+                if (op.kind != IrOpKind::Inst)
+                    continue;
+
+                bool keeps = false;
+                switch (user.cmd)
+                {
+                case IrCmd::NUM_TO_INT:
+                case IrCmd::NUM_TO_UINT:
+                    keeps = i == 0;
+                    break;
+                case IrCmd::JUMP_CMP_NUM:
+                case IrCmd::CHECK_CMP_NUM:
+                    keeps = i < 2;
+                    break;
+                case IrCmd::SELECT_NUM:
+                    keeps = i == 2 || i == 3;
+                    break;
+                case IrCmd::STORE_DOUBLE:
+                    keeps = i == 1;
+                    break;
+                case IrCmd::STORE_SPLIT_TVALUE:
+                    keeps = i == 2;
+                    break;
+                default:
+                    break;
+                }
+                if (!keeps)
+                    keepsMixed[op.index] = false;
+            }
+        }
 
         // the parameters are the buffer and the index
         std::vector<RegState> start(proto->maxstacksize);
@@ -1160,6 +1426,15 @@ struct GlslLowering
                 NumClass from = cur[r].cls;
                 if (from == NumClass::None || from == to[r].cls)
                     continue;
+
+                // into a register of class Mixed, the number stays in its variable, which the marker designates
+                if (to[r].cls == NumClass::Mixed)
+                {
+                    const char* marker = from == NumClass::Float ? "1u" : from == NumClass::Uint ? "2u" : "0u";
+                    moves += "r" + std::to_string(r) + "m = " + marker + "; ";
+                    continue;
+                }
+                CODEGEN_ASSERT(from != NumClass::Mixed);
 
                 std::string src = numReg(int(r), from);
                 std::string value = convert(src, from, to[r].cls, true);
@@ -1518,10 +1793,85 @@ struct GlslLowering
     }
 
     // compares two numbers in a class both fit in
+    // an integer times or divided by a power of two, whose product the VM gets exactly: rounding the integer to a float and
+    // scaling it gives the product rounded once, as other float operations are, so the integer needn't be exact
+    bool scaledInt(IrOp a, IrOp b, bool divide, std::string& code)
+    {
+        NumClass ca = cls(a);
+        if (ca == NumClass::None || ca == NumClass::Float)
+            return false;
+
+        double k;
+        if (b.kind == IrOpKind::Constant && function.constOp(b).kind == IrConstKind::Double)
+            k = function.doubleOp(b);
+        else if (b.kind == IrOpKind::VmConst && ttisnumber(&proto->k[vmConstOp(b)]))
+            k = nvalue(&proto->k[vmConstOp(b)]);
+        else
+            return false;
+
+        // nonzero products of integers below 2^32 stay normal floats
+        int e;
+        if (!(k > 0) || frexp(k, &e) != 0.5)
+            return false;
+        e = divide ? 1 - e : e - 1;
+        if (e < -126 || e > 95)
+            return false;
+
+        code = "(" + rounded(a) + " * " + literal(ldexp(1.0, e), NumClass::Float) + ")";
+        return true;
+    }
+
+    // comparisons are exact whatever the classes: an integer a float can't hold is compared exactly, not converted
     std::string compareNum(IrOp a, IrOp b, IrCondition cond)
     {
-        NumClass c = arith(cls(a), cls(b));
-        return compare(num(a, c), num(b, c), cond);
+        std::string base;
+        uint8_t kinds;
+        bool slotted = mixed(a, base, kinds) || mixed(b, base, kinds);
+        Range ra = range(a), rb = range(b);
+
+        return slots(
+            a,
+            [&](const std::string& x, NumClass cx)
+            {
+                return slots(
+                    b,
+                    [&](const std::string& y, NumClass cy)
+                    {
+                        return compareExact(x, cx, slotted ? classRange(cx) : ra, y, cy, slotted ? classRange(cy) : rb, cond);
+                    }
+                );
+            }
+        );
+    }
+
+    static std::string compareExact(const std::string& x, NumClass cx, Range rx, const std::string& y, NumClass cy, Range ry, IrCondition cond)
+    {
+        bool fx = cx == NumClass::Float, fy = cy == NumClass::Float;
+        if (fx != fy)
+        {
+            if (small(fx ? ry : rx))
+                return fx ? compare(x, "float(" + y + ")", cond) : compare("float(" + x + ")", y, cond);
+
+            NumClass ci = fx ? cy : cx;
+            std::string sign = (ci == NumClass::Uint ? "l_cmpuf(" : "l_cmpif(") + (fx ? y : x) + ", " + (fx ? x : y) + ")";
+            return fx ? compare("0.0", sign, cond) : compare(sign, "0.0", cond);
+        }
+
+        // an int and a uint compare as ints when the uint fits, as uints when the int isn't negative, and otherwise exactly
+        NumClass c = arith(cx, cy);
+        if ((cx == NumClass::Int && cy == NumClass::Uint) || (cx == NumClass::Uint && cy == NumClass::Int))
+        {
+            Range ri = cx == NumClass::Int ? rx : ry, ru = cx == NumClass::Int ? ry : rx;
+            if (ru.hi > 2147483647.0 && ri.lo >= 0)
+                c = NumClass::Uint;
+            else if (ru.hi > 2147483647.0)
+            {
+                std::string sign = cx == NumClass::Int ? "l_cmpiu(" + x + ", " + y + ")" : "l_cmpiu(" + y + ", " + x + ")";
+                return cx == NumClass::Int ? compare(sign, "0", cond) : compare("0", sign, cond);
+            }
+        }
+
+        return compare(convert(x, cx, c), convert(y, cy, c), cond);
     }
 
     std::string access(int binding, const std::string& offset, const char* op, const std::string& value = "")
@@ -1578,7 +1928,10 @@ struct GlslLowering
         case IrCmd::LOAD_POINTER:
             break;
         case IrCmd::LOAD_DOUBLE:
-            line(v + " = " + num(OP_A(inst), c) + ";");
+            if (c == NumClass::Mixed)
+                line(copyMixed(v, "r" + std::to_string(vmRegOp(OP_A(inst))), instKinds[index]));
+            else
+                line(v + " = " + num(OP_A(inst), c) + ";");
             break;
         case IrCmd::LOAD_INT:
             line(v + " = " + intv(OP_A(inst)) + ";");
@@ -1589,7 +1942,8 @@ struct GlslLowering
             if (a.kind == IrOpKind::VmReg)
             {
                 std::string r = "r" + std::to_string(vmRegOp(a));
-                line(v + "t = " + r + "t; " + v + "n = " + numReg(vmRegOp(a), cls(a)) + "; " + v + "i = " + r + "i; " + v + "v = " + r + "v;");
+                std::string number = c == NumClass::Mixed ? copyMixed(v, r, instKinds[index]) : v + "n = " + numReg(vmRegOp(a), cls(a)) + ";";
+                line(v + "t = " + r + "t; " + number + " " + v + "i = " + r + "i; " + v + "v = " + r + "v;");
             }
             else if (a.kind == IrOpKind::VmConst)
             {
@@ -1613,11 +1967,8 @@ struct GlslLowering
             line("r" + std::to_string(vmRegOp(OP_A(inst))) + "t = " + tag(OP_B(inst)) + ";");
             break;
         case IrCmd::STORE_DOUBLE:
-        {
-            Num n = num(OP_B(inst));
-            line(numReg(vmRegOp(OP_A(inst)), n.cls) + " = " + n.code + ";");
+            line(storeNumber(vmRegOp(OP_A(inst)), OP_B(inst)));
             break;
-        }
         case IrCmd::STORE_INT:
             line("r" + std::to_string(vmRegOp(OP_A(inst))) + "i = " + intv(OP_B(inst)) + ";");
             break;
@@ -1762,7 +2113,9 @@ struct GlslLowering
                 break;
             }
 
-            line(rs + "t = " + s + "t; " + numReg(r, instClass[src.index]) + " = " + s + "n; " + rs + "i = " + s + "i; " + rs + "v = " + s + "v;");
+            std::string number =
+                instClass[src.index] == NumClass::Mixed ? copyMixed(rs, s, instKinds[src.index]) : numReg(r, instClass[src.index]) + " = " + s + "n;";
+            line(rs + "t = " + s + "t; " + number + " " + rs + "i = " + s + "i; " + rs + "v = " + s + "v;");
             break;
         }
         case IrCmd::STORE_SPLIT_TVALUE:
@@ -1773,10 +2126,7 @@ struct GlslLowering
             line(rs + "t = " + std::to_string(t) + "u;");
 
             if (t == LUA_TNUMBER)
-            {
-                Num n = num(OP_C(inst));
-                line(numReg(r, n.cls) + " = " + n.code + ";");
-            }
+                line(storeNumber(r, OP_C(inst)));
             else if (t == LUA_TBOOLEAN)
                 line(rs + "i = " + intv(OP_C(inst)) + ";");
             else if (t != LUA_TBUFFER)
@@ -1794,7 +2144,11 @@ struct GlslLowering
         {
             std::string a = num(OP_A(inst), c), b = num(OP_B(inst), c);
             bool add = inst.cmd == IrCmd::ADD_NUM;
-            if (c == NumClass::Float)
+            if (std::string scaled; !add && c == NumClass::Float && scaledInt(OP_A(inst), OP_B(inst), false, scaled))
+                line(v + " = " + scaled + ";");
+            else if (std::string scaled; !add && c == NumClass::Float && scaledInt(OP_B(inst), OP_A(inst), false, scaled))
+                line(v + " = " + scaled + ";");
+            else if (c == NumClass::Float)
                 line(v + " = " + (add ? "l_addr(" : "l_mulr(") + a + ", " + b + ");");
             else
                 line(v + " = " + intArith(index, inst.cmd, OP_A(inst), OP_B(inst), c) + ";");
@@ -1816,7 +2170,10 @@ struct GlslLowering
             break;
         case IrCmd::DIV_NUM:
             // correctly rounded, so that quotients the VM gets exactly, like 37 / 37, are exact here too
-            line(v + " = l_divr(" + num(OP_A(inst), c) + ", " + num(OP_B(inst), c) + ");");
+            if (std::string scaled; scaledInt(OP_A(inst), OP_B(inst), true, scaled))
+                line(v + " = " + scaled + ";");
+            else
+                line(v + " = l_divr(" + num(OP_A(inst), c) + ", " + num(OP_B(inst), c) + ");");
             break;
         case IrCmd::IDIV_NUM:
         case IrCmd::MOD_NUM:
@@ -1954,18 +2311,12 @@ struct GlslLowering
             line(v + " = uint(" + intv(OP_A(inst)) + ");");
             break;
         case IrCmd::NUM_TO_INT:
-        {
-            Num a = num(OP_A(inst));
-            line(v + " = " + (a.cls == NumClass::Float ? "l_f2i(" + a.code + ")" : convert(a.code, a.cls, NumClass::Int)) + ";");
+            line(v + " = " + toInt(OP_A(inst), false) + ";");
             break;
-        }
         case IrCmd::NUM_TO_UINT:
-        {
             // out of range values are architecture specific in native code; here they fail the run
-            Num a = num(OP_A(inst));
-            line(v + " = int(" + (a.cls == NumClass::Float ? "l_f2u(" + a.code + ")" : a.code) + ");");
+            line(v + " = " + toInt(OP_A(inst), true) + ";");
             break;
-        }
         case IrCmd::FLOAT_TO_NUM:
             line(v + " = " + floatv(OP_A(inst)) + ";");
             break;
@@ -1973,7 +2324,7 @@ struct GlslLowering
             line(v + " = " + intv(OP_A(inst)) + ";");
             break;
         case IrCmd::NUM_TO_FLOAT:
-            line(v + " = " + num(OP_A(inst), NumClass::Float) + ";");
+            line(v + " = " + rounded(OP_A(inst)) + ";");
             break;
         case IrCmd::CHECK_TAG:
             if (knownTag(OP_A(inst)) >= 0 && knownTag(OP_A(inst)) == knownTag(OP_B(inst)))
@@ -2176,12 +2527,8 @@ struct GlslLowering
                 return reject(index, "an atomic with these arguments");
 
             // offsets are rounded toward zero and values wrap from the ranges the VM accepts, as in the gpu library
-            Num off = num(IrOp{IrOpKind::VmReg, uint32_t(ra + 2)});
-            Num val = num(IrOp{IrOpKind::VmReg, uint32_t(ra + 3)});
-            std::string offset = off.cls == NumClass::Float ? "l_f2i(" + off.code + ")" : convert(off.code, off.cls, NumClass::Int);
-            std::string operand = val.cls == NumClass::Float ? "l_f2u(" + val.code + ")"
-                                  : val.cls == NumClass::Int ? "uint(" + val.code + ")"
-                                                             : convert(val.code, val.cls, NumClass::Uint);
+            std::string offset = toInt(IrOp{IrOpKind::VmReg, uint32_t(ra + 2)}, false);
+            std::string operand = "uint(" + toInt(IrOp{IrOpKind::VmReg, uint32_t(ra + 3)}, true) + ")";
 
             int op = call == GpuCall::AtomicAdd ? 0 : 1;
             atomics[b] |= uint8_t(1 << op);
@@ -2203,7 +2550,7 @@ struct GlslLowering
     {
         if (op.kind == IrOpKind::Inst && getCmdValueKind(function.instOp(op).cmd) == IrValueKind::Float)
             return "v" + std::to_string(op.index);
-        return num(op, NumClass::Float);
+        return rounded(op);
     }
 
     // floats are 'precise', which keeps drivers from contracting or reordering operations: Vulkan rounds each of them
@@ -2211,6 +2558,11 @@ struct GlslLowering
     static std::string declType(NumClass c)
     {
         return c == NumClass::Float ? "precise float" : glslType(c);
+    }
+
+    static std::string mixedDecl(const std::string& v)
+    {
+        return "int " + v + "a = 0; uint " + v + "u = 0u; precise float " + v + "f = 0.0; uint " + v + "m = 0u;";
     }
 
     std::string declarations()
@@ -2221,7 +2573,7 @@ struct GlslLowering
         {
             std::string rs = "r" + std::to_string(r);
             decl += "    uint " + rs + "t = 0u; int " + rs + "i = 0; precise vec3 " + rs + "v = vec3(0.0); int " + rs + "a = 0; uint " + rs +
-                    "u = 0u; precise float " + rs + "f = 0.0;\n";
+                    "u = 0u; precise float " + rs + "f = 0.0; uint " + rs + "m = 0u;\n";
         }
 
         for (size_t i = 0; i < function.instructions.size(); i++)
@@ -2244,13 +2596,16 @@ struct GlslLowering
                 decl += "    precise float " + v + " = 0.0;\n";
                 break;
             case IrValueKind::Double:
-                decl += "    " + declType(instClass[i]) + " " + v + " = " + glslType(instClass[i]) + "(0);\n";
+                if (instClass[i] == NumClass::Mixed)
+                    decl += "    " + mixedDecl(v) + "\n";
+                else
+                    decl += "    " + declType(instClass[i]) + " " + v + " = " + glslType(instClass[i]) + "(0);\n";
                 break;
             case IrValueKind::Tvalue:
             {
                 NumClass c = inst.cmd == IrCmd::LOAD_TVALUE ? instClass[i] : NumClass::Float;
-                decl += "    uint " + v + "t = 0u; " + declType(c) + " " + v + "n = " + glslType(c) + "(0); int " + v + "i = 0; precise vec3 " + v +
-                        "v = vec3(0.0);\n";
+                std::string number = c == NumClass::Mixed ? mixedDecl(v) : declType(c) + " " + v + "n = " + glslType(c) + "(0);";
+                decl += "    uint " + v + "t = 0u; " + number + " int " + v + "i = 0; precise vec3 " + v + "v = vec3(0.0);\n";
                 break;
             }
             default:
