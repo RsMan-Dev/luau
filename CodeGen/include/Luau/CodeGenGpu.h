@@ -30,6 +30,10 @@ struct GpuKernel
 
     std::string glsl;
 
+    // the variant of the kernel that computes the divisions and square roots whose hardware results it can't correct
+    // cheaply, which the kernel fails with GpuFailure::NeedsExact on: larger and slower, but rarely needed
+    std::string exactGlsl() const;
+
     // whether the kernel writes its buffer (one entry)
     std::vector<bool> bufferWritten;
 };
@@ -49,6 +53,7 @@ enum class GpuFailure : uint8_t
     LoopBudget = 8,      // the run's loop iteration budget ran out
     Stopped = 9,         // the host stopped the run
     Fallback = 10,       // a value of a type the lowering doesn't handle there, which native code leaves to the VM
+    NeedsExact = 11,     // a division or square root only the kernel's exact variant computes, see GpuKernel::exactGlsl
 };
 
 // The reason gpu.run gives for a status word, like "the kernel failed on the GPU: integer overflow at line 12"

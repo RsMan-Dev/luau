@@ -60,7 +60,12 @@ ordinary `buffer`s that can also be called from Luau, and data layouts are writt
   kernel), which a script can't wait for. Several pipelines are created at once. A script that needs the result calls
   `gpu.run` again (the examples do); `VulkanOptions::waitForPipelines` and `luau-gpu --wait-for-pipelines` make runs
   wait instead. A kernel of more than 2 MB of GLSL is refused, with "Function cannot run in GPU", since its pipeline
-  would take a compile thread for most of an hour.
+  would take a compile thread for most of an hour. Each kernel has two variants: the one that runs first only notes
+  that a check failed, that a division or square root needs the exact computation (denormal numbers, a hardware result
+  too far off), or that a float result is infinite, and a run where it did runs again on the checked variant, compiled
+  the first time it's needed (a run can then return "being compiled" again), which gives the results and failures this
+  contract describes. The checks and the exact computations otherwise make kernels twice as slow, in the registers they
+  keep even when they don't run. The 64 runs after one that needed it start on the checked variant.
 - Arguments of the wrong type or out of range (`runs_per_buffer` must be an integer from 0 to 2^31-1, `buffers` an array
   of buffers) are mistakes in the script and raise errors, as in other libraries.
 

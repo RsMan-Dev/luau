@@ -1455,6 +1455,57 @@ end
 )") == "");
 }
 
+TEST_CASE("runs_the_unchecked_variant_flags_run_again_checked")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend(VulkanOptions());
+    if (!backend)
+        return;
+
+    // kernels run first without most checks and the exact computations, noting only that one would have been needed: a
+    // denormal quotient, an infinity (1 / 0 here, which the VM gives too), an integer a float can't hold. Those runs run
+    // again on the checked variant, which is compiled when first needed, so that results and failures are the same
+    CHECK(run(*backend, std::string(kSquare) + R"(
+@gpu
+local function k(b: buffer, i: number)
+    local x, y = buffer.readf32(b, i * 16), buffer.readf32(b, i * 16 + 4)
+    buffer.writef32(b, i * 16 + 8, x / y)
+    buffer.writef32(b, i * 16 + 12, math.sqrt(x))
+end
+
+local function runReady(fn, b, n)
+    local ok, err
+    repeat
+        ok, err = gpu.run(fn, { b }, n)
+    until err ~= "the kernel is being compiled for the GPU"
+    return ok, err
+end
+
+local b = buffer.create(48)
+buffer.writef32(b, 0, 3)
+buffer.writef32(b, 4, 7)
+buffer.writef32(b, 16, 1e-38)
+buffer.writef32(b, 20, 3)
+buffer.writef32(b, 32, 1)
+buffer.writef32(b, 36, 0)
+local vm = copy(b)
+for i = 0, 2 do
+    k(vm, i)
+end
+assert(runReady(k, b, 3))
+assert(same(b, vm))
+
+-- and failures are those of the checked variant, with their kind and line
+@gpu
+local function inexact(b: buffer, i: number)
+    buffer.writef32(b, 4, buffer.readu32(b, 0) + 0.5)
+end
+local c = buffer.create(8)
+buffer.writeu32(c, 0, 16777217)
+local ok, err = runReady(inexact, c, 1)
+assert(not ok and string.find(err, "integer too large for a float at line", 1, true), err)
+)") == "");
+}
+
 TEST_CASE("division_and_square_roots_stay_exact_whatever_the_hardware_gives")
 {
     // the hardware's division and square root only seed the exact ones: shaders whose seeds are a few units off, or hundreds

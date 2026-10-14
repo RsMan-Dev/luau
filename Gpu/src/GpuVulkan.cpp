@@ -175,6 +175,12 @@ struct KernelEntry
     std::string compileError;
     std::string glsl; // until the compile thread takes it
 
+    // the kernel's exact variant, compiled the first time a run of it needs it, and how many of the next runs use it
+    // directly: data that needed it once, as denormal numbers, likely needs it again
+    std::shared_ptr<KernelEntry> exact;
+    std::string exactGlsl;
+    int preferExact = 0;
+
     bool ready() const
     {
         return (flags.load(std::memory_order_acquire) & kReady) != 0;
@@ -588,6 +594,7 @@ struct VulkanBackend::Impl
     std::string buildPipeline(KernelEntry& entry, const std::string& glsl);
     std::string checkLimits(const KernelEntry& entry);
     KernelEntry* kernelFor(lua_State* L, int fn);
+    KernelEntry* exactFor(KernelEntry& kernel);
     BufferEntry* bufferFor(lua_State* L, int idx, bool create);
     Use* useFor(BufferEntry* entry, void* data);
 
@@ -980,6 +987,8 @@ VulkanBackend::Impl::~Impl()
         {
             if (entry->ready())
                 destroyPipeline(*entry);
+            if (entry->exact && entry->exact->ready())
+                destroyPipeline(*entry->exact);
         }
         vkDestroyPipelineCache(device, pipelineCache, nullptr);
         for (auto& [id, entry] : buffers)
@@ -1247,9 +1256,14 @@ void VulkanBackend::Impl::freeDeadBuffers()
         if (--kernel->users > 0)
             continue;
 
-        uint32_t old = kernel->flags.fetch_or(KernelEntry::kAbandoned, std::memory_order_acq_rel);
-        if ((old & KernelEntry::kReady) && !deviceBusy)
-            destroyPipeline(*kernel);
+        for (KernelEntry* k : {kernel, kernel->exact.get()})
+        {
+            if (!k)
+                continue;
+            uint32_t old = k->flags.fetch_or(KernelEntry::kAbandoned, std::memory_order_acq_rel);
+            if ((old & KernelEntry::kReady) && !deviceBusy)
+                destroyPipeline(*k);
+        }
         kernels.erase(kernel->key);
     }
 
@@ -1284,6 +1298,19 @@ std::string VulkanBackend::Impl::checkLimits(const KernelEntry& entry)
     if (sizeof(PushConstants) > limits.pushConstants)
         return "device doesn't support " + std::to_string(sizeof(PushConstants)) + " bytes of push constants";
     return "";
+}
+
+KernelEntry* VulkanBackend::Impl::exactFor(KernelEntry& kernel)
+{
+    if (!kernel.exact)
+    {
+        kernel.exact = std::make_shared<KernelEntry>();
+        kernel.exact->name = kernel.name;
+        kernel.exact->written = kernel.written;
+        kernel.exact->glsl = std::move(kernel.exactGlsl);
+        compiler->submit(kernel.exact);
+    }
+    return kernel.exact.get();
 }
 
 // the kernel of a function, lowered on its first run; functions lowering to the same shader share its pipeline
@@ -1324,6 +1351,7 @@ KernelEntry* VulkanBackend::Impl::kernelFor(lua_State* L, int fn)
         {
             if (!compiler)
                 compiler = std::make_unique<PipelineCompiler>(device, pipelineCache, uint32_t(sizeof(PushConstants)));
+            entry->exactGlsl = kernel.exactGlsl();
             entry->glsl = std::move(kernel.glsl);
             compiler->submit(entry);
         }
@@ -1475,30 +1503,60 @@ std::string VulkanBackend::Impl::run(lua_State* L, int fn, int list, uint32_t ru
     if (!kernel->reason.empty() || !CodeGen::isGpuEnvironmentSafe(L, fn))
         return kCannotRun;
 
-    std::string reason = prepare(L, *kernel, list, runs);
-    if (!reason.empty() || runs == 0 || listed.empty())
-        return reason;
-
-    record(*kernel, runs);
-    reason = submit();
-
-    // until the device copies are uploaded again, they can't be trusted
-    uint32_t failure = *(volatile uint32_t*)status.mapped;
-    if (!reason.empty() || failure != 0)
+    // the kernel's exact variant runs instead when it needs it, which a run that needed it says. Its runs are discarded
+    // like failed ones: the buffers are uploaded again for the variant
+    KernelEntry* used = kernel;
+    if (kernel->preferExact > 0 && kernel->exact && kernel->exact->ready() && kernel->exact->compileError.empty())
     {
-        for (Use& u : uses)
-            u.entry->valid = false;
+        kernel->preferExact--;
+        used = kernel->exact.get();
+    }
 
-        if (!reason.empty())
+    std::string reason;
+    uint32_t failure = 0;
+    for (;;)
+    {
+        reason = prepare(L, *used, list, runs);
+        if (!reason.empty() || runs == 0 || listed.empty())
             return reason;
 
+        record(*used, runs);
+        reason = submit();
+
+        // until the device copies are uploaded again, they can't be trusted
+        failure = *(volatile uint32_t*)status.mapped;
+        if (!reason.empty() || failure != 0)
+        {
+            for (Use& u : uses)
+                u.entry->valid = false;
+        }
+        if (!reason.empty() || (failure >> 24) != uint32_t(CodeGen::GpuFailure::NeedsExact) || used != kernel)
+            break;
+
+        KernelEntry* exact = exactFor(*kernel);
+        if (!exact->ready())
+        {
+            if (!options.waitForPipelines)
+                return kCompiling;
+            compiler->wait(*exact);
+        }
+        if (!exact->compileError.empty())
+            return kCannotRun;
+        kernel->preferExact = 64;
+        used = exact;
+    }
+
+    if (!reason.empty())
+        return reason;
+    if (failure != 0)
+    {
         stats.failures++;
         return CodeGen::describeGpuFailure(failure);
     }
 
     // the parts the kernel didn't write are still those the Luau buffers have, since they were uploaded or found the same;
     // the parts it wrote are downloaded
-    if (kernel->written[0])
+    if (used->written[0])
     {
         reason = download();
         if (!reason.empty())

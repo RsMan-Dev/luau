@@ -458,7 +458,8 @@ def main():
     returncode = 0
     stderr = ""
     while True:
-        command = ["stdbuf", "-oL", args.luau_gpu, path] + ([f"{resume[0]}:{resume[1]}"] if resume else [])
+        # the fuzzer compares results, so runs wait for their kernel instead of returning while it compiles
+        command = ["stdbuf", "-oL", args.luau_gpu, "--wait-for-pipelines", path] + ([f"{resume[0]}:{resume[1]}"] if resume else [])
         try:
             proc = subprocess.run(command, capture_output=True, text=True, timeout=args.timeout)
         except subprocess.TimeoutExpired as e:

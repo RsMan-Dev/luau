@@ -51,10 +51,20 @@ const char* const kPrelude = R"(
 uint l_steps = 0u;
 // the first failure of a run gives its kind and source line, see GpuFailure. An invocation notes its first one and reports it
 // once it returns, which compiles much faster than an atomic at each check: drivers take a time growing faster than the code
-// with each side effect in a branch
+// with each side effect in a branch.
+// Kernels have two variants. The checked one, compiled with L_EXACT, computes every division and square root exactly and
+// tells which check failed where. The other, which runs first, only notes that a check failed, a division or square root
+// needed the exact computation, or a float result is infinite, which an overflow would give; the host then runs the checked
+// variant instead, so that both give the same results and failures. The checks cost kernels twice their time otherwise, in
+// the registers they keep. Stopping, the loop budget and fallbacks, which end the invocation, are told in both
 uint l_at = 0u;
 uint l_err = 0u;
+#ifdef L_EXACT
 void l_fail(uint kind) { if (l_err == 0u) l_err = (kind << 24) | l_at; }
+#else
+bool l_flag = false;
+void l_fail(uint kind) { if (kind < 8u) l_flag = true; else if (l_err == 0u) l_err = (kind << 24) | l_at; }
+#endif
 bool l_bad(int off, int b) { return off < 0 || (off & 3) != 0 || uint(off) + 4u > pc.len[b]; }
 int l_chk(bool bad, int r) { if (bad) l_fail(2u); return r; }
 uint l_chk(bool bad, uint r) { if (bad) l_fail(2u); return r; }
@@ -117,6 +127,9 @@ vec3 l_maxv(vec3 a, vec3 b) { return mix(b, a, greaterThan(a, b)); }
 // Vulkan only bounds the error of division and square roots, which the VM rounds correctly for vectors (f32): these start
 // from the hardware's result and correct it with exact integer arithmetic. A finite nonzero float is m * 2^(e - 150) with
 // m in [2^23, 2^24) once denormals are normalized
+// the exact computations, which cost kernels time even when they don't run, are only in the variant of the kernel compiled
+// with L_EXACT: the other notes that it needs them, and the host runs the variant instead
+#ifdef L_EXACT
 uint l_fmant(uint u, out int e)
 {
     e = int((u >> 23) & 0xffu);
@@ -206,6 +219,7 @@ float l_fsqrtexact(float a)
     }
     return l_fround(0u, (e - 127) / 2 + 127, root, rem != 0u);
 }
+#endif
 // the hardware's results are usually within a few units of the correctly rounded ones, which one integer remainder tells: with
 // normal operands and results, the remainder gives how many units to move the result by, and checks that the exact quotient
 // or root is then within half a unit of it; anything else, rare, goes to the exact computation, which only uses integers. The
@@ -273,18 +287,29 @@ bool l_fdivfast(float a, float b, out float result)
 float l_fdiv(float a, float b)
 {
     float q;
+#ifdef L_EXACT
     return l_fdivfast(a, b, q) ? q : l_fdivexact(a, b);
+#else
+    if (!l_fdivfast(a, b, q))
+        l_flag = true;
+    return q;
+#endif
 }
 // the exact computation is in a loop the compiler keeps, so that its code isn't repeated for each component
 vec3 l_fdivv(vec3 a, vec3 b)
 {
     vec3 q;
     bvec3 fast = bvec3(l_fdivfast(a.x, b.x, q.x), l_fdivfast(a.y, b.y, q.y), l_fdivfast(a.z, b.z, q.z));
+#ifdef L_EXACT
     [[dont_unroll]] for (int c = 0; c < 3; c++)
     {
         if (!fast[c])
             q[c] = l_fdivexact(a[c], b[c]);
     }
+#else
+    if (!all(fast))
+        l_flag = true;
+#endif
     return q;
 }
 float l_fsqrt(float a)
@@ -326,7 +351,12 @@ float l_fsqrt(float a)
         return a;
     if (ua > 0x7f800000u)
         return uintBitsToFloat(0x7fc00000u);
+#ifdef L_EXACT
     return l_fsqrtexact(a);
+#else
+    l_flag = true;
+    return q;
+#endif
 }
 // scalar math is f32 where the VM's is f64, so results are rounded more, but f32's narrower range would also change what they
 // are: a result that overflows to an infinity from finite operands fails the run. Underflows to zero or denormal numbers
@@ -336,16 +366,21 @@ float l_fsqrt(float a)
 // stop word whatever the values. An overflow notes its line plus one, the last one winning, which compiles faster than keeping
 // the first and is the same in practice: once infinite, a value doesn't overflow again
 uint l_ovf = 0u;
+#ifdef L_EXACT
+void l_note(bool overflowed, float r) { if (overflowed) l_ovf = l_at + 1u; }
+#else
+void l_note(bool overflowed, float r) { if (isinf(r)) l_flag = true; }
+#endif
 bool l_finite(float x) { return !isinf(x) && !isnan(x); }
 // an infinity from operands that aren't infinite: NaN operands give NaN, not infinities
 bool l_overflow(float r, float a, float b) { return isinf(r) && max(abs(a), abs(b)) < uintBitsToFloat(0x7f800000u); }
-float l_addr(float a, float b) { precise float r = a + b; if (l_overflow(r, a, b)) l_ovf = l_at + 1u; return r; }
-float l_subr(float a, float b) { precise float r = a - b; if (l_overflow(r, a, b)) l_ovf = l_at + 1u; return r; }
-float l_mulr(float a, float b) { precise float r = a * b; if (l_overflow(r, a, b)) l_ovf = l_at + 1u; return r; }
+float l_addr(float a, float b) { precise float r = a + b; l_note(l_overflow(r, a, b), r); return r; }
+float l_subr(float a, float b) { precise float r = a - b; l_note(l_overflow(r, a, b), r); return r; }
+float l_mulr(float a, float b) { precise float r = a * b; l_note(l_overflow(r, a, b), r); return r; }
 // dividing by zero gives an infinity in the VM too
-float l_divr(float a, float b) { float r = l_fdiv(a, b); if (l_overflow(r, a, b) && b != 0.0) l_ovf = l_at + 1u; return r; }
-float l_expr(float a) { float r = exp(a); if (isinf(r) && l_finite(a)) l_ovf = l_at + 1u; return r; }
-float l_rngr(float r, float a) { if (isinf(r) && l_finite(a)) l_ovf = l_at + 1u; return r; }
+float l_divr(float a, float b) { float r = l_fdiv(a, b); l_note(l_overflow(r, a, b) && b != 0.0, r); return r; }
+float l_expr(float a) { float r = exp(a); l_note(isinf(r) && l_finite(a), r); return r; }
+float l_rngr(float r, float a) { l_note(isinf(r) && l_finite(a), r); return r; }
 float l_fmod(float a, float b) { return b == 0.0 ? uintBitsToFloat(0x7fc00000u) : a - b * trunc(l_fdiv(a, b)); }
 )";
 
@@ -2647,7 +2682,7 @@ struct GlslLowering
         case LBF_MATH_POW:
             // 0 ^ -1 is infinite in the VM too
             line(v + " = l_pow(" + a + ", " + b + ");");
-            line("if (" + a + " != 0.0 && l_finite(" + a + ") && l_finite(" + b + ") && isinf(" + v + ")) l_ovf = l_at + 1u;");
+            line("l_note(" + a + " != 0.0 && l_finite(" + a + ") && l_finite(" + b + ") && isinf(" + v + "), " + v + ");");
             return true;
         case LBF_MATH_FMOD:
             line(v + " = l_fmod(" + a + ", " + b + ");");
@@ -2884,6 +2919,7 @@ struct GlslLowering
         glsl += "    if (gid >= pc.n) return;\n    if (gid == 0u) st.started = 1u;\n    if (st.stop != 0)\n        l_fail(9u);\n    else\n        "
                 "l_kernel(int(gid));\n"
                 "    if (l_ovf != 0u && l_err == 0u)\n        l_err = (6u << 24) | (l_ovf - 1u);\n"
+                "#ifndef L_EXACT\n    if (l_flag && l_err == 0u)\n        l_err = 11u << 24;\n#endif\n"
                 "    if (l_err != 0u)\n        atomicCompSwap(st.err, 0u, l_err);\n}\n";
 
         return true;
@@ -2955,6 +2991,14 @@ static GpuKernel compileProto(Proto* proto, LuaTable* env)
     return kernel;
 }
 
+std::string GpuKernel::exactGlsl() const
+{
+    size_t line = glsl.find('\n');
+    if (line == std::string::npos)
+        return glsl;
+    return glsl.substr(0, line + 1) + "#define L_EXACT\n" + glsl.substr(line + 1);
+}
+
 std::string describeGpuFailure(uint32_t status)
 {
     static const char* const kKinds[] = {
@@ -2969,6 +3013,7 @@ std::string describeGpuFailure(uint32_t status)
         "loop limit reached",
         "stopped by the host",
         "value of a type the kernel doesn't handle there",
+        "division or square root that needs the exact computation",
     };
 
     uint32_t kind = status >> 24, line = status & 0xffffff;
