@@ -67,8 +67,13 @@ A buffer listed several times runs several times, in the order of the list; diff
   run. Vectors give the VM's bits: the VM computes them in f32 too, and the GPU rounds every operation the same way,
   divisions and square roots included (computed with integers, since Vulkan only bounds their error), without
   reordering them, and keeping NaN, infinities, signed zeros and denormal numbers. Other floating point math is f32
-  instead of the VM's f64, with correctly rounded operations: results can differ by rounding, and values beyond the f32
-  range overflow or underflow sooner.
+  instead of the VM's f64, with every operation correctly rounded (division and square roots included): results differ
+  from the VM's by f32 rounding. A result whose class f32's narrower range changes fails the run when it overflows: an
+  infinity from finite operands (`1e30 * 1e10`, `math.exp(100)`, a literal beyond f32's range), which f64 would have kept
+  finite. Underflows don't: a product or quotient that f32 rounds to 0 or a denormal number where f64 has a tiny normal
+  number stays a result, since legitimate kernels produce them all the time (a falloff, `x ^ 40` of a small `x`; failing
+  them failed the rasterizer's shading). A later step can then still differ from the VM's in kind, as dividing by that
+  0, which is the one way scalar float results can be categorically different from the VM's.
 - Buffers stay on the GPU between runs. A run only uploads the 64 KB parts of a buffer that changed since the GPU last had
   it, and only downloads the parts its kernel wrote: kernels mark each part they write to, and the parts they don't are
   still those of the Luau buffer.
@@ -88,9 +93,11 @@ A kernel can only touch the buffer it's given, and a run either completes cleanl
   of GLSL, GLSL ES, MSL or HLSL
 - lowering, GLSL to SPIR-V compilation, SPIR-V validation, pipeline creation, device limits (storage buffer range,
   workgroup count, push constant size), allocation, submission and a zero status word must all succeed
-- devices are checked when the backend is created: a probe kernel must keep NaN, infinities, signed zeros and denormal numbers, and see the
-  host asking it to stop. Feature bits aren't enough: llvmpipe reports SignedZeroInfNanPreserve and folds `inf - inf` to 0.
-  A device that fails is refused
+- devices are checked when the backend is created: a probe kernel must keep NaN, infinities, signed zeros and denormal
+  numbers, and see the host asking it to stop. Feature bits aren't trusted either way: llvmpipe reports
+  SignedZeroInfNanPreserve and folds `inf - inf` to 0, and NVIDIA reports no DenormPreserve for f32 yet keeps denormal
+  numbers when shaders declare it (and flushes them when they don't). Shaders always declare both modes, and a device
+  whose probe doesn't behave as they require is refused
 - a run that doesn't finish within `VulkanOptions::timeoutMs` (5 s by default) or a lost device disables the backend for
   good: its results are never copied back and every later run fails
 - the backend is thread-safe

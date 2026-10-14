@@ -245,6 +245,35 @@ float l_fsqrt(float a)
         return uintBitsToFloat(uq + uint(k));
     return l_fsqrtexact(a);
 }
+// scalar math is f32 where the VM's is f64, so results are rounded more, but f32's narrower range would also change what they
+// are: a result that overflows to an infinity from finite operands fails the run. Underflows to zero or denormal numbers
+// aren't checked: kernels routinely produce them (falloffs, x ^ 40 of a small x), and failing those would fail them
+bool l_finite(float x) { return !isinf(x) && !isnan(x); }
+float l_addr(float a, float b) { precise float r = a + b; if (isinf(r) && l_finite(a) && l_finite(b)) l_fail(); return r; }
+float l_subr(float a, float b) { precise float r = a - b; if (isinf(r) && l_finite(a) && l_finite(b)) l_fail(); return r; }
+float l_mulr(float a, float b)
+{
+    precise float r = a * b;
+    if (isinf(r) && l_finite(a) && l_finite(b))
+        l_fail();
+    return r;
+}
+float l_divr(float a, float b)
+{
+    float r = l_fdiv(a, b);
+    // dividing by zero gives an infinity in the VM too
+    if (isinf(r) && l_finite(a) && l_finite(b) && b != 0.0)
+        l_fail();
+    return r;
+}
+float l_expr(float a)
+{
+    float r = exp(a);
+    if (isinf(r) && l_finite(a))
+        l_fail();
+    return r;
+}
+float l_rngr(float r, float a) { if (isinf(r) && l_finite(a)) l_fail(); return r; }
 float l_fmod(float a, float b) { return b == 0.0 ? uintBitsToFloat(0x7fc00000u) : a - b * trunc(l_fdiv(a, b)); }
 )";
 
@@ -281,8 +310,8 @@ std::string literal(double v, NumClass c)
         std::string s = buf;
         if (s.find_first_of(".e") == std::string::npos)
             s += ".0";
-        // as for conversions, an integer that a float can't hold fails the run
-        if (v == floor(v) && double(float(v)) != v)
+        // as for conversions, an integer that a float can't hold fails the run, as does a number beyond the range of floats
+        if ((v == floor(v) && double(float(v)) != v) || fabs(v) > 3.4028234663852886e38)
             return "l_inexact(float(" + s + "))";
         return "float(" + s + ")";
     }
@@ -1790,20 +1819,20 @@ struct GlslLowering
             std::string a = num(OP_A(inst), c), b = num(OP_B(inst), c);
             bool add = inst.cmd == IrCmd::ADD_NUM;
             if (c == NumClass::Float)
-                line(v + " = " + a + (add ? " + " : " * ") + b + ";");
+                line(v + " = " + (add ? "l_addr(" : "l_mulr(") + a + ", " + b + ");");
             else
                 line(v + " = " + intArith(index, inst.cmd, OP_A(inst), OP_B(inst), c) + ";");
             break;
         }
         case IrCmd::SUB_NUM:
             if (c == NumClass::Float)
-                line(v + " = " + num(OP_A(inst), c) + " - " + num(OP_B(inst), c) + ";");
+                line(v + " = l_subr(" + num(OP_A(inst), c) + ", " + num(OP_B(inst), c) + ");");
             else
                 line(v + " = " + intArith(index, inst.cmd, OP_A(inst), OP_B(inst), c) + ";");
             break;
         case IrCmd::MULADD_NUM:
             if (c == NumClass::Float)
-                line(v + " = " + num(OP_A(inst), c) + " * " + num(OP_B(inst), c) + " + " + num(OP_C(inst), c) + ";");
+                line(v + " = l_addr(l_mulr(" + num(OP_A(inst), c) + ", " + num(OP_B(inst), c) + "), " + num(OP_C(inst), c) + ");");
             else if (c == NumClass::Uint)
                 line(v + " = l_addu(l_mulu(" + num(OP_A(inst), c) + ", " + num(OP_B(inst), c) + "), " + num(OP_C(inst), c) + ");");
             else
@@ -1811,7 +1840,7 @@ struct GlslLowering
             break;
         case IrCmd::DIV_NUM:
             // correctly rounded, so that quotients the VM gets exactly, like 37 / 37, are exact here too
-            line(v + " = l_fdiv(" + num(OP_A(inst), c) + ", " + num(OP_B(inst), c) + ");");
+            line(v + " = l_divr(" + num(OP_A(inst), c) + ", " + num(OP_B(inst), c) + ");");
             break;
         case IrCmd::IDIV_NUM:
         case IrCmd::MOD_NUM:
@@ -1819,7 +1848,10 @@ struct GlslLowering
             std::string a = num(OP_A(inst), c), b = num(OP_B(inst), c);
             bool idiv = inst.cmd == IrCmd::IDIV_NUM;
             if (c == NumClass::Float)
-                line(v + " = " + (idiv ? "floor(l_fdiv(" + a + ", " + b + "))" : a + " - floor(l_fdiv(" + a + ", " + b + ")) * " + b) + ";");
+                line(
+                    v + " = " +
+                    (idiv ? "floor(l_divr(" + a + ", " + b + "))" : "l_subr(" + a + ", l_mulr(floor(l_divr(" + a + ", " + b + ")), " + b + "))") + ";"
+                );
             else
                 line(v + " = " + intArith(index, inst.cmd, OP_A(inst), OP_B(inst), c) + ";");
             break;
@@ -2083,7 +2115,7 @@ struct GlslLowering
         switch (function.uintOp(OP_A(inst)))
         {
         case LBF_MATH_EXP:
-            line(v + " = exp(" + a + ");");
+            line(v + " = l_expr(" + a + ");");
             return true;
         case LBF_MATH_LOG:
             line(v + " = l_log(" + a + ");");
@@ -2110,7 +2142,7 @@ struct GlslLowering
                              : id == LBF_MATH_SINH ? "sinh("
                              : id == LBF_MATH_COSH ? "cosh("
                                                    : "tanh(";
-            line(v + " = " + fn + a + ");");
+            line(v + " = l_rngr(" + fn + a + "), " + a + ");");
             return true;
         }
         case LBF_MATH_ASIN:
@@ -2123,7 +2155,9 @@ struct GlslLowering
             line(v + " = atan(" + a + ", " + b + ");");
             return true;
         case LBF_MATH_POW:
+            // 0 ^ -1 is infinite in the VM too
             line(v + " = l_pow(" + a + ", " + b + ");");
+            line("if (" + a + " != 0.0 && l_finite(" + a + ") && l_finite(" + b + ") && isinf(" + v + ")) l_fail();");
             return true;
         case LBF_MATH_FMOD:
             line(v + " = l_fmod(" + a + ", " + b + ");");

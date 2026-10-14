@@ -13,6 +13,8 @@
 //     a runaway kernel takes. Invocation 0 sets 'started', so that the host measures that time from when the run starts
 //   - binding 2: a word per 2^kWrittenChunkShift bytes of the buffer, from PushConstants::written; kernels set the word of
 //     each part of the buffer they write to a nonzero value, and the host only downloads those parts
+//   - execution modes: SignedZeroInfNanPreserve and DenormPreserve for 32-bit floats, which the device must honor whatever
+//     its feature bits say (the Vulkan backend checks it with a probe kernel)
 //   - push constants: GpuPushConstants
 //   - workgroups of kGpuWorkgroupSize invocations along x; invocation index = x + y * groupsX * kGpuWorkgroupSize
 namespace Luau

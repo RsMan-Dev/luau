@@ -1112,8 +1112,8 @@ std::string VulkanBackend::Impl::run(lua_State* L, int fn, int list, uint32_t ru
             return reason;
 
         stats.failures++;
-        return "the kernel failed on the GPU (out of bounds or unaligned access, integer overflow, inexact integer conversion or "
-               "loop limit)";
+        return "the kernel failed on the GPU (out of bounds or unaligned access, integer overflow, inexact integer conversion, float "
+               "overflow or loop limit)";
     }
 
     // the parts the kernel didn't write are still those the Luau buffers have, since they were uploaded or found the same;

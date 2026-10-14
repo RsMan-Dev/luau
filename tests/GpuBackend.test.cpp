@@ -1095,6 +1095,49 @@ assert(buffer.readf32(b, 4) == 4, buffer.readf32(b, 4))
 )") == "");
 }
 
+TEST_CASE("float_results_that_overflow_where_doubles_dont_fail_the_run")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // scalar math is f64 in the VM: -1e10 * 4.6e28 is finite there, times 0 it's -0; in f32 it's -inf, times 0 NaN
+    CHECK(run(*backend, std::string(kSquare) + R"(
+@gpu
+local function product(b: buffer, i: number)
+    local t, d, z = buffer.readf32(b, 0), buffer.readf32(b, 4), buffer.readf32(b, 8)
+    buffer.writef32(b, 12, (t * d) * z)
+end
+
+@gpu
+local function power(b: buffer, i: number)
+    -- e^100 is finite in f64
+    buffer.writef32(b, 12, math.exp(buffer.readf32(b, 8) + 100))
+end
+
+local b = buffer.create(16)
+buffer.writef32(b, 0, -1e10)
+buffer.writef32(b, 4, 4.6e28)
+local before = copy(b)
+for _, k in { product, power } do
+    local ok, err = gpu.run(k, { b }, 1)
+    assert(not ok and string.find(err, "float overflow", 1, true), err)
+    assert(same(b, before))
+end
+
+-- infinities the VM gets too, and underflows, are results
+@gpu
+local function legit(b: buffer, i: number)
+    local x = buffer.readf32(b, 0)
+    buffer.writef32(b, 4, 1 / x)
+    buffer.writef32(b, 8, (x * 1e-20 + 1e-30) ^ 2)
+end
+local c = buffer.create(12)
+assert(gpu.run(legit, { c }, 1))
+assert(buffer.readf32(c, 4) == math.huge and buffer.readf32(c, 8) == 0)
+)") == "");
+}
+
 TEST_CASE("kernels_that_crashed_the_spirv_optimizer_run_on_the_gpu")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();
