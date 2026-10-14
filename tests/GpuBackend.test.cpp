@@ -72,8 +72,8 @@ std::string run(VulkanBackend* backend, const std::string& source, int interrupt
     luaL_openlibs(L);
     openGpuLibrary(L, backend, "no device");
 
-    // backendstats() returns the device memory and the kernels the backend keeps, the memory it allocated for buffers, and
-    // the runs that ran again on the checked variant; collect() runs a full GC cycle
+    // backendstats() returns the device memory and the kernels the backend keeps, the memory it allocated for buffers, the
+    // runs that ran again on the checked variant, and the command buffers submitted; collect() runs a full GC cycle
     lua_pushlightuserdata(L, backend);
     lua_pushcclosure(
         L,
@@ -84,7 +84,8 @@ std::string run(VulkanBackend* backend, const std::string& source, int interrupt
             lua_pushnumber(L, double(stats.kernels));
             lua_pushnumber(L, double(stats.memoryBytes));
             lua_pushnumber(L, double(stats.checkedRuns));
-            return 4;
+            lua_pushnumber(L, double(stats.submissions));
+            return 5;
         },
         "backendstats",
         1
@@ -1069,6 +1070,74 @@ assert(same(a, beforeA) and same(b, beforeB))
 -- and the next run starts again from the Luau contents
 assert(gpu.run(partly, { a }, 4))
 assert(buffer.readu32(a, 0) == 1 and buffer.readu32(a, 4) == 0x09090909 and buffer.readu32(a, 3 * 65536) == 1)
+)") == "");
+}
+
+TEST_CASE("parts_written_by_the_last_run_come_back_with_the_kernel_and_others_after_it")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // the parts of a buffer its last run wrote are copied back in the kernel's own submission; a part written that wasn't
+    // expected takes a second one, and a part expected but not written comes back as it was, with what Luau wrote to it
+    CHECK(run(*backend, std::string(kSquare) + R"(
+local PART = 65536
+
+-- writes part p of the buffer, the word at its start
+@gpu
+local function writePart(b: buffer, i: number)
+    local p = buffer.readu32(b, 0)
+    buffer.writeu32(b, p * PART + 4 + i * 4, buffer.readu32(b, p * PART + 4 + i * 4) + p + 1)
+end
+
+local function reference(b: buffer, runs: number)
+    for i = 0, runs - 1 do
+        writePart(b, i)
+    end
+end
+
+local function submissions()
+    return select(5, backendstats())
+end
+
+local b = buffer.create(4 * PART + 10)
+for o = 0, buffer.len(b) - 4, 4 do
+    buffer.writeu32(b, o, (o * 7) % 1000)
+end
+local expected = copy(b)
+
+-- each case: the part written, and the submissions the run takes
+local function step(p: number, count: number)
+    buffer.writeu32(b, 0, p)
+    buffer.writeu32(expected, 0, p)
+    local before = submissions()
+    assert(gpu.run(writePart, { b }, 100))
+    reference(expected, 100)
+    assert(same(b, expected), `part {p}`)
+    assert(submissions() - before == count, `part {p}: {submissions() - before} submissions, expected {count}`)
+end
+
+step(1, 2) -- nothing expected yet
+step(1, 1) -- part 1 expected, and written
+-- Luau changes part 1, which the next run expects but doesn't write: it comes back as Luau has it
+buffer.writeu32(b, PART + 2000, 123456)
+buffer.writeu32(expected, PART + 2000, 123456)
+step(3, 2) -- part 3 wasn't expected
+step(3, 1)
+step(0, 2)
+
+-- a run that writes the expected part, then fails: the copy that came back with it isn't the Luau buffer's
+@gpu
+local function writeThenFail(b: buffer, i: number)
+    buffer.writeu32(b, 4 + i * 4, 0xdead)
+    buffer.writeu32(b, buffer.len(b) + i * 4, 1)
+end
+local before = copy(b)
+local ok, err = gpu.run(writeThenFail, { b }, 100)
+assert(not ok and string.find(err, "out of bounds", 1, true), err)
+assert(same(b, before))
+step(0, 1)
 )") == "");
 }
 

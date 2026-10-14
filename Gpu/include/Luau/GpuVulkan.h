@@ -28,6 +28,7 @@ struct RunStats
     uint64_t memoryBytes = 0; // device and host memory currently allocated for those copies, which share it
     uint64_t kernels = 0;     // kernels kept for live functions, including the ones that can't run on the GPU
     uint64_t checkedRuns = 0; // runs that ran again on the checked variant of their kernel
+    uint64_t submissions = 0; // command buffers submitted: one per run, and one more for parts written that weren't expected
 };
 
 struct VulkanOptions

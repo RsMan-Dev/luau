@@ -120,7 +120,8 @@ A buffer listed several times runs several times, in the order of the list; diff
   they are.
 - Buffers stay on the GPU between runs. A run only uploads the 64 KB parts of a buffer that changed since the GPU last had
   it, and only downloads the parts its kernel wrote: kernels mark each part they write to, and the parts they don't are
-  still those of the Luau buffer.
+  still those of the Luau buffer. The parts the buffer's last run wrote come back with the kernel's own submission; others
+  it writes take a second one.
 
 ## Safety
 

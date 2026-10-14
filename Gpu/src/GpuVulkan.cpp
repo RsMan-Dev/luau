@@ -427,6 +427,9 @@ struct BufferEntry : Allocation
 
     // the device holds the contents of the staging memory, which the Luau buffer had when they last matched
     bool valid = false;
+    // the parts the last run writing the buffer wrote, which the next one copies back with the kernel's submission: a part
+    // it doesn't write is the same on the device as in the staging memory, so copying it changes nothing
+    std::vector<uint8_t> expected;
     uint64_t lastUsed = 0;
 
     // position in the least recently used list
@@ -456,6 +459,8 @@ struct Use
     void* data;
     // its words in the binding of written parts
     uint32_t written = 0;
+    // the parts copied back with the kernel's submission
+    std::vector<uint8_t> copied;
 };
 
 struct Limits
@@ -1621,9 +1626,10 @@ std::string VulkanBackend::Impl::download()
         commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT
     );
 
+    // the parts the kernel wrote that weren't copied back with it, which the next run expects too
     const uint32_t* flags = static_cast<const uint32_t*>(writtenCopy.mapped);
     std::vector<VkBufferCopy> regions;
-    std::vector<std::vector<VkBufferCopy>> copied(uses.size());
+    std::vector<std::vector<VkDeviceSize>> written(uses.size());
     bool submitting = false;
     for (size_t i = 0; i < uses.size(); ++i)
     {
@@ -1632,7 +1638,13 @@ std::string VulkanBackend::Impl::download()
 
         for (VkDeviceSize offset = 0; offset < e->deviceSize; offset += kChunk)
         {
-            if (flags[uses[i].written + offset / kChunk] == 0)
+            size_t p = size_t(offset / kChunk);
+            e->expected[p] = flags[uses[i].written + p] != 0;
+            if (!e->expected[p])
+                continue;
+
+            written[i].push_back(offset);
+            if (uses[i].copied[p])
                 continue;
 
             VkDeviceSize size = std::min(kChunk, e->deviceSize - offset);
@@ -1642,13 +1654,11 @@ std::string VulkanBackend::Impl::download()
                 regions.push_back({offset, offset, size});
         }
 
-        // a single part is already in the host mirror
-        if (!regions.empty() && e->deviceSize > kChunk)
+        if (!regions.empty())
         {
             vkCmdCopyBuffer(commandBuffer, e->device, e->staging, uint32_t(regions.size()), regions.data());
             submitting = true;
         }
-        copied[i] = regions;
     }
 
     barrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
@@ -1663,12 +1673,11 @@ std::string VulkanBackend::Impl::download()
     for (size_t i = 0; i < uses.size(); ++i)
     {
         BufferEntry* e = uses[i].entry;
-        for (const VkBufferCopy& r : copied[i])
+        for (VkDeviceSize offset : written[i])
         {
-            for (VkDeviceSize offset = r.srcOffset; offset < r.srcOffset + r.size; offset += kChunk)
-                parts.push_back({i, offset});
+            parts.push_back({i, offset});
             // the last word may be partly past the end of the Luau buffer
-            stats.downloadedBytes += std::min<VkDeviceSize>(r.size, e->size - std::min<VkDeviceSize>(r.srcOffset, e->size));
+            stats.downloadedBytes += std::min<VkDeviceSize>(kChunk, e->size - std::min<VkDeviceSize>(offset, e->size));
         }
     }
 
@@ -1892,10 +1901,30 @@ void VulkanBackend::Impl::record(const KernelEntry& kernel, uint32_t runs)
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_ACCESS_TRANSFER_READ_BIT
         );
+        std::vector<VkBufferCopy> regions;
         for (Use& u : uses)
         {
-            if (u.entry->deviceSize <= kChunk)
-                copyBuffer(commandBuffer, u.entry->device, u.entry->staging, u.entry->deviceSize);
+            BufferEntry* e = u.entry;
+            size_t parts = size_t((e->deviceSize + kChunk - 1) / kChunk);
+            if (e->deviceSize <= kChunk)
+                e->expected.assign(1, 1);
+            if (e->expected.size() != parts)
+                e->expected.assign(parts, 0);
+            u.copied = e->expected;
+
+            regions.clear();
+            for (size_t p = 0; p < parts; ++p)
+            {
+                if (!u.copied[p])
+                    continue;
+                VkDeviceSize offset = VkDeviceSize(p) * kChunk, size = std::min(kChunk, e->deviceSize - offset);
+                if (!regions.empty() && regions.back().srcOffset + regions.back().size == offset)
+                    regions.back().size += size;
+                else
+                    regions.push_back({offset, offset, size});
+            }
+            if (!regions.empty())
+                vkCmdCopyBuffer(commandBuffer, e->device, e->staging, uint32_t(regions.size()), regions.data());
         }
         copyBuffer(commandBuffer, written.buffer, writtenCopy.buffer, VkDeviceSize(written.words) * 4);
     }
@@ -1930,6 +1959,7 @@ std::string VulkanBackend::Impl::submit()
     Clock::time_point submitted = Clock::now(), started = {};
     bool running = false;
 
+    stats.submissions++;
     VkResult res = vkQueueSubmit(queue, 1, &info, fence);
     while (res == VK_SUCCESS)
     {
