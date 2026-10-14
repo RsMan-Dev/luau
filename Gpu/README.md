@@ -64,11 +64,12 @@ A buffer listed several times runs several times, in the order of the list; diff
   from Luau, they are plain reads and writes.
 - Numbers are 32-bit on the GPU. Integers stay exact: the lowering types each value as `int`, `uint` or `float` from how
   it's produced, and a result that wouldn't be the VM's (an integer overflow, an integer a float can't hold) fails the
-  run. Vectors give the VM's bits: the VM computes them in f32 too, and the GPU rounds every operation the same way,
+  run. Whether a float holds an integer is a matter of its significant bits, not its magnitude: `2^26` and `0xffffff00`
+  convert, `16777217` doesn't. Vectors give the VM's bits: the VM computes them in f32 too, and the GPU rounds every operation the same way,
   divisions and square roots included (computed with integers, since Vulkan only bounds their error), without
   reordering them, and keeping NaN, infinities, signed zeros and denormal numbers. Other floating point math is f32
   instead of the VM's f64, with every operation correctly rounded (division and square roots included): results differ
-  from the VM's by f32 rounding. A result whose class f32's narrower range changes fails the run when it overflows: an
+  from the VM's by f32 rounding. Float literals round to f32 like any other result (`1e30`, `0.1`). A result whose class f32's narrower range changes fails the run when it overflows: an
   infinity from finite operands (`1e30 * 1e10`, `math.exp(100)`, a literal beyond f32's range), which f64 would have kept
   finite. Underflows don't: a product or quotient that f32 rounds to 0 or a denormal number where f64 has a tiny normal
   number stays a result, since legitimate kernels produce them all the time (a falloff, `x ^ 40` of a small `x`; failing

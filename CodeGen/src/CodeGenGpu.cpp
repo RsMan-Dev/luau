@@ -57,9 +57,11 @@ uint l_idivu(uint a, uint b) { if (b == 0u) { l_fail(); return 0u; } return a / 
 uint l_modu(uint a, uint b) { if (b == 0u) { l_fail(); return 0u; } return a % b; }
 int l_u2i(uint a) { if (a > 0x7fffffffu) l_fail(); return int(a); }
 uint l_i2u(int a) { if (a < 0) l_fail(); return uint(a); }
-float l_i2f(int a) { if (a < -16777216 || a > 16777216) l_fail(); return float(a); }
+// a float holds an integer exactly when its significant bits fit in 24
+bool l_exactu(uint a) { return a == 0u || (a >> findLSB(a)) < 0x1000000u; }
+float l_i2f(int a) { if (!l_exactu(a < 0 ? uint(-a) : uint(a))) l_fail(); return float(a); }
 float l_inexact(float a) { l_fail(); return a; }
-float l_u2f(uint a) { if (a > 16777216u) l_fail(); return float(a); }
+float l_u2f(uint a) { if (!l_exactu(a)) l_fail(); return float(a); }
 int l_f2i(float a) { if (!(a >= -2147483648.0 && a < 2147483648.0)) { l_fail(); return 0; } return int(a); }
 uint l_f2u(float a) { if (!(a > -2147483649.0 && a < 4294967296.0)) { l_fail(); return 0u; } return a >= 0.0 ? uint(a) : uint(int(a)); }
 float l_round(float a) { return sign(a) * floor(abs(a) + 0.5); }
@@ -284,8 +286,8 @@ std::string literal(double v, NumClass c)
         std::string s = buf;
         if (s.find_first_of(".e") == std::string::npos)
             s += ".0";
-        // as for conversions, an integer that a float can't hold fails the run, as does a number beyond the range of floats
-        if ((v == floor(v) && double(float(v)) != v) || fabs(v) > 3.4028234663852886e38)
+        // floats round like any other; only a number beyond the range of floats, which rounds to an infinity, fails the run
+        if (isinf(float(v)))
             return "l_inexact(float(" + s + "))";
         return "float(" + s + ")";
     }

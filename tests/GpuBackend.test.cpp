@@ -1169,6 +1169,54 @@ assert(buffer.readf32(b, 4) == 4, buffer.readf32(b, 4))
 )") == "");
 }
 
+TEST_CASE("integers_and_literals_that_floats_hold_dont_fail_the_run")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // what decides is whether a float holds the integer, not its magnitude; float literals round like any result, and
+    // only those beyond the range of floats fail
+    CHECK(run(*backend, R"(
+local SCALE = 67108864
+@gpu
+local function scale(b: buffer, i: number)
+    buffer.writef32(b, 4, buffer.readf32(b, 0) * SCALE)
+    buffer.writef32(b, 8, buffer.readu32(b, 12) * 0.5)
+end
+
+@gpu
+local function sentinel(b: buffer, i: number)
+    local m = 1e30
+    for k = 0, 1 do
+        m = math.min(m, buffer.readf32(b, k * 4))
+    end
+    buffer.writef32(b, 16, m)
+    buffer.writef32(b, 20, 1e30)
+end
+
+@gpu
+local function beyond(b: buffer, i: number)
+    buffer.writef32(b, 16, buffer.readf32(b, 0) * 1e39)
+end
+
+local b = buffer.create(24)
+buffer.writef32(b, 0, 0.25)
+buffer.writeu32(b, 12, 0xffffff00)
+assert(gpu.run(scale, { b }, 1))
+assert(buffer.readf32(b, 4) == 16777216 and buffer.readf32(b, 8) == 0x7fffff80)
+
+assert(gpu.run(sentinel, { b }, 1))
+local vm = buffer.create(24)
+buffer.copy(vm, 0, b, 0, 16)
+sentinel(vm, 0)
+assert(buffer.readf32(b, 16) == 0.25 and buffer.readf32(b, 20) == buffer.readf32(vm, 20))
+
+local ok, err = gpu.run(beyond, { b }, 1)
+assert(not ok and string.find(err, "failed on the GPU", 1, true), err)
+)") == "");
+}
+
 TEST_CASE("float_results_that_overflow_where_doubles_dont_fail_the_run")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();
