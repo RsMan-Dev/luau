@@ -20,14 +20,14 @@ the GPU median. The script fails if a result differs or if a run fails.
 
 | Scenario | Measures | Result check |
 |---|---|---|
-| saxpy | memory bound: one multiply-add per 8 bytes moved, 1M floats | f32, relative 1e-6 |
-| tiny saxpy | the same kernel on 64 elements: the fixed cost of a run | f32, relative 1e-6 |
-| mandelbrot | compute bound: up to 256 iterations per pixel, 1024x1024, no input | iteration counts, up to 1% may differ |
-| n-body | O(n²) reads over O(n) data: 4096 bodies, each reading all the others | f32, relative 1e-3 |
-| game of life | a grid with neighbor reads, 10 double buffered steps (10 runs), both grids in the buffer | exact |
-| histogram | 4M values into 256 bins with `gpu.atomicadd`, heavy contention | exact |
-| particles | vector math with a branch, 1M particles, 24 bytes each read and written | f32, relative 1e-5 |
-| blur 5x5 | a post-processing pass: 25 reads per pixel, 1024x1024, the image and the result in the buffer | f32, relative 1e-5 |
+| saxpy | 1000000 floats | 14.715 | 1.026 | 14.3x | yes |
+| tiny saxpy | 64 floats | 0.001 | 0.022 | 0.05x | yes |
+| mandelbrot | 1024x1024, 256 iterations | 254.000 | 1.075 | 236x | yes |
+| n-body | 4096 bodies | 340.761 | 1.767 | 193x | yes |
+| game of life | 1024x1024, 10 steps | 422.471 | 7.143 | 59.1x | yes |
+| histogram | 4000000 values, 256 bins | 120.938 | 2.425 | 49.9x | yes |
+| particles | 1000000 particles | 28.626 | 3.818 | 7.5x | yes |
+| blur 5x5 | 1024x1024 | 117.874 | 1.064 | 111x | yes |
 
 Tolerances come from f32 on the GPU against f64 in Luau: Mandelbrot iteration counts near the set's boundary depend on
 rounding, and n-body sums 4096 terms.
@@ -39,22 +39,23 @@ RelWithDebInfo build, scripts sandboxed with native code generation (as `luau --
 
 | Scenario | Size | Native loop ms | GPU ms | Speedup vs native | Match |
 |---|---|---:|---:|---:|---|
-| saxpy | 1000000 floats | 14.715 | 1.072 | 13.7x | yes |
-| tiny saxpy | 64 floats | 0.001 | 0.037 | 0.03x | yes |
-| mandelbrot | 1024x1024, 256 iterations | 254.000 | 0.781 | 325x | yes |
-| n-body | 4096 bodies | 340.761 | 3.686 | 92x | yes |
-| game of life | 1024x1024, 10 steps | 422.471 | 7.855 | 53.8x | yes |
-| histogram | 4000000 values, 256 bins | 120.938 | 2.811 | 43.0x | yes |
-| particles | 1000000 particles | 28.626 | 4.466 | 6.4x | yes |
-| blur 5x5 | 1024x1024 | 117.874 | 1.087 | 108x | yes |
+| saxpy | 1000000 floats | 14.715 | 1.026 | 14.3x | yes |
+| tiny saxpy | 64 floats | 0.001 | 0.022 | 0.05x | yes |
+| mandelbrot | 1024x1024, 256 iterations | 254.000 | 1.075 | 236x | yes |
+| n-body | 4096 bodies | 340.761 | 1.767 | 193x | yes |
+| game of life | 1024x1024, 10 steps | 422.471 | 7.143 | 59.1x | yes |
+| histogram | 4000000 values, 256 bins | 120.938 | 2.425 | 49.9x | yes |
+| particles | 1000000 particles | 28.626 | 3.818 | 7.5x | yes |
+| blur 5x5 | 1024x1024 | 117.874 | 1.064 | 111x | yes |
 
 (medians of the best time of three runs of the script)
 
 What it shows:
 
 - **Compute bound kernels win by two orders of magnitude** (Mandelbrot, n-body, blur): the transfers are small next to
-  the work. n-body divides vectors 3 times per pair of bodies: divisions and square roots give the VM's bits, which
-  costs about 6 times what the hardware's approximate ones do (0.6 ms with them).
+  the work. Exactness has a cost there: n-body divides vectors 3 times per pair of bodies, and divisions and square roots
+  that give the VM's bits take it from 0.6 ms with the hardware's approximate ones to 1.8 ms; Mandelbrot's scalar
+  products are checked for f32 overflows, from 0.8 to 1.1 ms.
 - **Memory bound kernels win much less** (saxpy, particles): most of the GPU time is copying what the kernel wrote back.
   Only the 64 KB parts a kernel writes come back, so inputs in the same buffer stay on the GPU: saxpy downloads y and not
   x, the histogram its 1 KB of bins and not its 16 MB of values, the game of life the grid each step writes.
