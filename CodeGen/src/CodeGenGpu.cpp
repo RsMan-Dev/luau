@@ -578,6 +578,17 @@ struct GlslLowering
     GpuFailure failKind = GpuFailure::Fallback;
     std::vector<uint32_t> alignedBases; // values whose alignment an access of the block checked
 
+    // bounds checks of an offset a * k + c computed with integers, checked on a instead: the integers can then neither overflow
+    // nor leave the class, which spares their checks, and an offset the buffer can't hold is out of bounds, as in the VM
+    struct FusedGuard
+    {
+        IrOp a;
+        int64_t k = 1;
+        int64_t c = 0;
+    };
+    std::unordered_map<uint32_t, FusedGuard> fusedGuards; // by CHECK_BUFFER_LEN
+    std::vector<bool> unchecked;                          // per instruction computing such an offset
+
     // structured control flow, as in "Beyond Relooper" (Ramsey, 2022): the IR of Luau code is reducible, so each block is
     // emitted once, in its immediate dominator, inside a loop if it's a loop header, after the blocks that end where the
     // block's dominator tree children with several predecessors start. Jumps across constructs go through l_jmp. Regions
@@ -782,6 +793,10 @@ struct GlslLowering
     std::string intArith(uint32_t index, IrCmd cmd, IrOp opa, IrOp opb, NumClass c)
     {
         std::string a = num(opa, c), b = num(opb, c);
+
+        // an offset whose bounds check is on the integer it's computed from, see fuseGuards
+        if (index < unchecked.size() && unchecked[index])
+            return "(" + a + (cmd == IrCmd::ADD_NUM ? " + " : cmd == IrCmd::SUB_NUM ? " - " : " * ") + b + ")";
 
         // the checks repeat their operands: a conversion, with its own check, is computed once
         auto once = [&](std::string& code, const char* suffix)
@@ -2510,7 +2525,10 @@ struct GlslLowering
             line(v + " = uint(" + intv(OP_A(inst)) + ");");
             break;
         case IrCmd::NUM_TO_INT:
-            line(v + " = " + toInt(OP_A(inst), false) + ";");
+            if (unchecked[index])
+                line(v + " = int(" + num(OP_A(inst), cls(OP_A(inst))) + ");");
+            else
+                line(v + " = " + toInt(OP_A(inst), false) + ";");
             break;
         case IrCmd::NUM_TO_UINT:
             // out of range values are architecture specific in native code; here they fail the run
@@ -2549,7 +2567,27 @@ struct GlslLowering
 
             std::string base = intv(OP_B(inst));
             std::string len = "int(pc.len[" + std::to_string(b) + "])";
-            guard("(" + base + " >= -(" + intv(OP_C(inst)) + ") && " + base + " <= " + len + " - " + intv(OP_D(inst)) + ")", OP_F(inst));
+            if (auto it = fusedGuards.find(index); it != fusedGuards.end())
+            {
+                // a * k + c in [-lo, len - hi]: a from ceil((-lo - c) / k) to floor((len - hi - c) / k)
+                const FusedGuard& f = it->second;
+                int64_t lo = function.intOp(OP_C(inst)), hi = function.intOp(OP_D(inst));
+                int64_t first = -lo - f.c, end = hi + f.c;
+                first = first >= 0 ? (first + f.k - 1) / f.k : -((-first) / f.k);
+                NumClass ca = cls(f.a);
+                std::string a = num(f.a, ca);
+                std::string room = "(" + len + " - (" + std::to_string(end) + "))", k = std::to_string(f.k);
+                // rounded down, which division by a positive integer only does for numbers that aren't negative
+                std::string last = "(" + room + " >= 0 ? " + room + " / " + k + " : -((" + k + " - 1 - " + room + ") / " + k + "))";
+                bool nonneg = ca == NumClass::Uint || ca == NumClass::NonNeg;
+                std::string cond = nonneg ? "(" + room + " >= 0 && " + a + (ca == NumClass::Uint ? " <= uint(" : " <= (") + room + " / " + k + ")"
+                                          : "(" + a + " <= " + last;
+                if (!nonneg || first > 0)
+                    cond += " && " + a + " >= " + (ca == NumClass::Uint ? std::to_string(first) + "u" : "(" + std::to_string(first) + ")");
+                guard(cond + ")", OP_F(inst));
+            }
+            else
+                guard("(" + base + " >= -(" + intv(OP_C(inst)) + ") && " + base + " <= " + len + " - " + intv(OP_D(inst)) + ")", OP_F(inst));
 
             // the offset must also be the exact integer the source number holds
             if (OP_E(inst).kind != IrOpKind::Undef)
@@ -2819,6 +2857,145 @@ struct GlslLowering
         return decl;
     }
 
+    // whether instruction u stores a number to a register that nothing reads before instruction g of its block: a value it
+    // stores is only seen once g has checked it
+    bool storedUnread(uint32_t u, uint32_t g)
+    {
+        IrInst& store = function.instructions[u];
+        if (store.cmd != IrCmd::STORE_DOUBLE || OP_A(store).kind != IrOpKind::VmReg || u > g)
+            return false;
+        for (uint32_t i = u + 1; i < g; i++)
+        {
+            IrInst& inst = function.instructions[i];
+            if (isBlockTerminator(inst.cmd))
+                return false;
+            for (IrOp op : inst.ops)
+            {
+                if (op.kind == IrOpKind::VmReg && op.index == OP_A(store).index && inst.cmd != IrCmd::STORE_DOUBLE && inst.cmd != IrCmd::STORE_TAG)
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    // finds the bounds checks of offsets a * k + c, whose integer operations only lead to the offset, and whose offset is only
+    // used after the check, in its block
+    void fuseGuards()
+    {
+        size_t size = function.instructions.size();
+        std::vector<std::vector<uint32_t>> users(size);
+        std::vector<uint32_t> blockOf(size, ~0u);
+        for (size_t b = 0; b < function.blocks.size(); b++)
+        {
+            IrBlock& block = function.blocks[b];
+            if (block.kind == IrBlockKind::Dead)
+                continue;
+            for (uint32_t i = block.start; i <= block.finish && i < size; i++)
+                blockOf[i] = uint32_t(b);
+        }
+        for (size_t i = 0; i < size; i++)
+        {
+            for (IrOp op : function.instructions[i].ops)
+            {
+                if (op.kind == IrOpKind::Inst)
+                    users[op.index].push_back(uint32_t(i));
+            }
+        }
+        unchecked.assign(size, false);
+
+        auto intClass = [](NumClass c)
+        {
+            return c == NumClass::NonNeg || c == NumClass::Uint || c == NumClass::Int;
+        };
+        auto constant = [&](IrOp op, int64_t& v)
+        {
+            if (op.kind != IrOpKind::Constant || function.constOp(op).kind != IrConstKind::Int)
+                return false;
+            v = function.intOp(op);
+            return true;
+        };
+
+        for (size_t g = 0; g < size; g++)
+        {
+            IrInst& guardInst = function.instructions[g];
+            int64_t lo, hi;
+            if (guardInst.cmd != IrCmd::CHECK_BUFFER_LEN || !constant(OP_C(guardInst), lo) || !constant(OP_D(guardInst), hi) ||
+                OP_B(guardInst).kind != IrOpKind::Inst)
+                continue;
+
+            // the offset, a conversion of the integer number, used only from the check on: before it, in its block, a value it
+            // didn't check would be seen
+            uint32_t offset = OP_B(guardInst).index;
+            IrInst& conversion = function.instructions[offset];
+            if (conversion.cmd != IrCmd::NUM_TO_INT || OP_A(conversion).kind != IrOpKind::Inst || blockOf[offset] != blockOf[g])
+                continue;
+            bool after = true;
+            for (uint32_t u : users[offset])
+                after &= u >= g || blockOf[u] != blockOf[g] || storedUnread(u, uint32_t(g));
+            if (!after)
+            {
+                continue;
+            }
+
+            // additions of constants, then a product with one, each used before the check only by the next
+            FusedGuard fused;
+            std::vector<uint32_t> chain = {offset};
+            // the check also gets the number the offset converts, to check that it's an integer, which an integer class is
+            IrOp y = OP_A(conversion);
+            IrOp source = OP_E(guardInst);
+            if (source.kind != IrOpKind::Undef && !(source.kind == IrOpKind::Inst && source.index == y.index))
+            {
+                continue;
+            }
+            bool multiplied = false;
+            for (;;)
+            {
+                size_t uses = 0;
+                if (y.kind == IrOpKind::Inst)
+                {
+                    // uses after the check, in its block or another, see a value it checked
+                    for (uint32_t u : users[y.index])
+                        uses += u < g && blockOf[u] == blockOf[g] && !storedUnread(u, uint32_t(g));
+                }
+                if (y.kind != IrOpKind::Inst || uses != 1 || blockOf[y.index] != blockOf[g] || !intClass(instClass[y.index]))
+                    break;
+                IrInst& op = function.instructions[y.index];
+                double v;
+                if (!multiplied && (op.cmd == IrCmd::ADD_NUM || op.cmd == IrCmd::SUB_NUM) && constNumber(OP_B(op), v) && v == floor(v) &&
+                    fabs(v) < 1 << 30)
+                {
+                    fused.c += op.cmd == IrCmd::ADD_NUM ? int64_t(v) : -int64_t(v);
+                    chain.push_back(y.index);
+                    y = OP_A(op);
+                }
+                else if (!multiplied && op.cmd == IrCmd::MUL_NUM &&
+                         ((constNumber(OP_B(op), v) && OP_A(op).kind != IrOpKind::Constant) ||
+                          (constNumber(OP_A(op), v) && OP_B(op).kind != IrOpKind::Constant)) &&
+                         v == floor(v) && v >= 1 && v < 1 << 20)
+                {
+                    fused.k = int64_t(v);
+                    chain.push_back(y.index);
+                    y = constNumber(OP_B(op), v) ? OP_A(op) : OP_B(op);
+                    multiplied = true;
+                }
+                else
+                    break;
+            }
+
+            // the integer the offset is computed from
+            NumClass ca = y.kind == IrOpKind::Inst ? instClass[y.index] : NumClass::None;
+            if (chain.size() < 2 || !intClass(ca) || fabs(double(fused.c)) >= double(1 << 30))
+            {
+                continue;
+            }
+
+            fused.a = y;
+            fusedGuards[uint32_t(g)] = fused;
+            for (uint32_t i : chain)
+                unchecked[i] = true;
+        }
+    }
+
     bool lower(const std::vector<uint32_t>& sortedBlocks)
     {
         lowered.assign(function.blocks.size(), false);
@@ -2859,6 +3036,8 @@ struct GlslLowering
 
         if (!analyze(sortedBlocks))
             return false;
+
+        fuseGuards();
 
         orderBlocks();
         std::string body = tree(function.entryBlock);

@@ -636,6 +636,65 @@ end
 )") == "");
 }
 
+TEST_CASE("offsets_computed_from_integers_are_checked_on_the_integers")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // an offset a * k + c is checked on a, which spares the checks of its operations: they can then neither overflow nor
+    // leave the class. Offsets in the buffer give the VM's results, from negative integers too, and the others fail as out
+    // of bounds, as in the VM, even when 32-bit integers would have wrapped back into the buffer
+    CHECK(run(*backend, std::string(kSquare) + R"(
+@gpu
+local function fromBase(b: buffer, i: number)
+    local base = buffer.readu32(b, 0)
+    buffer.writeu32(b, base + 12, buffer.readu32(b, base + 8) + 1)
+end
+
+@gpu
+local function fromIndex(b: buffer, i: number)
+    local a = buffer.readi32(b, 0) + i
+    buffer.writeu32(b, a * 4 + 32, a)
+end
+
+local function check(k, b: buffer, runs: number, ok: boolean)
+    local vm = copy(b)
+    local vmOk = pcall(function()
+        for i = 0, runs - 1 do
+            k(vm, i)
+        end
+    end)
+    assert(vmOk == ok, `VM {vmOk} for {buffer.readi32(b, 0)}`)
+    local gpuOk, err = gpu.run(k, { b }, runs)
+    if ok then
+        assert(gpuOk, err)
+        assert(same(b, vm), `results for {buffer.readi32(vm, 0)}`)
+    else
+        assert(not gpuOk and string.find(err, "out of bounds", 1, true), `{buffer.readi32(b, 0)}: {err}`)
+    end
+end
+
+for _, case in { { 0, true }, { 48, true }, { 52, false }, { 0xfffffff8, false }, { 0xfffffff4, false }, { 0x7ffffff8, false } } do
+    local b = buffer.create(64)
+    buffer.writeu32(b, 0, case[1])
+    check(fromBase, b, 1, case[2])
+end
+
+-- a from -8 to 7, offsets from 0 to 60 in 64 bytes, with negative a
+for _, case in { { -8, 16, true }, { -9, 1, false }, { 7, 1, true }, { 8, 1, false }, { -0x40000000, 1, false }, { 0x3fffffff, 1, false } } do
+    local b = buffer.create(64)
+    buffer.writei32(b, 0, case[1])
+    check(fromIndex, b, case[2], case[3])
+end
+local small = buffer.create(16)
+buffer.writei32(small, 0, -5)
+check(fromIndex, small, 1, true) -- offset 12 in 16 bytes: the bound on a is below 0
+buffer.writei32(small, 0, -4)
+check(fromIndex, small, 1, false)
+)") == "");
+}
+
 TEST_CASE("unaligned_offsets_fail_the_run_with_the_accesses_that_follow_them")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();

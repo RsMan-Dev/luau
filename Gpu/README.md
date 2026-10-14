@@ -85,7 +85,9 @@ A buffer listed several times runs several times, in the order of the list; diff
 - Numbers are 32-bit on the GPU. Integers stay exact: the lowering types each value as `int`, `uint` or `float` from how
   it's produced, and a result that wouldn't be the VM's (an integer overflow, an integer a float can't hold) fails the
   run. Whether a float holds an integer is a matter of its significant bits, not its magnitude: `2^26` and `0xffffff00`
-  convert, `16777217` doesn't. Numbers convert only where an operation needs another class: a register holding an
+  convert, `16777217` doesn't. A buffer offset computed from an integer (`base + 12`, `i * 16 + 4`) is checked on that
+  integer: one too large for the buffer fails as out of bounds, as in the VM, even when 32-bit arithmetic would have
+  wrapped it back into the buffer. Numbers convert only where an operation needs another class: a register holding an
   integer on a path and a float on another keeps each as it is, which joining the paths doesn't convert, and comparisons
   between integers and floats, or ints and uints, are exact. Where the VM rounds the integer once, the GPU does too, so
   it needn't be exact there: stored as a float (`buffer.writef32`, a vector component), or multiplied or divided by a
