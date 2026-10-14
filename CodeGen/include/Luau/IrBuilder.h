@@ -83,6 +83,9 @@ struct IrBuilder
     // Force builder to skip source commands
     int cmdSkipTarget = -1;
 
+    // Numbers are f32 (GPU kernels): double constants, including the results of constant folding, are rounded to f32
+    bool float32 = false;
+
     IrFunction function;
 
     uint32_t activeBlockIdx = ~0u;

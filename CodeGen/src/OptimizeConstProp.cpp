@@ -2926,7 +2926,8 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
         break;
     case IrCmd::NUM_TO_INT:
     {
-        IrInst* src = function.asInstOp(OP_A(inst));
+        // f32 numbers (GPU kernels) don't hold every integer: converting one to a number and back may change it
+        IrInst* src = build.float32 ? nullptr : function.asInstOp(OP_A(inst));
 
         if (src && src->cmd == IrCmd::INT_TO_NUM)
         {
@@ -3000,7 +3001,7 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
     }
     case IrCmd::NUM_TO_UINT:
     {
-        IrInst* src = function.asInstOp(OP_A(inst));
+        IrInst* src = build.float32 ? nullptr : function.asInstOp(OP_A(inst));
 
         if (src && src->cmd == IrCmd::UINT_TO_NUM)
         {

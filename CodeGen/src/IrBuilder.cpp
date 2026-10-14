@@ -876,6 +876,9 @@ IrOp IrBuilder::constImport(unsigned value)
 
 IrOp IrBuilder::constDouble(double value)
 {
+    if (float32)
+        value = double(float(value));
+
     IrConst constant;
     constant.kind = IrConstKind::Double;
     constant.valueDouble = value;

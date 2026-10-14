@@ -876,11 +876,18 @@ void foldConstants(IrBuilder& build, IrFunction& function, IrBlock& block, uint3
         break;
     case IrCmd::IDIV_NUM:
         if (OP_A(inst).kind == IrOpKind::Constant && OP_B(inst).kind == IrOpKind::Constant)
-            substitute(function, inst, build.constDouble(luai_numidiv(function.doubleOp(OP_A(inst)), function.doubleOp(OP_B(inst)))));
+        {
+            double a = function.doubleOp(OP_A(inst)), b = function.doubleOp(OP_B(inst));
+            // with f32 numbers, each step of the formula is rounded
+            substitute(function, inst, build.constDouble(build.float32 ? floor(double(float(a / b))) : luai_numidiv(a, b)));
+        }
         break;
     case IrCmd::MOD_NUM:
         if (OP_A(inst).kind == IrOpKind::Constant && OP_B(inst).kind == IrOpKind::Constant)
-            substitute(function, inst, build.constDouble(luai_nummod(function.doubleOp(OP_A(inst)), function.doubleOp(OP_B(inst)))));
+        {
+            double a = function.doubleOp(OP_A(inst)), b = function.doubleOp(OP_B(inst));
+            substitute(function, inst, build.constDouble(build.float32 ? a - double(float(floor(double(float(a / b))) * b)) : luai_nummod(a, b)));
+        }
         break;
     case IrCmd::MIN_NUM:
         if (OP_A(inst).kind == IrOpKind::Constant && OP_B(inst).kind == IrOpKind::Constant)
