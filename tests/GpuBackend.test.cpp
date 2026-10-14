@@ -1057,6 +1057,44 @@ end
 )") == "");
 }
 
+TEST_CASE("integers_that_floats_cant_hold_fail_the_run")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // the VM computes these exactly in doubles; rounding them to f32 would give another answer
+    CHECK(run(*backend, std::string(kSquare) + R"(
+@gpu
+local function converted(b: buffer, i: number)
+    buffer.writef32(b, 4, math.floor(buffer.readu32(b, 0) % 2.5))
+end
+
+@gpu
+local function literal(b: buffer, i: number)
+    buffer.writef32(b, 4, 16777217 * buffer.readf32(b, 8))
+end
+
+for _, k in { converted, literal } do
+    local b = buffer.create(12)
+    buffer.writeu32(b, 0, 4294967294)
+    buffer.writef32(b, 8, 0.5)
+    local ok, err = gpu.run(k, { b }, 1)
+    assert(not ok and string.find(err, "failed on the GPU", 1, true), err)
+end
+
+-- below 2^24 they're exact, and divisions are correctly rounded: 37 / 37 is 1, not 0.99999994
+@gpu
+local function quotient(b: buffer, i: number)
+    buffer.writef32(b, 4, (buffer.readu32(b, 0) / 37) // 0.25)
+end
+local b = buffer.create(8)
+buffer.writeu32(b, 0, 37)
+assert(gpu.run(quotient, { b }, 1))
+assert(buffer.readf32(b, 4) == 4, buffer.readf32(b, 4))
+)") == "");
+}
+
 TEST_CASE("kernels_that_crashed_the_spirv_optimizer_run_on_the_gpu")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();

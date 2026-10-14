@@ -63,7 +63,7 @@ A buffer listed several times runs several times, in the order of the list; diff
   Atomics are what kernels use to combine results from several invocations: counters, histograms, depth tests. Called
   from Luau, they are plain reads and writes.
 - Numbers are 32-bit on the GPU. Integers stay exact: the lowering types each value as `int`, `uint` or `float` from how
-  it's produced, and a result that wouldn't be the VM's (an integer overflow, a conversion that isn't exact) fails the
+  it's produced, and a result that wouldn't be the VM's (an integer overflow, an integer a float can't hold) fails the
   run. Vectors give the VM's bits: the VM computes them in f32 too, and the GPU rounds every operation the same way,
   divisions and square roots included (computed with integers, since Vulkan only bounds their error), without
   reordering them, and keeping NaN, infinities, signed zeros and denormal numbers. Other floating point math is f32

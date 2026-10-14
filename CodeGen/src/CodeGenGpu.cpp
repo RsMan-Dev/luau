@@ -58,6 +58,7 @@ uint l_modu(uint a, uint b) { if (b == 0u) { l_fail(); return 0u; } return a % b
 int l_u2i(uint a) { if (a > 0x7fffffffu) l_fail(); return int(a); }
 uint l_i2u(int a) { if (a < 0) l_fail(); return uint(a); }
 float l_i2f(int a) { if (a < -16777216 || a > 16777216) l_fail(); return float(a); }
+float l_inexact(float a) { l_fail(); return a; }
 float l_u2f(uint a) { if (a > 16777216u) l_fail(); return float(a); }
 int l_f2i(float a) { if (!(a >= -2147483648.0 && a < 2147483648.0)) { l_fail(); return 0; } return int(a); }
 uint l_f2u(float a) { if (!(a > -2147483649.0 && a < 4294967296.0)) { l_fail(); return 0u; } return a >= 0.0 ? uint(a) : uint(int(a)); }
@@ -244,6 +245,9 @@ std::string literal(double v, NumClass c)
         std::string s = buf;
         if (s.find_first_of(".e") == std::string::npos)
             s += ".0";
+        // as for conversions, an integer that a float can't hold fails the run
+        if (v == floor(v) && double(float(v)) != v)
+            return "l_inexact(float(" + s + "))";
         return "float(" + s + ")";
     }
 
@@ -254,17 +258,15 @@ std::string literal(double v, NumClass c)
     return buf;
 }
 
-// converts an expression between number classes; only widens, with a failure check where the value may not fit
-// a register that holds both integers and floats keeps the integers exact, so they can still be used as offsets
+// converts an expression between number classes; only widens, with a failure check where the value may not fit: integers
+// stay exact, so an integer that a float can't hold fails the run instead of being rounded
 std::string convert(const std::string& code, NumClass from, NumClass to, bool exact = false)
 {
-    if (exact && to == NumClass::Float && from != NumClass::Float && from != NumClass::None)
+    if (to == NumClass::Float && from != NumClass::Float && from != NumClass::None)
         return (from == NumClass::Uint ? "l_u2f(" : "l_i2f(") + code + ")";
 
     if (from == to || from == NumClass::None)
         return code;
-    if (to == NumClass::Float)
-        return "float(" + code + ")";
     if (to == NumClass::Uint)
         return from == NumClass::Int ? "l_i2u(" + code + ")" : "uint(" + code + ")";
     if (to == NumClass::Int || to == NumClass::NonNeg)

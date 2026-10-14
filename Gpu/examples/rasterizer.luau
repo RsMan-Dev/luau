@@ -16,7 +16,8 @@ local W = 1280
 local H = 720
 local FOCAL = 900
 local NEAR = 0.5
-local DEPTH_SCALE = 4194304 -- depth keys are integers: view z * scale
+-- depth keys are integers, view z * scale, which floats hold exactly below 2^24: views end before z = 32
+local DEPTH_SCALE = 524288
 local CLEAR_DEPTH = 0x7f7f7f7f
 local NO_ID = 0xffffffff
 
@@ -168,7 +169,8 @@ local function rasterize(s: buffer, t: number, resolve: boolean)
             local w2 = edge(x0, y0, x1, y1, px, py)
             if w0 >= 0 and w1 >= 0 and w2 >= 0 then
                 local key = math.floor((w0 * z0 + w1 * z1 + w2 * z2) / area * DEPTH_SCALE)
-                local p = (y * W + x) * 4
+                -- an integer, since the offsets of the parts of the scene are larger than what floats hold exactly
+                local p = bit32.bor(y * W + x, 0) * 4
                 if resolve then
                     if buffer.readu32(s, depth + p) == key then
                         gpu.atomicmin(s, ids + p, t)
