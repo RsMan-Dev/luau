@@ -26,31 +26,39 @@ so no kernel can keep the GPU or Luau busy for long and no process ever needs to
 The output is line buffered: when the process dies (a shader compiler bug can take it down), the case after the last
 one printed is reported with the signal, and the campaign resumes after it in a new process.
 
+## The reference
+
+Kernels compute with f32 numbers, so the reference is Luau with f32 numbers: each kernel is generated twice, once as
+the kernel and once for the VM with every operation's result rounded to f32 by `F`, which stores it with
+`buffer.writef32` and reads it back. Luau computes the operation in f64; for `+`, `-`, `*`, `/` and `sqrt` of f32
+operands, rounding that result to f32 gives the correctly rounded f32 result (f64 has more than twice f32's precision
+plus two bits). `//` and `%` are written as the VM computes them, `floor(a / b)` and `a - floor(a / b) * b`, with each
+step rounded; reads, literals and `bit32` results are rounded too, and `bit32` arguments convert in the VM as on the GPU.
+Since the Luau compiler folds constant expressions in f64 before either side sees them, the generator never writes an
+operation whose operands are all constants (constant locals, reads at constant offsets and constant shift amounts
+included).
+
 ## Families
 
-| Family | Kernels | Comparison |
-|---|---|---|
-| `int` | integer sources, literals within 32 bits, `+ - * // %`, `bit32`, `math` rounding, min/max/clamp, helpers, loops | bit-exact |
-| `float` | adds floats, `/`, `^`, `sqrt`, `fmod`, float literals including values beyond 32 bits | f32 outputs: relative 1e-4; integer outputs derived from floats are reported as "precision" |
-| `vector` | vector arithmetic, dot, cross, normalize, magnitude, floor/ceil, min/max | relative 1e-4; differences after a division, rounding, comparison or normalization are "precision" |
-
-In every family, an f32 output that is NaN on one side only is an exact mismatch: rounding never explains it.
+| Family | Kernels |
+|---|---|
+| `int` | integer inputs and literals, `+ - * // %`, `bit32`, `math` rounding, min/max/clamp, helpers, loops |
+| `float` | adds float inputs and literals, `/`, `^`, `sqrt`, `fmod` |
+| `vector` | vector arithmetic, dot, cross, normalize, magnitude, floor/ceil, min/max; the VM computes vectors in f32 itself |
 
 ## Profiles
 
-- `extreme` feeds values at the edges of the int and uint ranges: most runs overflow 32 bits and must fail, which checks
-  that no wrong value ever leaves the GPU.
-- `tame` keeps values small so that more kernels run on the GPU, which checks the GPU arithmetic itself; a failed run
-  there is worth a look (`--show-failed`). Many still come from `bit32` results of negative numbers, which are large
-  unsigned values that later overflow.
+- `extreme` feeds values at the edges of the 32-bit and f32 ranges (`0xffffffff`, `2^31`, `3e9`, `1e20`), where f32
+  rounding, the conversions of `bit32` and offsets, and infinities matter.
+- `tame` keeps values small, which checks the ordinary arithmetic: a failed run there is worth a look (`--show-failed`).
 
 ## What counts as a difference
 
-Integer values on the GPU are exact or the run fails, so integer outputs of integer computations must match bit for bit.
-Floats are f32 on the GPU and doubles in Luau; the accepted differences are:
+Outputs must match the reference bit for bit, with two exceptions:
 
-- f32 rounding, including integers above 2^24 held in floats and everything derived from them
-- GPU division, `sqrt` and transcendental functions, which Vulkan doesn't require to be correctly rounded (`pow` can be
-  off by about 1e-4 relative); `floor`, `ceil` and comparisons can turn an ulp into a whole unit or another branch
-- NaN bit patterns (Luau's depend on the CPU)
-- the sign of an integer zero: `-x` for an integer `x == 0` is `-0` in Luau and `0` on the GPU
+- kernels using `^`, which the GPU computes with its own `pow`, not correctly rounded: their differences are reported
+  as "precision" and not counted (a NaN on one side only still counts)
+- NaN bit patterns, which neither side specifies
+
+A run that fails is fine when its buffer is untouched: failures are out of bounds or unaligned accesses and cases native
+code leaves to the VM (a shift by 32 or more), which the reference doesn't model.

@@ -43,20 +43,14 @@ struct GpuKernel
 enum class GpuFailure : uint8_t
 {
     None = 0,
-    Access = 1,          // out of bounds or unaligned buffer access
-    IntegerOverflow = 2, // an integer result 32 bits can't hold
-    DivisionByZero = 3,  // integer division or modulo by zero
-    InexactFloat = 4,    // an integer a float can't hold exactly, used in float math
-    IntegerRange = 5,    // a number out of the range of the 32-bit integer class it's converted to
-    FloatOverflow = 6,   // an infinity from finite operands, which f64 would have kept finite
-    FloatLiteral = 7,    // a literal beyond the range of floats
-    LoopBudget = 8,      // the run's loop iteration budget ran out
-    Stopped = 9,         // the host stopped the run
-    Fallback = 10,       // a value of a type the lowering doesn't handle there, which native code leaves to the VM
-    NeedsExact = 11,     // a division or square root only the kernel's exact variant computes, see GpuKernel::exactGlsl
+    Access = 1,     // out of bounds or unaligned buffer access
+    LoopBudget = 2, // the run's loop iteration budget ran out
+    Stopped = 3,    // the host stopped the run
+    Fallback = 4,   // a value of a type the lowering doesn't handle there, which native code leaves to the VM
+    NeedsExact = 5, // a division or square root only the kernel's exact variant computes, see GpuKernel::exactGlsl
 };
 
-// The reason gpu.run gives for a status word, like "the kernel failed on the GPU: integer overflow at line 12"
+// The reason gpu.run gives for a status word, like "the kernel failed on the GPU: loop limit reached at line 12"
 std::string describeGpuFailure(uint32_t status);
 
 // Lowers the Luau function at stack index idx, which must have the gpu attribute

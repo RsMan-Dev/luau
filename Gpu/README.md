@@ -16,7 +16,7 @@ for _, b in buffers do
 end
 ```
 
-`fn(b, index)` gets one buffer, which it reads and mutates, and an index, an exact integer from 0. Its return value is
+`fn(b, index)` gets one buffer, which it reads and mutates, and an index, a number from 0. Its return value is
 ignored. The invocations run in parallel as a Vulkan compute shader lowered from the function's IR by native code
 generation. Nothing ever runs in the VM instead: gpu.run either leaves every buffer with its results and returns true,
 or leaves every buffer byte for byte as it was and returns false and why.
@@ -34,7 +34,9 @@ local ok, err = gpu.run(move, { particles }, 100000)
 ```
 
 The design goal is to stay as close to base Luau as possible: no new types, kernels are ordinary Luau functions over
-ordinary `buffer`s that can also be called from Luau, and data layouts are written in Luau on top of the primitive.
+ordinary `buffer`s that can also be called from Luau, and data layouts are written in Luau on top of the primitive. As
+`@native` does, `@gpu` keeps Luau's semantics for the types it doesn't know: `number` is fully supported, with the one
+rule that numbers are f32 on the GPU (see [Contract](#contract)).
 
 ## API
 
@@ -50,24 +52,25 @@ ordinary `buffer`s that can also be called from Luau, and data layouts are writt
   support (see [Supported subset](#supported-subset)), or its environment isn't safe.
 - `false, reason` for everything else that only shows when the run is attempted: no device or a refused one, a buffer
   over the device's limits, not enough memory, an error in the kernel, a run that was stopped or timed out. An error in
-  the kernel gives the kind and source line of the run's first one, as in `the kernel failed on the GPU: integer too
-  large for a float at line 980`: out of bounds or unaligned buffer access, integer overflow, integer division by zero,
-  integer too large for a float, number out of the range of 32-bit integers, float overflow, number beyond the range of
-  floats, loop limit reached, or a value of a type the kernel doesn't handle there.
+  the kernel gives the kind and source line of the run's first one, as in `the kernel failed on the GPU: out of bounds
+  or unaligned buffer access at line 980`: out of bounds or unaligned buffer access, loop limit reached, stopped by the
+  host, or a case native code leaves to the VM (a value of a type the kernel doesn't handle there, a `bit32` argument
+  out of range, as a shift by 32 or more). Arithmetic never fails a run.
 - `false, "the kernel is being compiled for the GPU"`: the driver is still creating the kernel's pipeline, on a host
   thread, and the buffers are left as they were. Drivers take a time growing faster than the size of the kernel: tens of
   milliseconds for small ones, but about 40 s for 600 KB of GLSL and 160 s for 1.1 MB on NVIDIA's (Find a Geode's frame
   kernel), which a script can't wait for. Several pipelines are created at once. A script that needs the result calls
   `gpu.run` again (the examples do); `VulkanOptions::waitForPipelines` and `luau-gpu --wait-for-pipelines` make runs
   wait instead. A kernel of more than 2 MB of GLSL is refused, with "Function cannot run in GPU", since its pipeline
-  would take a compile thread for most of an hour. Each kernel has two variants: the one that runs first only notes
-  that a check failed, that a division or square root needs the exact computation (denormal numbers, a hardware result
-  too far off), or that a float result is infinite, and a run where it did runs again on the checked variant, compiled
-  the first time it's needed (a run can then return "being compiled" again), which gives the results and failures this
-  contract describes. The checks and the exact computations otherwise make kernels twice as slow, in the registers they
-  keep even when they don't run. The 64 runs after one that needed it start on the checked variant.
-- Arguments of the wrong type or out of range (`runs_per_buffer` must be an integer from 0 to 2^31-1, `buffers` an array
-  of buffers) are mistakes in the script and raise errors, as in other libraries.
+  would take a compile thread for most of an hour. Each kernel has two variants: the one that runs first computes
+  divisions and square roots with a fast path only, and notes when one needs the exact computation (denormal numbers,
+  a hardware result too far off); a run where it did runs again on the exact variant, compiled the first time it's
+  needed (a run can then return "being compiled" again). The exact computations otherwise make kernels about 1.5 times
+  as slow (Find a Geode's frame), in the registers they keep even when they don't run. The 64 runs after one that
+  needed it start on the exact variant.
+- Arguments of the wrong type or out of range (`runs_per_buffer` must be an integer from 0 to 2^24, `buffers` an array
+  of buffers) are mistakes in the script and raise errors, as in other libraries. The index is an f32 number, which
+  holds every integer up to 2^24 exactly: a larger work is split across buffers or runs.
 
 `luau-gpu` keeps the pipelines the driver compiled in `~/.cache/luau-gpu/pipelines.bin` (`$XDG_CACHE_HOME/luau-gpu`
 when set, `--no-pipeline-cache` to leave it out), so that a script runs its kernels at once from its second run: Find a
@@ -82,26 +85,34 @@ A buffer listed several times runs several times, in the order of the list; diff
   uses the atomics: invocations run concurrently, and plain writes that race give an unspecified result on the GPU.
   Atomics are what kernels use to combine results from several invocations: counters, histograms, depth tests. Called
   from Luau, they are plain reads and writes.
-- Numbers are 32-bit on the GPU. Integers stay exact: the lowering types each value as `int`, `uint` or `float` from how
-  it's produced, and a result that wouldn't be the VM's (an integer overflow, an integer a float can't hold) fails the
-  run. Whether a float holds an integer is a matter of its significant bits, not its magnitude: `2^26` and `0xffffff00`
-  convert, `16777217` doesn't. A buffer offset computed from an integer (`base + 12`, `i * 16 + 4`) is checked on that
-  integer: one too large for the buffer fails as out of bounds, as in the VM, even when 32-bit arithmetic would have
-  wrapped it back into the buffer. Numbers convert only where an operation needs another class: a register holding an
-  integer on a path and a float on another keeps each as it is, which joining the paths doesn't convert, and comparisons
-  between integers and floats, or ints and uints, are exact. Where the VM rounds the integer once, the GPU does too, so
-  it needn't be exact there: stored as a float (`buffer.writef32`, a vector component), or multiplied or divided by a
-  power of two (`k / 2^27`). Vectors give the VM's bits: the VM computes them in f32 too, and the GPU rounds every
-  operation the same way, divisions and square roots included (computed with integers, since Vulkan only bounds their
-  error), without reordering them, and keeping NaN, infinities, signed zeros and denormal numbers. Other floating point
-  math is f32 instead of the VM's f64, with every operation correctly rounded (division and square roots included):
-  results differ from the VM's by f32 rounding. Float literals round to f32 like any other result (`1e30`, `0.1`). A
-  result whose class f32's narrower range changes fails the run when it overflows: an infinity from finite operands
-  (`1e30 * 1e10`, `math.exp(100)`, a literal beyond f32's range), which f64 would have kept finite. Underflows don't: a
-  product or quotient that f32 rounds to 0 or a denormal number where f64 has a tiny normal number stays a result, since
-  legitimate kernels produce them all the time (a falloff, `x ^ 40` of a small `x`; failing them failed the rasterizer's
-  shading). A later step can then still differ from the VM's in kind, as dividing by that 0, which is the one way scalar
-  float results can be categorically different from the VM's.
+- Numbers are f32 on the GPU: a kernel computes what Luau would if `number` were IEEE f32 instead of f64. Every
+  operation is correctly rounded to f32, division and square root included (computed with integers, since Vulkan only
+  bounds their error), without reordering them and keeping NaN, infinities, signed zeros and denormal numbers. There
+  are no integer registers in the semantics, and so no integer overflow or inexact conversion: a result beyond what f32
+  holds rounds, or is an infinity, as an f32 result would. Integers are exact up to 2^24; above, they are the nearest
+  f32 (`16777217` is `16777216`, `0xffffffff` is `4294967296`). In detail:
+  - literals round to f32 (`0.1`, `1e30`; `1e39` is an infinity). The Luau compiler folds constant expressions in f64
+    before the kernel sees them, so `2^24 + 1` written with constants only is folded to 16777217 and rounded once, to
+    16777216, where the GPU would round each step: the same in this case, but not always
+  - `buffer.readu32`, `readi32` give the number rounded to f32 (`readu32` of `0xffffffff` is 4294967296)
+  - what needs an integer converts the number as the VM does: buffer offsets as `luaL_checkinteger`, truncated, an
+    offset outside the 32-bit range being out of bounds; `bit32` arguments as `luaL_checkunsigned`, the truncated value
+    modulo 2^32; `writeu32`, `writei32` and the atomics' values the same way. A `bit32` result is a number, rounded to f32
+    like any other (`bit32.bxor(0xdeadbeef, 0)` is `0xdeadbf00`)
+  - `//` and `%` follow the VM's formulas, `floor(a / b)` and `a - floor(a / b) * b`, each step rounded to f32
+  - vectors give the VM's bits: the VM computes them in f32 too, and the GPU in the same order
+  - `math` functions that native code calls in libm (`sin`, `exp`, `^`, ...) use the GPU's, which Vulkan doesn't require
+    to be correctly rounded: results can be off by a few ulps (`pow` by about 1e-4 relative)
+  - buffer accesses are 4-byte words: an unaligned offset fails the run, where the VM would read the unaligned word
+
+  - buffer methods that need 64 bits (`buffer.readf64`, `buffer.writef64`) make the function unable to run on the GPU:
+    `gpu.run` returns `false, "Function cannot run in GPU"`
+
+  Data beyond f32's precision is lost by design: packing several fields into a 32-bit word above 2^24 (a color with
+  its alpha byte, flags in the top bits, ids shifted by 16, `0xffffffff` as a marker) loses its low bits on the GPU, as
+  it would in Luau with f32 numbers. Compacting everything into one number is a CPU optimization a GPU doesn't need:
+  scripts store the fields separately, one word each (kernels only access 32-bit words), or keep every word they
+  compute with below 2^24, as `Gpu/examples/rasterizer.luau` does.
 - Buffers stay on the GPU between runs. A run only uploads the 64 KB parts of a buffer that changed since the GPU last had
   it, and only downloads the parts its kernel wrote: kernels mark each part they write to, and the parts they don't are
   still those of the Luau buffer.
@@ -110,9 +121,8 @@ A buffer listed several times runs several times, in the order of the list; diff
 
 A kernel can only touch the buffer it's given, and a run either completes cleanly on the GPU or changes nothing:
 
-- every buffer access and atomic is checked against the real buffer size, as native code does; a bad access, an
-  integer division by zero, `INT_MIN // -1` or another operation without the VM's result sets the status word, and the
-  run fails
+- every buffer access and atomic is checked against the real buffer size, as native code does; a bad access sets the
+  status word, and the run fails
 - a run going on for more than `VulkanOptions::abortMs` (100 ms by default, counted from when it starts on the GPU) is
   asked to stop: invocations that start afterwards give up at once and loops within 256 iterations, so a runaway kernel
   gives the GPU back quickly. Loops also count against a per-invocation budget (`VulkanOptions::loopBudget`, 2^24 by
@@ -160,8 +170,8 @@ Inside `@gpu` functions, and the functions they call, which the compiler inlines
 - `gpu.atomicadd`, `gpu.atomicmin`
 - top-level `local` numeric constants
 
-Not supported: tables, strings, upvalues other than constants, calls that aren't inlined, 8/16-bit and f64 buffer
-accesses. `luau-gpu --emit=glsl` reports why each function can't run.
+Not supported: tables, strings, upvalues other than constants, calls that aren't inlined, 8/16-bit buffer accesses,
+and the 64-bit ones (`readf64`, `writef64`), since numbers are f32. `luau-gpu --emit=glsl` reports why each function can't run.
 
 ## Embedding
 

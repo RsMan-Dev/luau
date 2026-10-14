@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 # This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 
-# Differential fuzzer for @gpu kernels: generates random kernels in the GPU subset, runs each one with gpu.run and by
-# calling it from Luau through luau-gpu, and reports every output that differs.
+# Differential fuzzer for @gpu kernels: generates random kernels in the GPU subset, runs each one with gpu.run, and
+# compares the results with a reference computed by luau-gpu in the VM, and reports every output that differs.
 #
 # usage: difffuzz.py [--luau-gpu build/luau-gpu] [--seed N] [--rounds R] [--kernels K] [--family int|float|both]
 #
-# Two families of kernels:
-#   int    only integer sources, literals and operations: outputs must be bit-exact
-#   float  floats too: f32 outputs are compared with a relative tolerance, since the GPU computes in f32 and Luau in
-#          f64; integer outputs derived from floats may then differ by rounding, which is reported separately as
-#          "precision" and not counted as a failure
+# Kernels compute with f32 numbers, each operation rounded as Luau's would be if numbers were f32. The reference is the same
+# kernel written for the VM with every operation's result rounded to f32, by F, which stores it with buffer.writef32 and
+# reads it back: Luau computes the operation in f64, which for +, -, *, / and sqrt of f32 operands rounds to the same f32 as
+# the f32 operation; // and % are written as the VM computes them, floor(a / b) and a - floor(a / b) * b, each step
+# rounded. Outputs must then be bit-exact, except for ^, which neither side computes exactly: those differences are
+# reported separately as "precision" and not counted as failures.
+#
+# Two families of kernels: int (integer literals and inputs) and float (floats too), and vector kernels.
 #
 # A kernel gets one buffer: 64 integer inputs, 20 float inputs, then its outputs, SLOTS words per index.
 
@@ -54,6 +57,10 @@ GUARD = "guard += 1 if guard > 4096 then break end"
 N = 64
 
 
+# a variable or a read in an expression, which keeps the compiler from folding it
+VARIABLE = re.compile(r"\b(i|a|b|c|d|k|x|buf|v\d+|n\d+)\b")
+
+
 class Gen:
     def __init__(self, rng, family, tame=False):
         self.rng = rng
@@ -62,22 +69,34 @@ class Gen:
         self.vars = ["i", "a", "b", "c", "d"]
         self.counter = 0
 
+    # every expression is a pair: the kernel's code, and the reference's
     def leaf(self):
         r = self.rng.random()
         if r < 0.45:
-            return self.rng.choice(self.vars)
+            v = self.rng.choice(self.vars)
+            return v, v
         if self.family == "float" and r < 0.65:
-            return self.rng.choice(TAME_FLOAT_LITERALS if self.tame else FLOAT_LITERALS)
-        return self.rng.choice(TAME_INT_LITERALS if self.tame else INT_LITERALS)
+            lit = self.rng.choice(TAME_FLOAT_LITERALS if self.tame else FLOAT_LITERALS)
+        else:
+            lit = self.rng.choice(TAME_INT_LITERALS if self.tame else INT_LITERALS)
+        # a negative literal is parenthesized as F(...) is: -0.5 ^ c is -(0.5 ^ c)
+        return (f"({lit})" if lit.startswith("-") else lit), f"F({lit})"
 
     def expr(self, depth=0):
+        # the compiler folds expressions of constants in f64, where the kernel would compute in f32: they're avoided
+        g, r = self.compound(depth)
+        if (r.startswith("F(") and r.count("F(") == 1) or VARIABLE.search(g):
+            return g, r
+        v = self.rng.choice(self.vars)
+        return v, v
+
+    def compound(self, depth):
         if depth >= 3 or self.rng.random() < 0.3:
             return self.leaf()
 
         ops = ["+", "-", "*", "//", "%", "neg", "if", "floor", "ceil", "round", "abs", "min", "max", "clamp", "band",
                "bor", "bxor", "bnot", "lshift", "rshift", "arshift", "extract", "btest", "read", "helper"]
         if self.tame:
-            # products of products and bnot leave the small range quickly
             ops = [op for op in ops if op not in ("bnot",)] + ["+", "-", "//", "%", "if", "min", "max"]
         if self.family == "float":
             ops += ["/", "/", "sqrt", "^", "fmod"]
@@ -85,132 +104,210 @@ class Gen:
         op = self.rng.choice(ops)
         e = lambda: self.expr(depth + 1)
 
+        def binary(a, o, b):
+            (ga, ra), (gb, rb) = a, b
+            g = f"({ga} {o} {gb})"
+            if o in ("+", "-", "*", "/", "^"):
+                return g, f"F({ra} {o} {rb})"
+            if o == "//":
+                return g, f"F(math.floor(F({ra} / {rb})))"
+            return g, f"F({ra} - F(math.floor(F({ra} / {rb})) * {rb}))"
+
         if op in ("//", "%") and self.tame:
-            return f"({e()} {op} {self.rng.choice(['3', '7', '-2', '10', '2.5', '-0.75'] if self.family == 'float' else ['3', '7', '-2', '10'])})"
+            k = self.rng.choice(['3', '7', '-2', '10', '2.5', '-0.75'] if self.family == 'float' else ['3', '7', '-2', '10'])
+            return binary(e(), op, (k, f"F({k})"))
         if op in ("+", "-", "*", "//", "%", "/", "^"):
-            return f"({e()} {op} {e()})"
+            return binary(e(), op, e())
         if op == "neg":
-            return f"(-({e()}))"
+            g, r = e()
+            return f"(-({g}))", f"(-({r}))"
         if op == "if":
             cmp = self.rng.choice(["<", "<=", ">", ">=", "==", "~="])
-            return f"(if {e()} {cmp} {e()} then {e()} else {e()})"
+            (g1, r1), (g2, r2), (g3, r3), (g4, r4) = e(), e(), e(), e()
+            return f"(if {g1} {cmp} {g2} then {g3} else {g4})", f"(if {r1} {cmp} {r2} then {r3} else {r4})"
         if op in ("floor", "ceil", "round", "abs"):
-            return f"math.{op}({e()})"
+            g, r = e()
+            return f"math.{op}({g})", f"math.{op}({r})"
         if op in ("min", "max"):
-            return f"math.{op}({e()}, {e()})"
+            (g1, r1), (g2, r2) = e(), e()
+            return f"math.{op}({g1}, {g2})", f"math.{op}({r1}, {r2})"
         if op == "clamp":
             lo, hi = sorted([self.rng.randint(-100000, 100000), self.rng.randint(-100000, 100000)])
-            return f"math.clamp({e()}, {lo}, {hi})"
+            g, r = e()
+            return f"math.clamp({g}, {lo}, {hi})", f"math.clamp({r}, {lo}, {hi})"
         if op == "sqrt":
-            return f"math.sqrt(math.abs({e()}))"
+            g, r = e()
+            return f"math.sqrt(math.abs({g}))", f"F(math.sqrt(math.abs({r})))"
         if op == "fmod":
-            return f"math.fmod({e()}, {self.rng.choice(['3', '-2.5', '7', '0.75'])})"
+            k = self.rng.choice(['3', '-2.5', '7', '0.75'])
+            g, r = e()
+            return f"math.fmod({g}, {k})", f"F(math.fmod({r}, {k}))"
         if op in ("band", "bor", "bxor"):
-            return f"bit32.{op}({e()}, {e()})"
+            (g1, r1), (g2, r2) = e(), e()
+            return f"bit32.{op}({g1}, {g2})", f"F(bit32.{op}({r1}, {r2}))"
         if op == "bnot":
-            return f"bit32.bnot({e()})"
+            g, r = e()
+            return f"bit32.bnot({g})", f"F(bit32.bnot({r}))"
         if op in ("lshift", "rshift", "arshift"):
             if self.tame:
                 amount = str(self.rng.randint(-6, 6))
+                ga, ra = amount, amount
             else:
-                amount = self.rng.choice([str(self.rng.randint(-40, 40)), f"({e()}) % 40", "-3", "31", "32"])
-            return f"bit32.{op}({e()}, {amount})"
+                choice = self.rng.random()
+                if choice < 0.6:
+                    ga = ra = self.rng.choice([str(self.rng.randint(-40, 40)), "-3", "31", "32"])
+                else:
+                    gx, rx = e()
+                    if not VARIABLE.search(gx):
+                        gx = rx = self.rng.choice(self.vars)
+                    ga, ra = f"({gx}) % 40", f"F({rx} - F(math.floor(F({rx} / 40)) * 40))"
+            g, r = e()
+            return f"bit32.{op}({g}, {ga})", f"F(bit32.{op}({r}, {ra}))"
         if op == "extract":
             f = self.rng.randint(0, 31)
             w = self.rng.randint(1, 32 - f)
-            return f"bit32.extract({e()}, {f}, {w})"
+            g, r = e()
+            return f"bit32.extract({g}, {f}, {w})", f"F(bit32.extract({r}, {f}, {w}))"
         if op == "btest":
-            return f"(if bit32.btest({e()}, {e()}) then 1 else 0)"
+            (g1, r1), (g2, r2) = e(), e()
+            return f"(if bit32.btest({g1}, {g2}) then 1 else 0)", f"(if bit32.btest({r1}, {r2}) then 1 else 0)"
         if op == "helper":
-            # helpers are specialized per argument types, so mixing int, uint and float arguments matters
-            return self.rng.choice([f"h1({e()}, {e()})", f"h2({e()})"])
+            if self.rng.random() < 0.5:
+                (g1, r1), (g2, r2) = e(), e()
+                return f"h1({g1}, {g2})", f"r1({r1}, {r2})"
+            g, r = e()
+            return f"h2({g})", f"r2({r})"
         if op == "read":
-            return f"buffer.readu32(buf, (bit32.band({e()}, 63)) * 4)"
+            g, r = e()
+            if not VARIABLE.search(g):
+                g = r = self.rng.choice(self.vars)
+            return f"buffer.readu32(buf, (bit32.band({g}, 63)) * 4)", f"F(buffer.readu32(buf, (bit32.band({r}, 63)) * 4))"
         raise AssertionError(op)
 
-    def statement(self, out, indent):
+    def statement(self, out, ref, indent):
         r = self.rng.random()
         pad = "    " * indent
+
+        def both(g, rr=None):
+            out.append(pad + g)
+            ref.append(pad + (g if rr is None else rr))
+
+        def update(var, op, value):
+            g, rv = value
+            o = op[:-1]
+            if o in ("+", "-", "*", "/"):
+                both(f"{var} {op} {g}", f"{var} = F({var} {o} ({rv}))")
+            elif o == "//":
+                both(f"{var} {op} {g}", f"{var} = F(math.floor(F({var} / ({rv}))))")
+            else:
+                both(f"{var} {op} {g}", f"{var} = F({var} - F(math.floor(F({var} / ({rv}))) * ({rv})))")
+
         if r < 0.4:
             name = f"v{self.counter}"
             self.counter += 1
-            out.append(f"{pad}local {name} = {self.expr()}")
+            g, rv = self.expr()
+            # a local that's never assigned again is a constant the compiler folds, in f64
+            if not VARIABLE.search(g):
+                g = rv = self.rng.choice(self.vars)
+            both(f"local {name} = {g}", f"local {name} = {rv}")
             self.vars.append(name)
         elif r < 0.6:
             var = self.rng.choice(self.vars[1:])
             op = self.rng.choice(["+=", "-=", "*=", "//=", "%="] + (["/="] if self.family == "float" else []))
-            value = self.rng.choice(["3", "7", "-2"]) if self.tame and op in ("//=", "%=", "*=") else self.expr(1)
-            out.append(f"{pad}{var} {op} {value}")
+            if self.tame and op in ("//=", "%=", "*="):
+                k = self.rng.choice(["3", "7", "-2"])
+                value = (k, k)
+            else:
+                value = self.expr(1)
+            update(var, op, value)
         elif r < 0.8 and indent < 3:
             var = self.rng.choice(self.vars[1:])
-            out.append(f"{pad}if {self.expr(1)} < {self.expr(1)} then")
-            out.append(f"{pad}    {var} = {self.expr(1)}")
-            out.append(f"{pad}else")
-            out.append(f"{pad}    {var} = {self.expr(1)}")
-            out.append(f"{pad}end")
+            (g1, r1), (g2, r2), (g3, r3), (g4, r4) = self.expr(1), self.expr(1), self.expr(1), self.expr(1)
+            both(f"if {g1} < {g2} then", f"if {r1} < {r2} then")
+            both(f"    {var} = {g3}", f"    {var} = {r3}")
+            both("else")
+            both(f"    {var} = {g4}", f"    {var} = {r4}")
+            both("end")
         elif indent < 3 and r < 0.86:
             var = self.rng.choice(self.vars[1:])
             n = f"n{self.counter}"
             self.counter += 1
+            g, rv = self.expr(2)
+            both(f"local {n} = 0")
             if self.rng.random() < 0.5:
-                out.append(f"{pad}local {n} = 0")
-                out.append(f"{pad}while {n} < i % 6 do")
-                out.append(f"{pad}    {n} += 1")
-                out.append(f"{pad}    {GUARD}")
-                out.append(f"{pad}    {var} += {n} * {self.expr(2)}")
-                out.append(f"{pad}end")
+                both(f"while {n} < i % 6 do")
+                both(f"    {n} += 1")
+                both(f"    {GUARD}")
+                both(f"    {var} += {n} * {g}", f"    {var} = F({var} + F({n} * ({rv})))")
+                both("end")
             else:
-                out.append(f"{pad}local {n} = 0")
-                out.append(f"{pad}repeat")
-                out.append(f"{pad}    {n} += 1")
-                out.append(f"{pad}    {GUARD}")
-                out.append(f"{pad}    {var} -= {self.expr(2)}")
-                out.append(f"{pad}until {n} >= i % 4")
+                both("repeat")
+                both(f"    {n} += 1")
+                both(f"    {GUARD}")
+                both(f"    {var} -= {g}", f"    {var} = F({var} - ({rv}))")
+                both(f"until {n} >= i % 4")
         elif indent < 3 and r < 0.9 and self.family == "float":
             var = self.rng.choice(self.vars[1:])
-            # starts are literals: a start computed from d can be -inf, which loops forever in Luau too
-            out.append(f"{pad}for x = {self.rng.choice(['0.5', '-1.25', '0', '-3.5'])}, {self.rng.choice(['3', '2.5', 'i % 4'])}, {self.rng.choice(['0.5', '0.25', '1', '0.75'])} do")
-            out.append(f"{pad}    {GUARD}")
-            out.append(f"{pad}    {var} += x")
-            out.append(f"{pad}end")
+            # starts are literals: a start computed from d can be -inf, which loops forever in Luau too; the counters stay
+            # exact in f32, as their steps are
+            both(f"for x = {self.rng.choice(['0.5', '-1.25', '0', '-3.5'])}, {self.rng.choice(['3', '2.5', 'i % 4'])}, {self.rng.choice(['0.5', '0.25', '1', '0.75'])} do")
+            both(f"    {GUARD}")
+            both(f"    {var} += x", f"    {var} = F({var} + x)")
+            both("end")
         elif indent < 3:
             var = self.rng.choice(self.vars[1:])
             lo = self.rng.choice(["1", "0", "-2", "i % 5"])
             hi = self.rng.choice(["3", "i % 7", "-1", "5"])
             step = self.rng.choice(["", "", ", 2", ", -1", ", -2"])
-            out.append(f"{pad}for k = {lo}, {hi}{step} do")
-            out.append(f"{pad}    {GUARD}")
-            out.append(f"{pad}    {var} += k * {self.expr(2)}")
-            out.append(f"{pad}end")
+            g, rv = self.expr(2)
+            both(f"for k = {lo}, {hi}{step} do")
+            both(f"    {GUARD}")
+            both(f"    {var} += k * {g}", f"    {var} = F({var} + F(k * ({rv})))")
+            both("end")
         else:
             var = self.rng.choice(self.vars[1:])
-            out.append(f"{pad}{var} = {self.expr(1)}")
+            g, rv = self.expr(1)
+            both(f"{var} = {g}", f"{var} = {rv}")
 
     def kernel(self, index):
         self.vars = ["i", "a", "b", "c", "d"]
         self.counter = 0
-        lines = [
-            "@gpu",
-            f"local function k{index}(buf: buffer, i: number)",
+        head = [
             "    local a = buffer.readu32(buf, (i % 19) * 4)",
             "    local b = buffer.readi32(buf, ((i * 7 + 3) % 19) * 4)",
             "    local c = i - 32",
             "    local guard = 0",
         ]
+        refHead = [
+            "    local a = F(buffer.readu32(buf, (i % 19) * 4))",
+            "    local b = F(buffer.readi32(buf, ((i * 7 + 3) % 19) * 4))",
+            "    local c = i - 32",
+            "    local guard = 0",
+        ]
         if self.family == "float":
-            lines.append(f"    local d = buffer.readf32(buf, {FSRC} + (i % 20) * 4)")
+            head.append(f"    local d = buffer.readf32(buf, {FSRC} + (i % 20) * 4)")
+            refHead.append(f"    local d = buffer.readf32(buf, {FSRC} + (i % 20) * 4)")
         else:
-            lines.append("    local d = buffer.readu32(buf, ((i + 11) % 19) * 4) // 3")
+            head.append("    local d = buffer.readu32(buf, ((i + 11) % 19) * 4) // 3")
+            refHead.append("    local d = F(math.floor(F(F(buffer.readu32(buf, ((i + 11) % 19) * 4)) / 3)))")
+        lines = ["@gpu", f"local function k{index}(buf: buffer, i: number)"] + head
+        ref = [f"local function k{index}ref(buf: buffer, i: number)"] + refHead
         for _ in range(self.rng.randint(2, 8)):
-            self.statement(lines, 1)
+            self.statement(lines, ref, 1)
         writes = []
         for s in range(SLOTS):
             kind = self.rng.choice(["u32", "i32"] + (["f32", "f32"] if self.family == "float" else []))
-            value = self.rng.choice(self.vars) if self.rng.random() < 0.7 else self.expr(1)
+            if self.rng.random() < 0.7:
+                v = self.rng.choice(self.vars)
+                g, rv = v, v
+            else:
+                g, rv = self.expr(1)
             writes.append(kind)
-            lines.append(f"    buffer.write{kind}(buf, {OUT} + (i * {SLOTS} + {s}) * 4, {value})")
+            lines.append(f"    buffer.write{kind}(buf, {OUT} + (i * {SLOTS} + {s}) * 4, {g})")
+            ref.append(f"    buffer.write{kind}(buf, {OUT} + (i * {SLOTS} + {s}) * 4, {rv})")
         lines.append("end")
-        return lines, writes
+        ref.append("end")
+        return lines + [""] + ref, writes
 
 
 VEC_OPS = ["add", "sub", "mul", "div", "scale", "neg", "dot", "cross", "normalize", "magnitude", "floor", "ceil", "abs",
@@ -246,7 +343,7 @@ class VecGen:
         if depth >= 3 or self.rng.random() < 0.4:
             return self.rng.choice(["s", "t", "0.5", "-2", "3"])
         return self.rng.choice([f"{self.vec(depth + 1)}.x", f"{self.vec(depth + 1)}.y", f"vector.dot({self.vec(depth + 1)}, p)",
-                                f"vector.magnitude({self.vec(depth + 1)})", f"({self.num(depth + 1)} * {self.num(depth + 1)})"])
+                                f"vector.magnitude({self.vec(depth + 1)})", f"F({self.num(depth + 1)} * {self.num(depth + 1)})"])
 
     def kernel(self, index):
         lines = [
@@ -255,7 +352,7 @@ class VecGen:
             f"    local o = {FSRC} + (i % 20) * 4",
             "    local s = buffer.readf32(buf, o)",
             f"    local t = buffer.readf32(buf, {FSRC} + ((i * 3 + 1) % 20) * 4)",
-            "    local p = vector.create(s, t, s * t)",
+            "    local p = vector.create(s, t, F(s * t))",
             "    local q = vector.create(t, 1.5, -s)",
             "    local r = vector.create(0.25, s - t, 2)",
         ]
@@ -268,10 +365,19 @@ class VecGen:
             lines.append(f"    buffer.writef32(buf, {OUT} + (i * {SLOTS} + {slot + 3}) * 4, {self.num()})")
             writes += ["f32"] * 4
         lines.append("end")
-        return lines, writes
+        # the reference rounds the products of numbers, which the kernel computes in f32 without F
+        ref = [l.replace(f"local function k{index}(", f"local function k{index}ref(") for l in lines if l != "@gpu"]
+        return [l.replace("F(", "(") for l in lines] + [""] + ref, writes
 
 
-HELPERS = """@gpu
+HELPERS = """-- rounds a result of the VM to f32, as kernels compute
+local roundBuffer = buffer.create(4)
+local function F(x: number): number
+    buffer.writef32(roundBuffer, 0, x)
+    return buffer.readf32(roundBuffer, 0)
+end
+
+@gpu
 local function h1(x: number, y: number)
     if x < y then
         return x - y
@@ -286,6 +392,21 @@ local function h2(x: number)
         r += k
     end
     return r + x // 3
+end
+
+local function r1(x: number, y: number)
+    if x < y then
+        return F(x - y)
+    end
+    return F(x + F(y * 2))
+end
+
+local function r2(x: number)
+    local r = F(bit32.band(x, 255))
+    for k = 1, 3 do
+        r = F(r + k)
+    end
+    return F(r + F(math.floor(F(x / 3))))
 end
 """
 
@@ -305,10 +426,11 @@ do
     end
 end
 
--- runs each kernel with gpu.run and by calling it from Luau, on copies of the inputs, and prints the words that differ; a
+-- runs each kernel with gpu.run and its reference from Luau, on copies of the inputs, and prints the words that differ; a
 -- run that returns false must leave its buffer as it was
 local function check(round: number, kernels: {{ any }})
-    for j, k in kernels do
+    for j, pair in kernels do
+        local k, ref = pair[1], pair[2]
         if round < startRound or (round == startRound and j - 1 < startKernel) then
             continue
         end
@@ -320,7 +442,7 @@ local function check(round: number, kernels: {{ any }})
         local okGpu, errGpu = gpu.run(k, {{ onGpu }}, {n})
         local okLuau, errLuau = pcall(function()
             for i = 0, {n} - 1 do
-                k(inLuau, i)
+                ref(inLuau, i)
             end
         end)
 
@@ -333,7 +455,7 @@ local function check(round: number, kernels: {{ any }})
         elseif not okLuau then
             print("BOTHERR", round, j - 1, oneLine(errLuau))
         elseif not okGpu then
-            print("RESULT", round, j - 1, "failed", "")
+            print("RESULT", round, j - 1, "failed", oneLine(errGpu))
         else
             local diffs = {{}}
             for o = 0, {words} - 1 do
@@ -376,46 +498,30 @@ end
     out.append(CHECK.format(words=N * SLOTS, n=N, out=OUT, size=OUT + N * SLOTS * 4))
     for index, (seed, family, kernels) in enumerate(rounds):
         out.append(f"do -- round {index}: seed {seed}, {family}")
-        for lines, _ in kernels:
-            out += ["    " + line if line else line for line in lines]
-            out.append("")
-        out.append(f"    check({index}, {{ {', '.join(f'k{j}' for j in range(len(kernels)))} }})")
+        out.append("    local cases = {}")
+        # each kernel and its reference in a block of their own, which keeps the locals of a round within the limit
+        for j, (lines, _) in enumerate(kernels):
+            out.append("    do")
+            out += ["        " + line if line else line for line in lines]
+            out.append(f"        cases[{j + 1}] = {{ k{j}, k{j}ref }}")
+            out.append("    end")
+        out.append(f"    check({index}, cases)")
         out.append("end")
         out.append("")
     return "\n".join(out)
 
 
-def float_close(x, y):
-    if math.isnan(x) and math.isnan(y):
-        return True
-    if math.isinf(x) or math.isinf(y):
-        return x == y
-    return abs(x - y) <= 1e-4 * max(1.0, abs(y))
-
-
 def classify(family, lines, writes, diffs):
-    """splits differing words into exact mismatches and the accepted precision differences"""
+    """splits differing words into exact mismatches and the accepted precision differences: only ^ isn't exact"""
     hard, soft = [], []
-    text = "\n".join(lines)
+    inexact = any(" ^ " in l for l in lines)
     for d in diffs:
         o, xg, xv, fg, fv = d.split(":")
         kind = writes[int(o) % SLOTS]
-        # a NaN on one side only isn't rounding: the GPU lost Luau's NaN semantics (or produced a NaN Luau doesn't)
-        if kind == "f32" and math.isnan(float(fg)) != math.isnan(float(fv)):
-            hard.append(d)
+        # NaN payloads aren't specified, but a NaN on one side only isn't rounding
+        if kind == "f32" and math.isnan(float(fg)) and math.isnan(float(fv)):
             continue
-        if family == "vector":
-            if float_close(float(fg), float(fv)):
-                continue
-            # GPU division and sqrt may be off by an ulp (Vulkan doesn't require them to be correctly rounded),
-            # which floor, ceil, comparisons and divisions by a near-zero value turn into larger differences
-            if any(op in text for op in ("vector.floor(", "vector.ceil(", " / ", "if ", "normalize", "magnitude")):
-                soft.append(d)
-            else:
-                hard.append(d)
-        elif family == "float":
-            if kind == "f32" and float_close(float(fg), float(fv)):
-                continue
+        if inexact and not (kind == "f32" and math.isnan(float(fg)) != math.isnan(float(fv))):
             soft.append(d)
         else:
             hard.append(d)
@@ -498,7 +604,7 @@ def main():
 
         if tag == "REFUSED":
             stats["refused"] += 1
-            reason = re.sub(r"^line \d+: ", "", parts[3])
+            reason = "refused: " + re.sub(r"^line \d+: ", "", parts[3])
             reasons[reason] = reasons.get(reason, 0) + 1
         elif tag == "BOTHERR":
             stats["both_error"] += 1
@@ -508,8 +614,14 @@ def main():
             reports.append((r, j, line))
         else:
             stats[parts[3]] += 1
-            if parts[3] == "failed" and tame:
-                failed.append((r, j))
+            if parts[3] == "failed":
+                # numbers are f32 as in a VM computing in f32: kernels only fail on what fails there too, or on what the GPU
+                # doesn't do (unaligned accesses, the loop budget)
+                reason = re.sub(r" at line \d+", "", parts[4] if len(parts) > 4 else "")
+                reasons["failed: " + reason] = reasons.get("failed: " + reason, 0) + 1
+                if tame:
+                    failed.append((r, j))
+                continue
             hard, soft = classify(family, lines, writes, parts[4].split() if len(parts) > 4 else [])
             if hard:
                 stats["bad"] += 1
@@ -543,7 +655,7 @@ def main():
         os.unlink(path)
     print("totals:", stats)
     for reason, count in sorted(reasons.items(), key=lambda kv: -kv[1]):
-        print(f"  refused {count}x: {reason}")
+        print(f"  {count}x: {reason}")
     sys.exit(1 if stats["bad"] else 0)
 
 

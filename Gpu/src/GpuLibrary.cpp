@@ -21,8 +21,9 @@ static int gpu_run(lua_State* L)
 {
     luaL_checktype(L, 1, LUA_TFUNCTION);
     luaL_checktype(L, 2, LUA_TTABLE);
+    // kernels compute with f32 numbers, which hold the index exactly up to 2^24; larger works are split across buffers
     double runs = luaL_checknumber(L, 3);
-    luaL_argcheck(L, runs >= 0 && runs <= INT_MAX && runs == floor(runs), 3, "must be an integer between 0 and 2147483647");
+    luaL_argcheck(L, runs >= 0 && runs <= 16777216 && runs == floor(runs), 3, "must be an integer between 0 and 16777216");
 
     for (int i = 1, n = lua_objlen(L, 2); i <= n; ++i)
     {
@@ -53,23 +54,19 @@ static uint32_t atomicMin(uint32_t a, uint32_t b)
     return b < a ? b : a;
 }
 
-// atomics operate on unsigned 32-bit integers and return the previous value; like bit32, values wrap modulo 2^32, but only
-// from integers that are in range for a 32-bit signed or unsigned integer, so that the GPU converts them the same way
+// atomics operate on unsigned 32-bit integers and return the previous value; offsets and values convert as in the buffer
+// library: offsets as integers, values as unsigned integers wrapping modulo 2^32, as bit32's do
 template<uint32_t (*op)(uint32_t, uint32_t)>
 static int gpu_atomic(lua_State* L)
 {
     size_t len = 0;
     void* buf = luaL_checkbuffer(L, 1, &len);
 
-    double off = luaL_checknumber(L, 2);
-    // offsets are rounded toward zero as in the buffer library, so the range check happens before the conversion
-    if (!(off > -1 && off < double(INT_MAX) + 1) || size_t(off) + sizeof(uint32_t) > len)
+    int offset = luaL_checkinteger(L, 2);
+    if (uint64_t(unsigned(offset)) + sizeof(uint32_t) > uint64_t(len))
         luaL_error(L, "buffer access out of bounds");
-    size_t offset = size_t(off);
 
-    double v = luaL_checknumber(L, 3);
-    luaL_argcheck(L, v > double(INT_MIN) - 1 && v < 4294967296.0, 3, "value must be between -2147483648 and 4294967295");
-    uint32_t value = v < 0 ? uint32_t(int32_t(v)) : uint32_t(v);
+    uint32_t value = luaL_checkunsigned(L, 3);
 
     uint32_t old;
     memcpy(&old, (char*)buf + offset, sizeof(old));

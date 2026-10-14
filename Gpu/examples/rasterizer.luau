@@ -19,7 +19,8 @@ local NEAR = 0.5
 -- depth keys are integers, view z * scale, which floats hold exactly below 2^24: views end before z = 32
 local DEPTH_SCALE = 524288
 local CLEAR_DEPTH = 0x7f7f7f7f
-local NO_ID = 0xffffffff
+-- numbers are f32 on the GPU: words above 2^24 would round, so the ids and colors stay below
+local NO_ID = 0xffffff
 
 -- the header: the rotation matrix and the distance, then the offsets of the other parts
 local VERTS, TRIS, PROJ, DEPTH, IDS, IMAGE = 40, 44, 48, 52, 56, 60
@@ -58,6 +59,8 @@ for i, part in { vertexCount * 12, triangleCount * 12, vertexCount * 12, W * H *
     size += part
 end
 
+-- word offsets are exact below 2^26, where f32 numbers are 4 apart
+assert(size <= 2 ^ 26, "the scene is over 64 MB, where offsets would round: use fewer segments")
 local scene = buffer.create(size)
 for i, offset in offsets do
     buffer.writeu32(scene, VERTS + (i - 1) * 4, offset)
@@ -169,8 +172,7 @@ local function rasterize(s: buffer, t: number, resolve: boolean)
             local w2 = edge(x0, y0, x1, y1, px, py)
             if w0 >= 0 and w1 >= 0 and w2 >= 0 then
                 local key = math.floor((w0 * z0 + w1 * z1 + w2 * z2) / area * DEPTH_SCALE)
-                -- an integer, since the offsets of the parts of the scene are larger than what floats hold exactly
-                local p = bit32.bor(y * W + x, 0) * 4
+                local p = (y * W + x) * 4
                 if resolve then
                     if buffer.readu32(s, depth + p) == key then
                         gpu.atomicmin(s, ids + p, t)
@@ -198,9 +200,10 @@ local function channel(v: number)
     return math.clamp(math.floor(v * 255), 0, 255)
 end
 
+-- without the alpha byte, which the window ignores, and which would put the word above 2^24
 @gpu
 local function rgb(r: number, g: number, b: number)
-    return bit32.bor(0xff000000, bit32.lshift(channel(r), 16), bit32.lshift(channel(g), 8), channel(b))
+    return bit32.bor(bit32.lshift(channel(r), 16), bit32.lshift(channel(g), 8), channel(b))
 end
 
 @gpu
@@ -251,7 +254,9 @@ end
 -- frame loop
 
 buffer.fill(scene, offsets[4], 0x7f, W * H * 4)
-buffer.fill(scene, offsets[5], 0xff, W * H * 4)
+for o = offsets[5], offsets[6] - 4, 4 do
+    buffer.writeu32(scene, o, NO_ID)
+end
 
 local yaw, pitch, distance = 0.6, 0.35, 7.5
 local paused = false

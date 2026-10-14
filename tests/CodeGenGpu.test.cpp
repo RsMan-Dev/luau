@@ -89,9 +89,9 @@ return scale
     CHECK(contains(kernel.glsl, "layout(std430, set = 0, binding = 1) coherent volatile buffer BS { uint err; int stop; uint started; } st;"));
     CHECK(contains(kernel.glsl, "uint budget;"));
 
-    // offsets computed from the index stay exact integers, with an overflow check
-    CHECK(contains(kernel.glsl, "r1a = index;"));
-    CHECK(contains(kernel.glsl, "l_chk("));
+    // the index is a number, f32 on the GPU, which the offset converts as the VM does
+    CHECK(contains(kernel.glsl, "r1n = float(index);"));
+    CHECK(contains(kernel.glsl, "l_toi("));
 }
 
 TEST_CASE("GpuKernelControlFlowAndBuiltins")
@@ -144,7 +144,7 @@ return k
 TEST_CASE("GpuKernelChecksOnlyWhatIsntKnown")
 {
     // drivers compile kernels in a time that grows faster than their code, with each check adding to it: accesses at a
-    // multiple of 4 from an offset an earlier access checked are aligned, and constants a class holds are written in it
+    // multiple of 4 from an offset an earlier access checked are aligned
     GpuKernel kernel = lowerGpu(R"(
 @gpu
 local function k(b: buffer, i: number)
@@ -159,27 +159,6 @@ return k
     CHECK(count(kernel.glsl, "l_rd0(") == 2);  // the definition and the read at o
     CHECK(count(kernel.glsl, "l_rda0(") == 4); // the definition and the reads at 0, o + 4 and o + 8
     CHECK(contains(kernel.glsl, "l_wra0("));
-    CHECK(!contains(kernel.glsl, "l_i2f((8192))"));
-}
-
-TEST_CASE("GpuKernelExactIntegersInFloatRegisters")
-{
-    // 'x' holds a float on one path and an integer offset on the other: the integer must reach the offset exactly
-    GpuKernel kernel = lowerGpu(R"(
-@gpu
-local function k(b: buffer, i: number)
-    local x = i / 2
-    if i > 3 then
-        x = i * 4
-    end
-    buffer.writeu32(b, x, 1)
-end
-return k
-)");
-
-    REQUIRE_MESSAGE(kernel.reason.empty(), kernel.reason);
-    CHECK(contains(kernel.glsl, "l_i2f("));
-    CHECK(contains(kernel.glsl, "l_f2i("));
 }
 
 TEST_CASE("GpuKernelRejections")
@@ -319,10 +298,10 @@ static bool runOnGpuAndVm(const char* source, int count, int size, bool floats, 
     GpuKernel lowered = compileGpu(L, -1);
     REQUIRE_MESSAGE(lowered.reason.empty(), lowered.reason);
 
-    // the same input for both: a pattern of small signed and large unsigned words
+    // the same input for both: a pattern of words that f32 numbers hold exactly
     std::vector<uint32_t> input(size / 4);
     for (size_t i = 0; i < input.size(); i++)
-        input[i] = uint32_t(i * 2654435761u) ^ uint32_t(i % 7 == 0 ? 0x80000000u : 0);
+        input[i] = uint32_t(i * 2654435761u) & 0xffffffu;
 
     std::vector<uint8_t> results[2];
 
@@ -447,42 +426,22 @@ TEST_CASE("GpuKernelFailuresLeaveTheBufferUntouched")
 {
     std::string gpuError, vmError;
 
-    // an integer overflow on the GPU, where the VM computes the exact result
+    // shifting by 32 or more exits to the VM builtin in native code, so it fails the run here
     if (!runOnGpuAndVm(
             R"(
-@gpu
-local function k(b: buffer, i: number)
-    buffer.writef32(b, i * 4, i * 1073741824 * 4)
-end
-return k
-)",
-            16,
-            64,
-            true,
-            gpuError,
-            vmError
-        ))
-        return;
-
-    CHECK(!gpuError.empty());
-    CHECK(vmError.empty());
-
-    // shifting by 32 or more exits to the VM builtin in native code, so it fails the run here
-    gpuError.clear();
-    runOnGpuAndVm(
-        R"(
 @gpu
 local function k(b: buffer, i: number)
     buffer.writeu32(b, i * 4, bit32.rshift(0xffffffff, i))
 end
 return k
 )",
-        40,
-        160,
-        false,
-        gpuError,
-        vmError
-    );
+            40,
+            160,
+            false,
+            gpuError,
+            vmError
+        ))
+        return;
 
     CHECK(!gpuError.empty());
 

@@ -263,7 +263,7 @@ assert(gpu.run(square, { a }, 0) == true)
     CHECK(backend->stats().succeeded == 1);
 }
 
-TEST_CASE("large_indices_are_exact_integers")
+TEST_CASE("indices_are_exact_up_to_2_24_runs_and_more_runs_are_refused")
 {
     VulkanOptions options = waiting();
     options.minimumLimits = true;
@@ -271,22 +271,25 @@ TEST_CASE("large_indices_are_exact_integers")
     if (!backend)
         return;
 
-    // 2^24 + 1000 runs, over what f32 counts exactly and over the 65535 workgroups guaranteed along x; the last runs write
-    // their index, and its neighbors would collide if it were rounded
+    // the index is a number, f32 on the GPU, which holds every integer up to 2^24 exactly: as many runs are allowed, over the
+    // 65535 workgroups guaranteed along x, and the last runs write their index, whose neighbors would collide if it were
+    // rounded. More runs are an error: a script splits larger works across buffers
     CHECK(run(*backend, R"(
 @gpu
 local function last(b: buffer, i: number)
-    local base = 16777216
+    local base = 16777216 - 1000
     if i >= base then
         buffer.writeu32(b, (i - base) * 4, i)
     end
 end
 
 local b = buffer.create(1000 * 4)
-assert(gpu.run(last, { b }, 16777216 + 1000))
+assert(gpu.run(last, { b }, 16777216))
 for k = 0, 999 do
-    assert(buffer.readu32(b, k * 4) == 16777216 + k, k)
+    assert(buffer.readu32(b, k * 4) == 16777216 - 1000 + k, k)
 end
+local ok, err = pcall(gpu.run, last, { b }, 16777217)
+assert(not ok and string.find(err, "between 0 and 16777216", 1, true), err)
 )") == "");
 }
 
@@ -307,8 +310,11 @@ local function plain(b: buffer, i: number) buffer.writeu32(b, i * 4, 1) end
 local up = 3
 up += 1
 @gpu local function usesUpvalue(b: buffer, i: number) buffer.writeu32(b, i * 4, up) end
+-- numbers are f32 on the GPU: what needs 64 bits can't run there
+@gpu local function readsF64(b: buffer, i: number) buffer.writef32(b, 0, buffer.readf64(b, 8)) end
+@gpu local function writesF64(b: buffer, i: number) buffer.writef64(b, 8, i) end
 
-for _, f in { plain, usesTable, tooManyParameters, usesUpvalue, print } do
+for _, f in { plain, usesTable, tooManyParameters, usesUpvalue, print, readsF64, writesF64 } do
     local ok, err = gpu.run(f, { b }, 4)
     assert(ok == false and err == "Function cannot run in GPU", err)
     assert(same(b, before))
@@ -511,9 +517,9 @@ end
 assert(string.find(fails(nil, { b }, 4), "function expected"))
 assert(string.find(fails(square, b, 4), "table expected"))
 assert(string.find(fails(square, { b, "b" }, 4), "buffer expected at index 2, got string"))
-assert(string.find(fails(square, { b }, -1), "between 0 and 2147483647"))
-assert(string.find(fails(square, { b }, 1.5), "between 0 and 2147483647"))
-assert(string.find(fails(square, { b }, 2^31), "between 0 and 2147483647"))
+assert(string.find(fails(square, { b }, -1), "between 0 and 16777216"))
+assert(string.find(fails(square, { b }, 1.5), "between 0 and 16777216"))
+assert(string.find(fails(square, { b }, 2^24 + 1), "between 0 and 16777216"))
 assert(string.find(fails(square, { b }), "number expected"))
 assert(buffer.readu32(b, 12) == 0)
 )") == "");
@@ -561,24 +567,50 @@ assert(buffer.readu32(a, 0) == 6 and buffer.readu32(a, 12) == 1)
     CHECK(stats.succeeded == 1);
 }
 
-TEST_CASE("integer_overflows_and_inexact_conversions_fail_the_run")
+TEST_CASE("numbers_are_f32_and_what_needs_an_integer_converts_them_as_the_vm")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();
     if (!backend)
         return;
 
-    // the VM computes these exactly in doubles, which 32-bit integers on the GPU can't
-    CHECK(run(*backend, std::string(kSquare) + R"(
-@gpu
-local function overflow(b: buffer, i: number)
-    buffer.writeu32(b, 0, (buffer.readu32(b, 0) + i) * 65536 * 65536 // 65536 // 65536)
+    // a number holds the f32 nearest to what the VM would compute: reads round, bit32 and writes convert the number as the
+    // VM does (truncated, modulo 2^32), // and % follow the VM's formulas, each step rounded. Nothing of it fails the run
+    CHECK(run(*backend, R"(
+local roundBuffer = buffer.create(4)
+local function F(x: number): number
+    buffer.writef32(roundBuffer, 0, x)
+    return buffer.readf32(roundBuffer, 0)
 end
 
-local b = buffer.create(4)
-buffer.writeu32(b, 0, 3)
-local ok, err = gpu.run(overflow, { b }, 1)
-assert(not ok and string.find(err, "failed on the GPU", 1, true), err)
-assert(buffer.readu32(b, 0) == 3)
+@gpu
+local function k(b: buffer, i: number)
+    local big = buffer.readu32(b, 0) -- 0xffffffff
+    local odd = buffer.readu32(b, 4) -- 2^24 + 3
+    buffer.writef32(b, 16, big)
+    buffer.writeu32(b, 20, big)
+    buffer.writef32(b, 24, bit32.bxor(odd, 0))
+    buffer.writeu32(b, 28, bit32.band(odd, 3))
+    buffer.writef32(b, 32, odd * 65536 * 65536 * 65536)
+    buffer.writei32(b, 36, -2.75)
+    local x = buffer.readf32(b, 8) -- 1e8
+    buffer.writef32(b, 40, x // 3)
+    buffer.writef32(b, 44, x % 3)
+end
+
+local b = buffer.create(48)
+buffer.writeu32(b, 0, 0xffffffff)
+buffer.writeu32(b, 4, 16777219)
+buffer.writef32(b, 8, 1e8)
+assert(gpu.run(k, { b }, 1))
+assert(buffer.readf32(b, 16) == 4294967296) -- 0xffffffff rounds to 2^32
+assert(buffer.readu32(b, 20) == 0) -- which converts back to 0, modulo 2^32
+assert(buffer.readf32(b, 24) == 16777220) -- 2^24 + 3 rounds to 2^24 + 4, ties to even
+assert(buffer.readu32(b, 28) == 0)
+assert(buffer.readf32(b, 32) == F(16777220 * 2^48)) -- no overflow check: an f32 result
+assert(buffer.readi32(b, 36) == -2)
+assert(buffer.readf32(b, 40) == F(math.floor(F(F(1e8) / 3))))
+assert(buffer.readf32(b, 44) == F(F(1e8) - F(math.floor(F(F(1e8) / 3)) * 3)))
+assert(buffer.readf32(b, 44) ~= 1e8 % 3) -- what f64 gives
 )") == "");
 }
 
@@ -588,25 +620,9 @@ TEST_CASE("failures_give_their_kind_and_source_line")
     if (!backend)
         return;
 
-    // each kernel fails on its third line, counted from the line of 'base'; float overflows are noted where they happen,
-    // though the run only fails once the invocation returns
-    CHECK(run(*backend, R"(
+    // each kernel fails on its third line, counted from the line of 'base'
+    CHECK(run(*backend, R"lua(
 local base = debug.info(1, "l") + 1
-
-@gpu
-local function overflow(b: buffer, i: number)
-    buffer.writeu32(b, 0, buffer.readu32(b, 0) * 65536 * 65536)
-end
-
-@gpu
-local function inexact(b: buffer, i: number)
-    buffer.writef32(b, 4, buffer.readu32(b, 0) + 0.5)
-end
-
-@gpu
-local function infinite(b: buffer, i: number)
-    buffer.writef32(b, 4, buffer.readf32(b, 8) * buffer.readf32(b, 8) + 1)
-end
 
 @gpu
 local function outside(b: buffer, i: number)
@@ -614,26 +630,27 @@ local function outside(b: buffer, i: number)
 end
 
 @gpu
-local function zero(b: buffer, i: number)
-    buffer.writeu32(b, 4, buffer.readu32(b, 12) // buffer.readu32(b, 12))
+local function unaligned(b: buffer, i: number)
+    buffer.writeu32(b, buffer.readu32(b, 0) + 2, 1)
+end
+
+@gpu
+local function shift(b: buffer, i: number)
+    buffer.writeu32(b, 4, bit32.lshift(1, buffer.readu32(b, 0) + 40))
 end
 
 local b = buffer.create(16)
-buffer.writeu32(b, 0, 16777217)
-buffer.writef32(b, 8, 1e30)
 local cases = {
-    { overflow, "integer overflow" },
-    { inexact, "integer too large for a float" },
-    { infinite, "float overflow" },
     { outside, "out of bounds or unaligned buffer access" },
-    { zero, "integer division by zero" },
+    { unaligned, "out of bounds or unaligned buffer access" },
+    { shift, "case native code leaves to the VM (a value of another type, a bit32 argument out of range)" },
 }
 for n, c in cases do
     local ok, err = gpu.run(c[1], { b }, 1)
     local expected = "the kernel failed on the GPU: " .. c[2] .. " at line " .. base + (n - 1) * 5 + 3
     assert(not ok and err == expected, tostring(err) .. ", expected " .. expected)
 end
-)") == "");
+)lua") == "");
 }
 
 TEST_CASE("offsets_computed_from_integers_are_checked_on_the_integers")
@@ -932,7 +949,7 @@ local SIZE = 3 * PART + 10
 @gpu
 local function sparse(b: buffer, i: number)
     local o = if i == 0 then 65532 elseif i == 1 then 65536 else 196612
-    buffer.writeu32(b, o, bit32.bxor(buffer.readu32(b, o), 0x5a5a5a5a + i))
+    buffer.writeu32(b, o, bit32.bxor(buffer.readu32(b, o), 0x5a5a + i))
 end
 
 -- the same calls from Luau, on another copy
@@ -945,8 +962,9 @@ local function reference(b: buffer, times: number)
 end
 
 local b = buffer.create(SIZE)
-for o = 0, SIZE - 1 do
-    buffer.writeu8(b, o, o % 251)
+-- words that f32 numbers hold exactly
+for o = 0, SIZE - 4, 4 do
+    buffer.writeu32(b, o, o % 65521)
 end
 local expected = copy(b)
 
@@ -1011,7 +1029,9 @@ end
 
 for k = 1, 20 do
     local b = buffer.create(1024)
-    buffer.fill(b, 0, k)
+    for o = 0, 1020, 4 do
+        buffer.writeu32(b, o, k * 257)
+    end
     assert(gpu.run(incWords, { b }, 256))
     assert(buffer.readu8(b, 1000) == k + 1 and buffer.readu8(b, 1001) == k)
     b = nil
@@ -1140,144 +1160,6 @@ end
     for (const std::string& error : errors)
         CHECK(error == "");
     CHECK(backend->stats().succeeded == 200);
-}
-
-TEST_CASE("registers_dead_at_a_join_dont_need_exact_conversions")
-{
-    std::unique_ptr<VulkanBackend> backend = createBackend();
-    if (!backend)
-        return;
-
-    // 'big' doesn't fit a float exactly, and its register is reused for floats after the branch, where it's dead
-    CHECK(run(*backend, R"(
-@gpu
-local function k(b: buffer, i: number)
-    if i % 2 == 0 then
-        local big = buffer.readu32(b, 0)
-        buffer.writeu32(b, 4 + i * 4, big)
-    end
-    local acc = i * 0.5
-    for j = 1, 3 do
-        acc = acc * 1.5 + j
-    end
-    buffer.writef32(b, 64 + i * 4, acc)
-end
-
-local b = buffer.create(128)
-buffer.writeu32(b, 0, 0xfffffff1)
-assert(gpu.run(k, { b }, 8))
-assert(buffer.readu32(b, 4) == 0xfffffff1)
-)") == "");
-}
-
-TEST_CASE("registers_holding_integers_and_floats_convert_only_where_a_class_is_needed")
-{
-    std::unique_ptr<VulkanBackend> backend = createBackend();
-    if (!backend)
-        return;
-
-    // which numbers share a register depends on how the compiler allocates them, not on the code's meaning: joining paths
-    // converts nothing, comparisons are exact whatever the classes, and integers convert to floats where float math uses them
-    CHECK(run(*backend, std::string(kSquare) + R"(
-local function check(k, n: number, init)
-    local b = buffer.create(256)
-    init(b)
-    local vm = copy(b)
-    local ok, err = gpu.run(k, { b }, n)
-    for i = 0, n - 1 do
-        k(vm, i)
-    end
-    return ok, err, same(b, vm)
-end
-
--- -1, then uints above 2^31
-@gpu
-local function best(b: buffer, i: number)
-    local bestKey = -1
-    for k = 0, 3 do
-        local key = buffer.readu32(b, k * 4)
-        if key > bestKey then
-            bestKey = key
-        end
-    end
-    buffer.writeu32(b, 16, bestKey)
-end
-local ok, err, matches = check(best, 1, function(b)
-    for k = 0, 3 do
-        buffer.writeu32(b, k * 4, 0x81000001 + k * 0x10000003)
-    end
-end)
-assert(ok and matches, err)
-
--- an integer on a path and a float on another, compared, converted to an integer, or used in float math
-@gpu
-local function mixed(b: buffer, i: number)
-    local x = buffer.readf32(b, 0)
-    local k = buffer.readu32(b, 4 + i * 4)
-    if k > 0 then
-        x = k
-    end
-    if x > 16777216.5 then
-        buffer.writeu32(b, 64 + i * 4, x)
-    end
-    if buffer.readu32(b, 128) == 1 then
-        buffer.writef32(b, 96 + i * 4, x + 0.5)
-    end
-end
-local function init(big, useMath)
-    return function(b)
-        buffer.writef32(b, 0, 0.25)
-        buffer.writeu32(b, 8, big)
-        buffer.writeu32(b, 128, useMath)
-    end
-end
-ok, err, matches = check(mixed, 2, init(0x81000001, 0))
-assert(ok and matches, err)
-ok, err, matches = check(mixed, 2, init(0x40000000, 1))
-assert(ok and matches, err)
--- float math on an integer a float can't hold still fails
-ok, err = check(mixed, 2, init(0x40000001, 1))
-assert(not ok and string.find(err, "failed on the GPU", 1, true), err)
-
--- an integer from its halves times or divided by a power of two, or stored as a float, is rounded once as the VM rounds it
-@gpu
-local function halves(b: buffer, i: number)
-    local k = buffer.readu32(b, i * 4)
-    buffer.writef32(b, 64 + i * 4, (bit32.rshift(k, 8) * 256 + bit32.band(k, 255)) / 134217728)
-    buffer.writef32(b, 128 + i * 4, k * 0.5)
-    buffer.writef32(b, 192 + i * 4, k)
-end
-ok, err, matches = check(halves, 4, function(b)
-    for i, k in { 0x01000001, 0x7fffffff, 0xffffffff, 0x01000003 } do
-        buffer.writeu32(b, (i - 1) * 4, k)
-    end
-end)
-assert(ok and matches, err)
-
--- uints above 2^24 against floats, and ints against uints
-@gpu
-local function compares(b: buffer, i: number)
-    local k = buffer.readu32(b, i * 4)
-    local f = buffer.readf32(b, 16 + i * 4)
-    local n = buffer.readi32(b, 32 + i * 4)
-    local r = 0
-    if k < f then r += 1 end
-    if k == f then r += 2 end
-    if k <= f then r += 4 end
-    if n < k then r += 8 end
-    if n == k then r += 16 end
-    buffer.writeu32(b, 64 + i * 4, r)
-end
-ok, err, matches = check(compares, 4, function(b)
-    local ks, fs, ns = { 0x01000001, 0x01000001, 0xffffffff, 7 }, { 16777216, 16777218, 4294967296, 7.5 }, { -1, 0x01000001, -5, 7 }
-    for i = 0, 3 do
-        buffer.writeu32(b, i * 4, ks[i + 1])
-        buffer.writef32(b, 16 + i * 4, fs[i + 1])
-        buffer.writei32(b, 32 + i * 4, ns[i + 1])
-    end
-end)
-assert(ok and matches, err)
-)") == "");
 }
 
 TEST_CASE("devices_that_break_the_kernel_contract_are_refused")
@@ -1613,8 +1495,8 @@ local function overflow(b: buffer, i: number)
 end
 local c = buffer.create(8)
 buffer.writef32(c, 0, 3e38)
-local ok, err = gpu.run(overflow, { c }, 1)
-assert(not ok and string.find(err, "float overflow", 1, true), err)
+assert(gpu.run(overflow, { c }, 1))
+assert(buffer.readf32(c, 4) == math.huge)
 )") == "");
 }
 
@@ -1624,9 +1506,9 @@ TEST_CASE("runs_the_unchecked_variant_flags_run_again_checked")
     if (!backend)
         return;
 
-    // kernels run first without most checks and the exact computations, noting only that one would have been needed: a
-    // denormal quotient, an infinity (1 / 0 here, which the VM gives too), an integer a float can't hold. Those runs run
-    // again on the checked variant, which is compiled when first needed, so that results and failures are the same
+    // kernels run first without the exact computations of divisions and square roots, noting only that one would have been
+    // needed, as for a denormal quotient: those runs run again on the variant that has them, compiled when first needed, so
+    // that results and failures are the same
     CHECK(run(*backend, std::string(kSquare) + R"(
 @gpu
 local function k(b: buffer, i: number)
@@ -1659,69 +1541,38 @@ assert(same(b, vm))
 
 -- and failures are those of the checked variant, with their kind and line
 @gpu
-local function inexact(b: buffer, i: number)
-    buffer.writef32(b, 4, buffer.readu32(b, 0) + 0.5)
+local function denormalThenOutside(b: buffer, i: number)
+    buffer.writef32(b, 4, buffer.readf32(b, 0) / 3)
+    buffer.writeu32(b, 4096, 1)
 end
 local c = buffer.create(8)
-buffer.writeu32(c, 0, 16777217)
-local ok, err = runReady(inexact, c, 1)
-assert(not ok and string.find(err, "integer too large for a float at line", 1, true), err)
+buffer.writef32(c, 0, 1e-38)
+local ok, err = runReady(denormalThenOutside, c, 1)
+assert(not ok and string.find(err, "out of bounds or unaligned buffer access at line", 1, true), err)
 )") == "");
 }
 
-TEST_CASE("the_unchecked_variant_stays_in_its_buffer_and_its_runs_leave_no_trace")
+TEST_CASE("kernels_stay_in_their_buffer_and_failed_runs_leave_no_trace")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();
     if (!backend)
         return;
 
-    // the unchecked variant still skips accesses out of the buffer or unaligned, whatever wrapped integers gave their offset;
-    // a run whose integers wrapped into a loop bound is stopped by the loop budget; and a run that ran again on the checked
-    // variant starts from the buffers as they were, whatever the first one wrote or added with atomics
+    // accesses out of the buffer or unaligned are skipped, whatever number gave their offset; a loop bound beyond what the
+    // loop budget allows is stopped by it; and a run that ran again on the variant with the exact divisions starts from the
+    // buffers as they were, whatever the first one wrote or added with atomics
     CHECK(run(*backend, std::string(kSquare) + R"(
 @gpu
 local function copyWords(b: buffer, i: number)
-    buffer.writeu32(b, i * 4, buffer.readu32(b, i * 4))
+    buffer.writef32(b, i * 4, buffer.readf32(b, i * 4))
 end
 
 @gpu
-local function wild1(b: buffer, i: number)
+local function wild(b: buffer, i: number)
     local v = buffer.readu32(b, 0)
     local o = if buffer.readu32(b, 4) == 1 then v * 16 else v
     buffer.writeu32(b, o, 0xdead0001)
     buffer.writeu32(b, o + 4, 0xdead0001)
-    gpu.atomicadd(b, o + 8, 1)
-end
-@gpu
-local function wild2(b: buffer, i: number)
-    local v = buffer.readu32(b, 0)
-    local o = if buffer.readu32(b, 4) == 1 then v * 16 else v
-    buffer.writeu32(b, o, 0xdead0002)
-    buffer.writeu32(b, o + 4, 0xdead0002)
-    gpu.atomicadd(b, o + 8, 1)
-end
-@gpu
-local function wild3(b: buffer, i: number)
-    local v = buffer.readu32(b, 0)
-    local o = if buffer.readu32(b, 4) == 1 then v * 16 else v
-    buffer.writeu32(b, o, 0xdead0003)
-    buffer.writeu32(b, o + 4, 0xdead0003)
-    gpu.atomicadd(b, o + 8, 1)
-end
-@gpu
-local function wild4(b: buffer, i: number)
-    local v = buffer.readu32(b, 0)
-    local o = if buffer.readu32(b, 4) == 1 then v * 16 else v
-    buffer.writeu32(b, o, 0xdead0004)
-    buffer.writeu32(b, o + 4, 0xdead0004)
-    gpu.atomicadd(b, o + 8, 1)
-end
-@gpu
-local function wild5(b: buffer, i: number)
-    local v = buffer.readu32(b, 0)
-    local o = if buffer.readu32(b, 4) == 1 then v * 16 else v
-    buffer.writeu32(b, o, 0xdead0005)
-    buffer.writeu32(b, o + 4, 0xdead0005)
     gpu.atomicadd(b, o + 8, 1)
 end
 
@@ -1733,32 +1584,21 @@ end
 local expected = copy(canary)
 assert(gpu.run(copyWords, { canary }, 1024))
 
--- each case has its kernel, whose next runs would otherwise start on the checked variant
-local cases = {
-    { 64, 0, "out of bounds or unaligned buffer access", wild1 }, -- just past the end
-    { 66, 0, "out of bounds or unaligned buffer access", wild2 }, -- unaligned
-    { 0xfffffff0, 0, "number out of the range of 32-bit integers", wild3 }, -- negative as an int
-    { 0x10000000, 1, "integer overflow", wild4 }, -- wraps to 0, inside the buffer
-    { 0x10000004, 1, "integer overflow", wild5 }, -- wraps to 64, just past the end
-}
-for _, c in cases do
+for _, c in { { 64, 0 }, { 66, 0 }, { 0xfffffff0, 0 }, { 0x10000000, 1 }, { 0x7ffffff0, 1 } } do
     local b = buffer.create(64)
     buffer.writeu32(b, 0, c[1])
     buffer.writeu32(b, 4, c[2])
     local before = copy(b)
-    local _, _, _, checked = backendstats()
-    local ok, err = gpu.run(c[4], { b }, 1)
-    assert(select(4, backendstats()) == checked + 1, "the run didn't run again on the checked variant")
-    assert(not ok and string.find(err, c[3], 1, true), `{c[1]}: {err}`)
+    local ok, err = gpu.run(wild, { b }, 1)
+    assert(not ok and string.find(err, "out of bounds or unaligned buffer access", 1, true), `{c[1]}: {err}`)
     assert(same(b, before))
-    -- and its device copy is the buffer again, whatever the unchecked run wrote to it
+    -- and its device copy is the buffer again
     assert(gpu.run(copyWords, { b }, 16))
     assert(same(b, before))
 end
 assert(gpu.run(copyWords, { canary }, 1024))
 assert(same(canary, expected))
 
--- a loop bound that wrapped: the loop budget stops it, and the checked variant tells why
 @gpu
 local function spin(b: buffer, i: number)
     local n = buffer.readu32(b, 0) * 65536
@@ -1770,22 +1610,21 @@ local function spin(b: buffer, i: number)
 end
 local b = buffer.create(8)
 buffer.writeu32(b, 0, 0x10001)
-local _, _, _, checked = backendstats()
 local ok, err = gpu.run(spin, { b }, 64)
-assert(not ok and string.find(err, "integer overflow", 1, true), err)
-assert(select(4, backendstats()) == checked + 1, "the run didn't run again on the checked variant")
+assert(not ok and (string.find(err, "loop limit reached", 1, true) or string.find(err, "stopped by the host", 1, true)), err)
 
--- a histogram whose unchecked run notes an infinity late, in one invocation: the checked run counts from the original
--- contents, with nothing counted twice
+-- a histogram whose first run notes a denormal quotient late, in one invocation: the run with the exact divisions counts
+-- from the original contents, with nothing counted twice
 local N = 100000
 @gpu
 local function histogram(b: buffer, i: number)
     gpu.atomicadd(b, 64 + (i % 97) * 4, 1)
     if i == N - 7 then
-        buffer.writef32(b, 0, i / buffer.readf32(b, 4))
+        buffer.writef32(b, 0, buffer.readf32(b, 4) / 3)
     end
 end
 local h = buffer.create(64 + 97 * 4)
+buffer.writef32(h, 4, 1e-38)
 for o = 64, 64 + 96 * 4, 4 do
     buffer.writeu32(h, o, 1000)
 end
@@ -1796,7 +1635,7 @@ end
 local _, _, _, checkedBefore = backendstats()
 assert(gpu.run(histogram, { h }, N))
 local _, _, _, checkedAfter = backendstats()
-assert(checkedAfter == checkedBefore + 1, "the run didn't run again on the checked variant")
+assert(checkedAfter == checkedBefore + 1, "the run didn't run again with the exact divisions")
 assert(same(h, vm))
 )") == "");
 }
@@ -1875,148 +1714,59 @@ end
     }
 }
 
-TEST_CASE("integers_that_floats_cant_hold_fail_the_run")
+TEST_CASE("literals_round_to_f32")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();
     if (!backend)
         return;
 
-    // the VM computes these exactly in doubles; rounding them to f32 would give another answer
-    CHECK(run(*backend, std::string(kSquare) + R"(
-@gpu
-local function converted(b: buffer, i: number)
-    buffer.writef32(b, 4, math.floor(buffer.readu32(b, 0) % 2.5))
-end
-
-@gpu
-local function literal(b: buffer, i: number)
-    buffer.writef32(b, 4, 16777217 * buffer.readf32(b, 8))
-end
-
-for _, k in { converted, literal } do
-    local b = buffer.create(12)
-    buffer.writeu32(b, 0, 4294967294)
-    buffer.writef32(b, 8, 0.5)
-    local ok, err = gpu.run(k, { b }, 1)
-    assert(not ok and string.find(err, "failed on the GPU", 1, true), err)
-end
-
--- below 2^24 they're exact, and divisions are correctly rounded: 37 / 37 is 1, not 0.99999994
-@gpu
-local function quotient(b: buffer, i: number)
-    buffer.writef32(b, 4, (buffer.readu32(b, 0) / 37) // 0.25)
-end
-local b = buffer.create(8)
-buffer.writeu32(b, 0, 37)
-assert(gpu.run(quotient, { b }, 1))
-assert(buffer.readf32(b, 4) == 4, buffer.readf32(b, 4))
-)") == "");
-}
-
-TEST_CASE("integers_and_literals_that_floats_hold_dont_fail_the_run")
-{
-    std::unique_ptr<VulkanBackend> backend = createBackend();
-    if (!backend)
-        return;
-
-    // what decides is whether a float holds the integer, not its magnitude; float literals round like any result, and
-    // only those beyond the range of floats fail
+    // as every number does: 1e30 to the nearest f32, 1e39 to an infinity
     CHECK(run(*backend, R"(
-local SCALE = 67108864
 @gpu
-local function scale(b: buffer, i: number)
-    buffer.writef32(b, 4, buffer.readf32(b, 0) * SCALE)
-    buffer.writef32(b, 8, buffer.readu32(b, 12) * 0.5)
-end
-
-@gpu
-local function sentinel(b: buffer, i: number)
+local function k(b: buffer, i: number)
     local m = 1e30
     for k = 0, 1 do
         m = math.min(m, buffer.readf32(b, k * 4))
     end
-    buffer.writef32(b, 16, m)
-    buffer.writef32(b, 20, 1e30)
-end
-
-@gpu
-local function beyond(b: buffer, i: number)
+    buffer.writef32(b, 8, m)
+    buffer.writef32(b, 12, 1e30)
     buffer.writef32(b, 16, buffer.readf32(b, 0) * 1e39)
+    buffer.writef32(b, 20, buffer.readf32(b, 0) * 67108864)
 end
 
 local b = buffer.create(24)
 buffer.writef32(b, 0, 0.25)
-buffer.writeu32(b, 12, 0xffffff00)
-assert(gpu.run(scale, { b }, 1))
-assert(buffer.readf32(b, 4) == 16777216 and buffer.readf32(b, 8) == 0x7fffff80)
-
-assert(gpu.run(sentinel, { b }, 1))
+buffer.writef32(b, 4, 2e30)
 local vm = buffer.create(24)
-buffer.copy(vm, 0, b, 0, 16)
-sentinel(vm, 0)
-assert(buffer.readf32(b, 16) == 0.25 and buffer.readf32(b, 20) == buffer.readf32(vm, 20))
-
-local ok, err = gpu.run(beyond, { b }, 1)
-assert(not ok and string.find(err, "failed on the GPU", 1, true), err)
+buffer.writef32(vm, 12, 1e30)
+assert(gpu.run(k, { b }, 1))
+assert(buffer.readf32(b, 8) == 0.25 and buffer.readu32(b, 12) == buffer.readu32(vm, 12))
+assert(buffer.readf32(b, 16) == math.huge and buffer.readf32(b, 20) == 16777216)
 )") == "");
 }
 
-TEST_CASE("float_results_that_overflow_where_doubles_dont_fail_the_run")
+TEST_CASE("float_results_beyond_f32_are_infinities")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();
     if (!backend)
         return;
 
-    // scalar math is f64 in the VM: -1e10 * 4.6e28 is finite there, times 0 it's -0; in f32 it's -inf, times 0 NaN
-    CHECK(run(*backend, std::string(kSquare) + R"(
+    // in f32, -1e10 * 4.6e28 is -inf, and times 0 NaN; e^100 is inf
+    CHECK(run(*backend, R"(
 @gpu
-local function product(b: buffer, i: number)
+local function k(b: buffer, i: number)
     local t, d, z = buffer.readf32(b, 0), buffer.readf32(b, 4), buffer.readf32(b, 8)
-    buffer.writef32(b, 12, (t * d) * z)
+    buffer.writef32(b, 12, t * d)
+    buffer.writef32(b, 16, (t * d) * z)
+    buffer.writef32(b, 20, math.exp(z + 100))
 end
 
-@gpu
-local function power(b: buffer, i: number)
-    -- e^100 is finite in f64
-    buffer.writef32(b, 12, math.exp(buffer.readf32(b, 8) + 100))
-end
-
-local b = buffer.create(16)
+local b = buffer.create(24)
 buffer.writef32(b, 0, -1e10)
 buffer.writef32(b, 4, 4.6e28)
-local before = copy(b)
-for _, k in { product, power } do
-    local ok, err = gpu.run(k, { b }, 1)
-    assert(not ok and string.find(err, "float overflow", 1, true), err)
-    assert(same(b, before))
-end
-
--- overflows are noted and fail the invocation once it returns: one that loops on an infinity is still stopped, and what it
--- wrote, including the infinity, never leaves the GPU
-@gpu
-local function spin(b: buffer, i: number)
-    local x = buffer.readf32(b, 4)
-    while x == x do
-        x = x * 1e10
-        buffer.writef32(b, 12, x)
-    end
-end
-for _, k in { spin } do
-    local ok, err = gpu.run(k, { b }, 1)
-    assert(not ok and string.find(err, "failed on the GPU", 1, true), err)
-    assert(same(b, before))
-end
-
--- infinities the VM gets too, and underflows, are results
-@gpu
-local function legit(b: buffer, i: number)
-    local x = buffer.readf32(b, 0)
-    buffer.writef32(b, 4, 1 / x)
-    buffer.writef32(b, 8, (x * 1e-20 + 1e-30) ^ 2)
-end
-local c = buffer.create(12)
-assert(gpu.run(legit, { c }, 1))
-assert(buffer.readf32(c, 4) == math.huge and buffer.readf32(c, 8) == 0)
+assert(gpu.run(k, { b }, 1))
+local nan = buffer.readf32(b, 16)
+assert(buffer.readf32(b, 12) == -math.huge and nan ~= nan and buffer.readf32(b, 20) == math.huge)
 )") == "");
 }
 
