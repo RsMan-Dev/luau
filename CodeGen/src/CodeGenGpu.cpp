@@ -131,34 +131,20 @@ uint l_fcorrect(uint q, uint nlo, uint d, out bool sticky)
     sticky = r != 0;
     return q;
 }
-float l_fdiv(float a, float b)
+float l_fdivexact(float a, float b)
 {
     uint ua = floatBitsToUint(a), ub = floatBitsToUint(b);
     uint sign = (ua ^ ub) & 0x80000000u;
-    uint ea = (ua >> 23) & 0xffu, eb = (ub >> 23) & 0xffu;
-    uint ma, mb;
-    int e;
-    // normal operands are the common case
-    if (ea - 1u < 254u && eb - 1u < 254u)
-    {
-        ma = (ua & 0x7fffffu) | 0x800000u;
-        mb = (ub & 0x7fffffu) | 0x800000u;
-        e = int(ea) - int(eb) + 127;
-    }
-    else
-    {
-        uint xa = ua & 0x7fffffffu, xb = ub & 0x7fffffffu;
-        if (xa > 0x7f800000u || xb > 0x7f800000u || (xa == xb && (xa == 0u || xa == 0x7f800000u)))
-            return uintBitsToFloat(0x7fc00000u);
-        if (xa == 0x7f800000u || xb == 0u)
-            return uintBitsToFloat(sign | 0x7f800000u);
-        if (xa == 0u || xb == 0x7f800000u)
-            return uintBitsToFloat(sign);
-        int fa, fb;
-        ma = l_fmant(xa, fa);
-        mb = l_fmant(xb, fb);
-        e = fa - fb + 127;
-    }
+    uint xa = ua & 0x7fffffffu, xb = ub & 0x7fffffffu;
+    if (xa > 0x7f800000u || xb > 0x7f800000u || (xa == xb && (xa == 0u || xa == 0x7f800000u)))
+        return uintBitsToFloat(0x7fc00000u);
+    if (xa == 0x7f800000u || xb == 0u)
+        return uintBitsToFloat(sign | 0x7f800000u);
+    if (xa == 0u || xb == 0x7f800000u)
+        return uintBitsToFloat(sign);
+    int ea, eb;
+    uint ma = l_fmant(xa, ea), mb = l_fmant(xb, eb);
+    int e = ea - eb + 127;
     if (ma < mb)
     {
         ma <<= 1;
@@ -167,16 +153,9 @@ float l_fdiv(float a, float b)
     // q = floor(ma * 2^24 / mb), 25 bits
     bool sticky;
     uint q = l_fcorrect(uint(float(ma) / float(mb) * 16777216.0), ma << 24, mb, sticky);
-    if (e - 1 < 253 && e >= 1)
-    {
-        uint r = q >> 1;
-        if ((q & 1u) != 0u && (sticky || (r & 1u) != 0u))
-            r += 1u;
-        return uintBitsToFloat(sign | ((uint(e - 1) << 23) + r));
-    }
     return l_fround(sign, e, q, sticky);
 }
-float l_fsqrt(float a)
+float l_fsqrtexact(float a)
 {
     uint u = floatBitsToUint(a);
     if ((u & 0x7fffffffu) == 0u || u == 0x7f800000u)
@@ -208,6 +187,63 @@ float l_fsqrt(float a)
         root += 1u;
     }
     return l_fround(0u, (e - 127) / 2 + 127, root, r != 0);
+}
+// the hardware's results are within a few units of the correctly rounded ones, which one integer remainder tells: with normal
+// operands and results, the remainder gives how many units to move the result by, and checks that the exact quotient or root
+// is then within half a unit of it; anything else, rare, goes to the exact computation
+bool l_fdivfast(float a, float b, out float result)
+{
+    float q = a / b;
+    uint ua = floatBitsToUint(a), ub = floatBitsToUint(b), uq = floatBitsToUint(q);
+    uint ea = (ua >> 23) & 0xffu, eb = (ub >> 23) & 0xffu, eq = (uq >> 23) & 0xffu;
+    // a / b = q * 2^(s - 23) * (ma * 2^s) / (qm * mb), so the exact quotient minus q, in units of q's last bit, is r / mb
+    int s = int(ea) - int(eb) + 150 - int(eq);
+    uint ma = (ua & 0x7fffffu) | 0x800000u, mb = (ub & 0x7fffffu) | 0x800000u, qm = (uq & 0x7fffffu) | 0x800000u;
+    int r = int((ma << (s & 31)) - qm * mb);
+    int k = int(floor(float(r) * (1.0 / float(mb)) + 0.5));
+    r -= k * int(mb);
+    bool normal = ea - 1u < 254u && eb - 1u < 254u && eq - 1u < 254u && uint(s - 23) <= 1u;
+    // the significand stays in its binade, where the remainder's scale holds
+    result = uintBitsToFloat(uq + uint(k));
+    if (normal && qm + uint(k) - 0x800000u < 0x800000u && uint(abs(r)) * 2u < mb)
+        return true;
+    // zero divided by a normal number, as when a vector has a zero component
+    result = uintBitsToFloat((ua ^ ub) & 0x80000000u);
+    return (ua & 0x7fffffffu) == 0u && eb - 1u < 254u;
+}
+float l_fdiv(float a, float b)
+{
+    float q;
+    return l_fdivfast(a, b, q) ? q : l_fdivexact(a, b);
+}
+// the exact computation is in a loop the compiler keeps, so that its code isn't repeated for each component
+vec3 l_fdivv(vec3 a, vec3 b)
+{
+    vec3 q;
+    bvec3 fast = bvec3(l_fdivfast(a.x, b.x, q.x), l_fdivfast(a.y, b.y, q.y), l_fdivfast(a.z, b.z, q.z));
+    [[dont_unroll]] for (int c = 0; c < 3; c++)
+    {
+        if (!fast[c])
+            q[c] = l_fdivexact(a[c], b[c]);
+    }
+    return q;
+}
+float l_fsqrt(float a)
+{
+    float q = sqrt(a);
+    uint ua = floatBitsToUint(a), uq = floatBitsToUint(q);
+    uint ea = (ua >> 23) & 0xffu, eq = (uq >> 23) & 0xffu;
+    // a = q^2 * 2^(t - 23 * 2) * (m * 2^t) / qm^2: the root is correctly rounded when m * 2^t - qm^2 is in (-qm, qm]
+    int t = int(ea) + 150 - 2 * int(eq);
+    uint m = (ua & 0x7fffffu) | 0x800000u, qm = (uq & 0x7fffffu) | 0x800000u;
+    uint x = m << (t & 31);
+    int k = int(floor(float(int(x - qm * qm)) * (0.5 / float(qm)) + 0.5));
+    uint root = qm + uint(k);
+    int r = int(x - root * root);
+    bool normal = ua - 0x00800000u < 0x7f000000u && uint(t - 23) <= 1u;
+    if (normal && root - 0x800000u < 0x800000u && r > -int(root) && r <= int(root))
+        return uintBitsToFloat(uq + uint(k));
+    return l_fsqrtexact(a);
 }
 float l_fmod(float a, float b) { return b == 0.0 ? uintBitsToFloat(0x7fc00000u) : a - b * trunc(l_fdiv(a, b)); }
 )";
@@ -1599,7 +1635,7 @@ struct GlslLowering
             if (inst.cmd == IrCmd::DIV_VEC)
             {
                 std::string a = vec(OP_A(inst)), b = vec(OP_B(inst));
-                line(v + "v = vec3(l_fdiv(" + a + ".x, " + b + ".x), l_fdiv(" + a + ".y, " + b + ".y), l_fdiv(" + a + ".z, " + b + ".z));");
+                line(v + "v = l_fdivv(" + a + ", " + b + ");");
                 break;
             }
             const char* op = inst.cmd == IrCmd::ADD_VEC ? " + " : inst.cmd == IrCmd::SUB_VEC ? " - " : " * ";
@@ -1609,7 +1645,7 @@ struct GlslLowering
         case IrCmd::IDIV_VEC:
         {
             std::string a = vec(OP_A(inst)), b = vec(OP_B(inst));
-            line(v + "v = floor(vec3(l_fdiv(" + a + ".x, " + b + ".x), l_fdiv(" + a + ".y, " + b + ".y), l_fdiv(" + a + ".z, " + b + ".z)));");
+            line(v + "v = floor(l_fdivv(" + a + ", " + b + "));");
             break;
         }
         case IrCmd::MULADD_VEC:
@@ -2264,7 +2300,7 @@ struct GlslLowering
         std::string& glsl = build.glsl;
         // like the VM, shaders keep NaN, infinities and signed zeros (SignedZeroInfNanPreserve for 32-bit floats), and denormal
         // numbers (DenormPreserve)
-        glsl = "#version 450\n#extension GL_EXT_spirv_intrinsics : require\n"
+        glsl = "#version 450\n#extension GL_EXT_spirv_intrinsics : require\n#extension GL_EXT_control_flow_attributes : require\n"
                "spirv_execution_mode(extensions = [\"SPV_KHR_float_controls\"], capabilities = [4466], 4461, 32);\n"
                "spirv_execution_mode(extensions = [\"SPV_KHR_float_controls\"], capabilities = [4464], 4459, 32);\n"
                "layout(local_size_x = " +
