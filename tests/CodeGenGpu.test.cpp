@@ -114,7 +114,7 @@ return k
 
     // loops count against the budget where native code checks for interrupts
     CHECK(contains(kernel.glsl, "++l_steps > pc.budget"));
-    CHECK(contains(kernel.glsl, "l_sqrt("));
+    CHECK(contains(kernel.glsl, "l_fsqrt("));
 }
 
 TEST_CASE("GpuKernelGuardsFailTheRun")

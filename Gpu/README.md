@@ -64,7 +64,11 @@ A buffer listed several times runs several times, in the order of the list; diff
   from Luau, they are plain reads and writes.
 - Numbers are 32-bit on the GPU. Integers stay exact: the lowering types each value as `int`, `uint` or `float` from how
   it's produced, and a result that wouldn't be the VM's (an integer overflow, a conversion that isn't exact) fails the
-  run. Floating point math is f32 instead of f64, and keeps NaN, infinities and signed zeros.
+  run. Vectors give the VM's bits: the VM computes them in f32 too, and the GPU rounds every operation the same way,
+  divisions and square roots included (computed with integers, since Vulkan only bounds their error), without
+  reordering them, and keeping NaN, infinities, signed zeros and denormal numbers. Other floating point math is f32
+  instead of the VM's f64, with correctly rounded operations: results can differ by rounding, and values beyond the f32
+  range overflow or underflow sooner.
 - Buffers stay on the GPU between runs. A run only uploads the 64 KB parts of a buffer that changed since the GPU last had
   it, and only downloads the parts its kernel wrote: kernels mark each part they write to, and the parts they don't are
   still those of the Luau buffer.
@@ -84,7 +88,7 @@ A kernel can only touch the buffer it's given, and a run either completes cleanl
   of GLSL, GLSL ES, MSL or HLSL
 - lowering, GLSL to SPIR-V compilation, SPIR-V validation, pipeline creation, device limits (storage buffer range,
   workgroup count, push constant size), allocation, submission and a zero status word must all succeed
-- devices are checked when the backend is created: a probe kernel must keep NaN, infinities and signed zeros, and see the
+- devices are checked when the backend is created: a probe kernel must keep NaN, infinities, signed zeros and denormal numbers, and see the
   host asking it to stop. Feature bits aren't enough: llvmpipe reports SignedZeroInfNanPreserve and folds `inf - inf` to 0.
   A device that fails is refused
 - a run that doesn't finish within `VulkanOptions::timeoutMs` (5 s by default) or a lost device disables the backend for

@@ -927,7 +927,8 @@ TEST_CASE("devices_that_break_the_kernel_contract_are_refused")
         unsetenv("VK_DRIVER_FILES");
 
     CHECK(!backend);
-    CHECK_MESSAGE(error.find("is refused: its shaders don't keep NaN, infinities and signed zeros") != std::string::npos, error);
+    bool refused = error.find("is refused:") != std::string::npos && error.find("NaN, infinities, signed zeros and denormal") != std::string::npos;
+    CHECK_MESSAGE(refused, error);
 #endif
 
     // a device that keeps its contract is accepted, and runs kernels
@@ -983,6 +984,75 @@ for o = 16, 52, 4 do
     -- NaN payloads are platform specific, in the VM too
     local same = if x ~= x then y ~= y else buffer.readu32(onGpu, o) == buffer.readu32(inLuau, o)
     assert(same, `offset {o}: gpu {x} vm {y}`)
+end
+)") == "");
+}
+
+TEST_CASE("vector_math_matches_luau_bit_for_bit")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // the VM computes vectors in f32, rounding each operation correctly: the GPU must give the same bits, for every exponent,
+    // denormal numbers, infinities and NaN included. Drivers may reorder operations ((s - t) + t was folded to s), flush
+    // denormal numbers, and round divisions and square roots within a few ulps; none of that may show
+    CHECK(run(*backend, R"(
+local N = 131072
+
+@gpu
+local function k(b: buffer, i: number)
+    local o = i * 64
+    local x = vector.create(buffer.readf32(b, o), buffer.readf32(b, o + 4), buffer.readf32(b, o + 8))
+    local y = vector.create(buffer.readf32(b, o + 12), 1.5, buffer.readf32(b, o + 4))
+    local q = x / y
+    local n = vector.normalize(x)
+    local c = vector.cross(x, y)
+    local r = vector.create(0.25, x.x - y.x, 2) + vector.create(x.x, y.x, 1)
+    buffer.writef32(b, o + 16, q.x)
+    buffer.writef32(b, o + 20, q.z)
+    buffer.writef32(b, o + 24, vector.magnitude(x))
+    buffer.writef32(b, o + 28, n.y)
+    buffer.writef32(b, o + 32, vector.dot(x, y))
+    buffer.writef32(b, o + 36, c.z)
+    buffer.writef32(b, o + 40, (x * y).x)
+    buffer.writef32(b, o + 44, r.y)
+    buffer.writef32(b, o + 48, (vector.create(x.x, 0, 0) * vector.create(0.5, 0, 0)).x)
+    buffer.writef32(b, o + 52, vector.floor(x / y).y)
+end
+
+local seed = 7
+local function rnd()
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    return seed
+end
+
+local onGpu = buffer.create(N * 64)
+for i = 0, N - 1 do
+    for w = 0, 3 do
+        -- random bit patterns: every exponent, half of them near 1, where ties and exact results are common
+        local bits = (rnd() * 2 + rnd() % 2) % 4294967296
+        if rnd() % 2 == 0 then
+            bits = bit32.bor(bit32.band(bits, 0x807fffff), bit32.lshift(117 + rnd() % 20, 23))
+        end
+        buffer.writeu32(onGpu, i * 64 + w * 4, bits)
+    end
+end
+local inLuau = buffer.create(N * 64)
+buffer.copy(inLuau, 0, onGpu)
+
+assert(gpu.run(k, { onGpu }, N))
+for i = 0, N - 1 do
+    k(inLuau, i)
+end
+
+for i = 0, N - 1 do
+    for o = i * 64 + 16, i * 64 + 52, 4 do
+        local x, y = buffer.readf32(onGpu, o), buffer.readf32(inLuau, o)
+        -- NaN payloads are platform specific, in the VM too
+        local same = if x ~= x then y ~= y else buffer.readu32(onGpu, o) == buffer.readu32(inLuau, o)
+        assert(same, `index {i} word {(o - i * 64) // 4}: gpu {x} luau {y}`)
+    end
 end
 )") == "");
 }

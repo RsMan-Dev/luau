@@ -61,13 +61,11 @@ float l_i2f(int a) { if (a < -16777216 || a > 16777216) l_fail(); return float(a
 float l_u2f(uint a) { if (a > 16777216u) l_fail(); return float(a); }
 int l_f2i(float a) { if (!(a >= -2147483648.0 && a < 2147483648.0)) { l_fail(); return 0; } return int(a); }
 uint l_f2u(float a) { if (!(a > -2147483649.0 && a < 4294967296.0)) { l_fail(); return 0u; } return a >= 0.0 ? uint(a) : uint(int(a)); }
-float l_sqrt(float a) { return a < 0.0 ? uintBitsToFloat(0x7fc00000u) : sqrt(a); }
 float l_round(float a) { return sign(a) * floor(abs(a) + 0.5); }
 float l_log(float a) { return a < 0.0 ? uintBitsToFloat(0x7fc00000u) : a == 0.0 ? uintBitsToFloat(0xff800000u) : log(a); }
 float l_log2(float a) { return a < 0.0 ? uintBitsToFloat(0x7fc00000u) : a == 0.0 ? uintBitsToFloat(0xff800000u) : log2(a); }
 float l_asin(float a) { return abs(a) > 1.0 ? uintBitsToFloat(0x7fc00000u) : asin(a); }
 float l_acos(float a) { return abs(a) > 1.0 ? uintBitsToFloat(0x7fc00000u) : acos(a); }
-float l_fmod(float a, float b) { return b == 0.0 ? uintBitsToFloat(0x7fc00000u) : a - b * trunc(a / b); }
 bool l_odd(float b) { return abs(b) < 16777216.0 && mod(b, 2.0) == 1.0; }
 float l_pow(float a, float b)
 {
@@ -79,6 +77,138 @@ float l_pow(float a, float b)
 }
 vec3 l_minv(vec3 a, vec3 b) { return mix(b, a, lessThan(a, b)); }
 vec3 l_maxv(vec3 a, vec3 b) { return mix(b, a, greaterThan(a, b)); }
+// Vulkan only bounds the error of division and square roots, which the VM rounds correctly for vectors (f32): these start
+// from the hardware's result and correct it with exact integer arithmetic. A finite nonzero float is m * 2^(e - 150) with
+// m in [2^23, 2^24) once denormals are normalized
+uint l_fmant(uint u, out int e)
+{
+    e = int((u >> 23) & 0xffu);
+    uint m = u & 0x7fffffu;
+    if (e != 0)
+        return m | 0x800000u;
+    int shift = 23 - findMSB(m);
+    e = 1 - shift;
+    return m << shift;
+}
+// rounds m * 2^(e - 150) with m in [2^24, 2^25) (a guard bit below the 24 bits kept), plus 'sticky' nonzero bits below it
+float l_fround(uint sign, int e, uint m, bool sticky)
+{
+    if (e >= 255)
+        return uintBitsToFloat(sign | 0x7f800000u);
+    if (e <= 0)
+    {
+        int shift = min(1 - e, 26);
+        sticky = sticky || (m & ((1u << shift) - 1u)) != 0u;
+        m >>= shift;
+        e = 0;
+    }
+    uint r = m >> 1;
+    if ((m & 1u) != 0u && (sticky || (r & 1u) != 0u))
+        r += 1u;
+    // a carry into the exponent is right: it only makes the significand 2^23, which encodes the next binade
+    return uintBitsToFloat(sign | ((e == 0 ? 0u : uint(e - 1) << 23) + r));
+}
+// the significand of a quotient or square root: 'q' estimates floor(n / d) within a few units, the exact remainder n - q * d
+// is far below 2^31 so 32 bits hold it, and q is corrected to the exact floor
+uint l_fcorrect(uint q, uint nlo, uint d, out bool sticky)
+{
+    int r = int(nlo - q * d);
+    // one step brings q within a unit, which spares divergent loops
+    int step = int(floor(float(r) / float(d)));
+    q += uint(step);
+    r -= step * int(d);
+    while (r < 0)
+    {
+        q -= 1u;
+        r += int(d);
+    }
+    while (r >= int(d))
+    {
+        q += 1u;
+        r -= int(d);
+    }
+    sticky = r != 0;
+    return q;
+}
+float l_fdiv(float a, float b)
+{
+    uint ua = floatBitsToUint(a), ub = floatBitsToUint(b);
+    uint sign = (ua ^ ub) & 0x80000000u;
+    uint ea = (ua >> 23) & 0xffu, eb = (ub >> 23) & 0xffu;
+    uint ma, mb;
+    int e;
+    // normal operands are the common case
+    if (ea - 1u < 254u && eb - 1u < 254u)
+    {
+        ma = (ua & 0x7fffffu) | 0x800000u;
+        mb = (ub & 0x7fffffu) | 0x800000u;
+        e = int(ea) - int(eb) + 127;
+    }
+    else
+    {
+        uint xa = ua & 0x7fffffffu, xb = ub & 0x7fffffffu;
+        if (xa > 0x7f800000u || xb > 0x7f800000u || (xa == xb && (xa == 0u || xa == 0x7f800000u)))
+            return uintBitsToFloat(0x7fc00000u);
+        if (xa == 0x7f800000u || xb == 0u)
+            return uintBitsToFloat(sign | 0x7f800000u);
+        if (xa == 0u || xb == 0x7f800000u)
+            return uintBitsToFloat(sign);
+        int fa, fb;
+        ma = l_fmant(xa, fa);
+        mb = l_fmant(xb, fb);
+        e = fa - fb + 127;
+    }
+    if (ma < mb)
+    {
+        ma <<= 1;
+        e -= 1;
+    }
+    // q = floor(ma * 2^24 / mb), 25 bits
+    bool sticky;
+    uint q = l_fcorrect(uint(float(ma) / float(mb) * 16777216.0), ma << 24, mb, sticky);
+    if (e - 1 < 253 && e >= 1)
+    {
+        uint r = q >> 1;
+        if ((q & 1u) != 0u && (sticky || (r & 1u) != 0u))
+            r += 1u;
+        return uintBitsToFloat(sign | ((uint(e - 1) << 23) + r));
+    }
+    return l_fround(sign, e, q, sticky);
+}
+float l_fsqrt(float a)
+{
+    uint u = floatBitsToUint(a);
+    if ((u & 0x7fffffffu) == 0u || u == 0x7f800000u)
+        return a;
+    if (u > 0x7f800000u)
+        return uintBitsToFloat(0x7fc00000u);
+    int e;
+    uint m = l_fmant(u, e);
+    // a = m * 2^(e - 150); with an even exponent, sqrt(a) = sqrt(m * 2^25) * 2^((e - 127) / 2 - 24)
+    if (((e - 127) & 1) != 0)
+    {
+        m <<= 1;
+        e -= 1;
+    }
+    // root = floor(sqrt(m * 2^25)), 25 bits, from the hardware's estimate within a few units; x - root^2 is far below 2^31
+    uint root = uint(sqrt(float(m) * 33554432.0));
+    int r = int((m << 25) - root * root);
+    int step = int(floor(float(r) / float(2u * root)));
+    root += uint(step);
+    r = int((m << 25) - root * root);
+    while (r < 0)
+    {
+        root -= 1u;
+        r += int(2u * root + 1u);
+    }
+    while (r >= int(2u * root + 1u))
+    {
+        r -= int(2u * root + 1u);
+        root += 1u;
+    }
+    return l_fround(0u, (e - 127) / 2 + 127, root, r != 0);
+}
+float l_fmod(float a, float b) { return b == 0.0 ? uintBitsToFloat(0x7fc00000u) : a - b * trunc(l_fdiv(a, b)); }
 )";
 
 const char* glslType(NumClass c)
@@ -1464,13 +1594,22 @@ struct GlslLowering
         case IrCmd::MUL_VEC:
         case IrCmd::DIV_VEC:
         {
-            const char* op = inst.cmd == IrCmd::ADD_VEC ? " + " : inst.cmd == IrCmd::SUB_VEC ? " - " : inst.cmd == IrCmd::MUL_VEC ? " * " : " / ";
+            if (inst.cmd == IrCmd::DIV_VEC)
+            {
+                std::string a = vec(OP_A(inst)), b = vec(OP_B(inst));
+                line(v + "v = vec3(l_fdiv(" + a + ".x, " + b + ".x), l_fdiv(" + a + ".y, " + b + ".y), l_fdiv(" + a + ".z, " + b + ".z));");
+                break;
+            }
+            const char* op = inst.cmd == IrCmd::ADD_VEC ? " + " : inst.cmd == IrCmd::SUB_VEC ? " - " : " * ";
             line(v + "v = " + vec(OP_A(inst)) + op + vec(OP_B(inst)) + ";");
             break;
         }
         case IrCmd::IDIV_VEC:
-            line(v + "v = floor(" + vec(OP_A(inst)) + " / " + vec(OP_B(inst)) + ");");
+        {
+            std::string a = vec(OP_A(inst)), b = vec(OP_B(inst));
+            line(v + "v = floor(vec3(l_fdiv(" + a + ".x, " + b + ".x), l_fdiv(" + a + ".y, " + b + ".y), l_fdiv(" + a + ".z, " + b + ".z)));");
             break;
+        }
         case IrCmd::MULADD_VEC:
             line(v + "v = " + vec(OP_A(inst)) + " * " + vec(OP_B(inst)) + " + " + vec(OP_C(inst)) + ";");
             break;
@@ -1493,8 +1632,12 @@ struct GlslLowering
             line(v + "v = mix(" + vec(OP_A(inst)) + ", " + vec(OP_B(inst)) + ", equal(" + vec(OP_C(inst)) + ", " + vec(OP_D(inst)) + "));");
             break;
         case IrCmd::DOT_VEC:
-            line(v + " = dot(" + vec(OP_A(inst)) + ", " + vec(OP_B(inst)) + ");");
+        {
+            // as native code computes it (vdpps): the first two products, then the third plus the fourth lane, which is +0
+            std::string a = vec(OP_A(inst)), b = vec(OP_B(inst));
+            line(v + " = (" + a + ".x * " + b + ".x + " + a + ".y * " + b + ".y) + (" + a + ".z * " + b + ".z + 0.0);");
             break;
+        }
         case IrCmd::EXTRACT_VEC:
             line(v + " = " + vec(OP_A(inst)) + "[" + std::to_string(function.intOp(OP_B(inst))) + "];");
             break;
@@ -1509,10 +1652,12 @@ struct GlslLowering
         case IrCmd::MUL_FLOAT:
         case IrCmd::DIV_FLOAT:
         {
-            const char* op = inst.cmd == IrCmd::ADD_FLOAT   ? " + "
-                             : inst.cmd == IrCmd::SUB_FLOAT ? " - "
-                             : inst.cmd == IrCmd::MUL_FLOAT ? " * "
-                                                            : " / ";
+            if (inst.cmd == IrCmd::DIV_FLOAT)
+            {
+                line(v + " = l_fdiv(" + floatv(OP_A(inst)) + ", " + floatv(OP_B(inst)) + ");");
+                break;
+            }
+            const char* op = inst.cmd == IrCmd::ADD_FLOAT ? " + " : inst.cmd == IrCmd::SUB_FLOAT ? " - " : " * ";
             line(v + " = " + floatv(OP_A(inst)) + op + floatv(OP_B(inst)) + ";");
             break;
         }
@@ -1535,7 +1680,7 @@ struct GlslLowering
             break;
         }
         case IrCmd::SQRT_FLOAT:
-            line(v + " = l_sqrt(" + floatv(OP_A(inst)) + ");");
+            line(v + " = l_fsqrt(" + floatv(OP_A(inst)) + ");");
             break;
         case IrCmd::SIGN_FLOAT:
         {
@@ -1627,7 +1772,8 @@ struct GlslLowering
                 line(v + " = l_addi(l_muli(" + num(OP_A(inst), c) + ", " + num(OP_B(inst), c) + "), " + num(OP_C(inst), c) + ");");
             break;
         case IrCmd::DIV_NUM:
-            line(v + " = " + num(OP_A(inst), c) + " / " + num(OP_B(inst), c) + ";");
+            // correctly rounded, so that quotients the VM gets exactly, like 37 / 37, are exact here too
+            line(v + " = l_fdiv(" + num(OP_A(inst), c) + ", " + num(OP_B(inst), c) + ");");
             break;
         case IrCmd::IDIV_NUM:
         case IrCmd::MOD_NUM:
@@ -1635,7 +1781,7 @@ struct GlslLowering
             std::string a = num(OP_A(inst), c), b = num(OP_B(inst), c);
             bool idiv = inst.cmd == IrCmd::IDIV_NUM;
             if (c == NumClass::Float)
-                line(v + " = " + (idiv ? "floor(" + a + " / " + b + ")" : a + " - floor(" + a + " / " + b + ") * " + b) + ";");
+                line(v + " = " + (idiv ? "floor(l_fdiv(" + a + ", " + b + "))" : a + " - floor(l_fdiv(" + a + ", " + b + ")) * " + b) + ";");
             else
                 line(v + " = " + intArith(index, inst.cmd, OP_A(inst), OP_B(inst), c) + ";");
             break;
@@ -1661,7 +1807,7 @@ struct GlslLowering
             break;
         }
         case IrCmd::SQRT_NUM:
-            line(v + " = l_sqrt(" + num(OP_A(inst), c) + ");");
+            line(v + " = l_fsqrt(" + num(OP_A(inst), c) + ");");
             break;
         case IrCmd::ABS_NUM:
         {
@@ -2012,6 +2158,13 @@ struct GlslLowering
         return num(op, NumClass::Float);
     }
 
+    // floats are 'precise', which keeps drivers from contracting or reordering operations: Vulkan rounds each of them
+    // correctly, as the VM does for vectors
+    static std::string declType(NumClass c)
+    {
+        return c == NumClass::Float ? "precise float" : glslType(c);
+    }
+
     std::string declarations()
     {
         std::string decl;
@@ -2019,8 +2172,8 @@ struct GlslLowering
         for (int r = 0; r < proto->maxstacksize; r++)
         {
             std::string rs = "r" + std::to_string(r);
-            decl += "    uint " + rs + "t = 0u; int " + rs + "i = 0; vec3 " + rs + "v = vec3(0.0); int " + rs + "a = 0; uint " + rs +
-                    "u = 0u; float " + rs + "f = 0.0;\n";
+            decl += "    uint " + rs + "t = 0u; int " + rs + "i = 0; precise vec3 " + rs + "v = vec3(0.0); int " + rs + "a = 0; uint " + rs +
+                    "u = 0u; precise float " + rs + "f = 0.0;\n";
         }
 
         for (size_t i = 0; i < function.instructions.size(); i++)
@@ -2040,15 +2193,15 @@ struct GlslLowering
                 decl += "    int " + v + " = 0;\n";
                 break;
             case IrValueKind::Float:
-                decl += "    float " + v + " = 0.0;\n";
+                decl += "    precise float " + v + " = 0.0;\n";
                 break;
             case IrValueKind::Double:
-                decl += std::string("    ") + glslType(instClass[i]) + " " + v + " = " + glslType(instClass[i]) + "(0);\n";
+                decl += "    " + declType(instClass[i]) + " " + v + " = " + glslType(instClass[i]) + "(0);\n";
                 break;
             case IrValueKind::Tvalue:
             {
                 NumClass c = inst.cmd == IrCmd::LOAD_TVALUE ? instClass[i] : NumClass::Float;
-                decl += "    uint " + v + "t = 0u; " + glslType(c) + " " + v + "n = " + glslType(c) + "(0); int " + v + "i = 0; vec3 " + v +
+                decl += "    uint " + v + "t = 0u; " + declType(c) + " " + v + "n = " + glslType(c) + "(0); int " + v + "i = 0; precise vec3 " + v +
                         "v = vec3(0.0);\n";
                 break;
             }
@@ -2107,9 +2260,11 @@ struct GlslLowering
             return false;
 
         std::string& glsl = build.glsl;
-        // like the VM, shaders keep NaN, infinities and signed zeros (SignedZeroInfNanPreserve for 32-bit floats)
+        // like the VM, shaders keep NaN, infinities and signed zeros (SignedZeroInfNanPreserve for 32-bit floats), and denormal
+        // numbers (DenormPreserve)
         glsl = "#version 450\n#extension GL_EXT_spirv_intrinsics : require\n"
                "spirv_execution_mode(extensions = [\"SPV_KHR_float_controls\"], capabilities = [4466], 4461, 32);\n"
+               "spirv_execution_mode(extensions = [\"SPV_KHR_float_controls\"], capabilities = [4464], 4459, 32);\n"
                "layout(local_size_x = " +
                std::to_string(kGpuWorkgroupSize) + ") in;\n\n";
 

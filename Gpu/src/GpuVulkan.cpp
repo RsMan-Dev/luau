@@ -462,6 +462,7 @@ void VulkanBackend::Impl::destroyHostWords(HostWords& words)
 static const char* const kProbe = R"(#version 450
 #extension GL_EXT_spirv_intrinsics : require
 spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4466], 4461, 32);
+spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4464], 4459, 32);
 layout(local_size_x = 1) in;
 layout(std430, set = 0, binding = 0) buffer B0 { uint d[]; } b0;
 layout(std430, set = 0, binding = 1) coherent volatile buffer BS { uint err; int stop; uint started; } st;
@@ -475,6 +476,8 @@ void main()
     b0.d[3] = floatBitsToUint(z / z);
     b0.d[4] = floatBitsToUint(z * -1.0);
     b0.d[5] = floatBitsToUint(1.0 / (z * -1.0));
+    b0.d[7] = floatBitsToUint(uintBitsToFloat(b0.d[1] - 0x7f000000u) * 0.5);
+    b0.d[8] = floatBitsToUint(uintBitsToFloat(b0.d[1] - 0x7f7fffffu) + uintBitsToFloat(b0.d[1] - 0x7f7ffffeu));
     uint i = 0u;
     for (; i < 0x40000000u; i++)
     {
@@ -495,7 +498,7 @@ std::string VulkanBackend::Impl::probe()
         return "the probe kernel failed to build: " + reason;
 
     BufferEntry buffer;
-    buffer.deviceSize = 32;
+    buffer.deviceSize = 64;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kBindings};
     VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -512,14 +515,14 @@ std::string VulkanBackend::Impl::probe()
     dsai.pSetLayouts = &kernel.setLayout;
 
     if (!pool || vkAllocateDescriptorSets(device, &dsai, &set) != VK_SUCCESS ||
-        !createBuffer(32, true, buffer.device, buffer.deviceMemory, nullptr) ||
-        !createBuffer(32, false, buffer.staging, buffer.stagingMemory, &buffer.mapped))
+        !createBuffer(64, true, buffer.device, buffer.deviceMemory, nullptr) ||
+        !createBuffer(64, false, buffer.staging, buffer.stagingMemory, &buffer.mapped))
         reason = "not enough memory for the probe kernel";
 
     uint32_t* words = static_cast<uint32_t*>(buffer.mapped);
     if (reason.empty())
     {
-        memset(words, 0, 32);
+        memset(words, 0, 64);
         words[1] = 0x7f800000; // infinity; the kernel reads its inputs, so the compiler can't fold them
 
         VkDescriptorBufferInfo infos[2] = {{buffer.device, 0, VK_WHOLE_SIZE}, {status.buffer, 0, VK_WHOLE_SIZE}};
@@ -539,7 +542,7 @@ std::string VulkanBackend::Impl::probe()
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkResetCommandBuffer(commandBuffer, 0);
         vkBeginCommandBuffer(commandBuffer, &begin);
-        copyBuffer(commandBuffer, buffer.staging, buffer.device, 32);
+        copyBuffer(commandBuffer, buffer.staging, buffer.device, 64);
         barrier(
             commandBuffer,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -559,7 +562,7 @@ std::string VulkanBackend::Impl::probe()
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_ACCESS_TRANSFER_READ_BIT
         );
-        copyBuffer(commandBuffer, buffer.device, buffer.staging, 32);
+        copyBuffer(commandBuffer, buffer.device, buffer.staging, 64);
         barrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
         vkEndCommandBuffer(commandBuffer);
 
@@ -577,8 +580,9 @@ std::string VulkanBackend::Impl::probe()
     };
     if (reason.empty())
     {
-        if (!nan(words[2]) || !nan(words[3]) || words[4] != 0x80000000 || words[5] != 0xff800000)
-            reason = "its shaders don't keep NaN, infinities and signed zeros";
+        // half the smallest normal number is denormal
+        if (!nan(words[2]) || !nan(words[3]) || words[4] != 0x80000000 || words[5] != 0xff800000 || words[7] != 0x00400000 || words[8] != 0x00000003)
+            reason = "its shaders don't keep NaN, infinities, signed zeros and denormal numbers";
         if (words[6] != 1)
             reason += std::string(reason.empty() ? "its" : ", and its") + " shaders don't see the host asking a running kernel to stop";
     }
