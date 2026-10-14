@@ -1224,8 +1224,8 @@ assert(ok and matches, err)
 TEST_CASE("devices_that_break_the_kernel_contract_are_refused")
 {
 #if !defined(_WIN32)
-    // llvmpipe, Mesa's CPU implementation, reports SignedZeroInfNanPreserve but folds inf - inf to 0; the loader picks it when
-    // it's the only driver listed
+    // llvmpipe, Mesa's CPU implementation, flushes denormal numbers, which kernels need kept; the loader picks it
+    // when it's the only driver listed
     const char* const kDirs[] = {"/run/opengl-driver/share/vulkan/icd.d", "/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d"};
     std::string icd;
     for (const char* dir : kDirs)
@@ -1257,7 +1257,8 @@ TEST_CASE("devices_that_break_the_kernel_contract_are_refused")
         unsetenv("VK_DRIVER_FILES");
 
     CHECK(!backend);
-    bool refused = error.find("is refused:") != std::string::npos && error.find("NaN, infinities, signed zeros and denormal") != std::string::npos;
+    // the reason tells which check failed
+    bool refused = error.find("is refused: its shaders don't keep denormal numbers") != std::string::npos;
     CHECK_MESSAGE(refused, error);
 #endif
 
@@ -1271,6 +1272,65 @@ local b = buffer.create(16)
 assert(gpu.run(square, { b }, 4))
 assert(buffer.readu32(b, 12) == 9)
 )") == "");
+}
+
+TEST_CASE("amd_gpus_see_the_host_ask_runs_to_stop")
+{
+#if !defined(_WIN32)
+    // AMD's GPUs keep cached copies of the status words until a run ends, unless they're in memory the GPU doesn't cache:
+    // the probe refused RADV for not seeing the stop word, and a runaway run would have hit the timeout instead of being
+    // stopped. RADV is tested when it's installed and has a device
+    const char* const kDirs[] = {"/run/opengl-driver/share/vulkan/icd.d", "/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d"};
+    std::string icd;
+    for (const char* dir : kDirs)
+    {
+        std::error_code ec;
+        for (const std::filesystem::directory_entry& e : std::filesystem::directory_iterator(dir, ec))
+        {
+            if (e.path().filename().string().rfind("radeon_icd", 0) == 0)
+                icd = e.path().string();
+        }
+    }
+    if (icd.empty())
+    {
+        MESSAGE("skipped, RADV isn't installed");
+        return;
+    }
+
+    const char* previous = getenv("VK_DRIVER_FILES");
+    std::string saved = previous ? previous : "";
+    setenv("VK_DRIVER_FILES", icd.c_str(), 1);
+
+    std::string error;
+    std::unique_ptr<VulkanBackend> backend = VulkanBackend::create(error, waiting());
+
+    if (previous)
+        setenv("VK_DRIVER_FILES", saved.c_str(), 1);
+    else
+        unsetenv("VK_DRIVER_FILES");
+
+    if (!backend && error.find("is refused") == std::string::npos)
+    {
+        MESSAGE("skipped, no AMD device: " << error);
+        return;
+    }
+    REQUIRE_MESSAGE(backend, error);
+
+    auto start = std::chrono::steady_clock::now();
+    CHECK(run(*backend, R"(
+@gpu
+local function spin(b: buffer, i: number)
+    local n = 0
+    while true do
+        n += 1
+        buffer.writeu32(b, i * 4, n)
+    end
+end
+local ok, err = gpu.run(spin, { buffer.create(256) }, 64)
+assert(not ok and string.find(err, "failed on the GPU", 1, true), err)
+)") == "");
+    CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(3));
+#endif
 }
 
 TEST_CASE("kernels_keep_nan_infinities_and_signed_zeros")

@@ -513,6 +513,7 @@ struct VulkanBackend::Impl
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t queueFamily = 0;
     VkPhysicalDeviceMemoryProperties memory = {};
+    VkPhysicalDeviceCoherentMemoryFeaturesAMD coherentMemory = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COHERENT_MEMORY_FEATURES_AMD};
 
     VkCommandPool commandPool = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
@@ -576,7 +577,7 @@ struct VulkanBackend::Impl
     ~Impl();
 
     bool init(std::string& error);
-    bool createHostWords(uint32_t words, HostWords& result, bool cached = false);
+    bool createHostWords(uint32_t words, HostWords& result, bool cached = false, bool uncached = false);
     void destroyHostWords(HostWords& words);
     std::string probe();
     void savePipelineCache();
@@ -709,6 +710,20 @@ bool VulkanBackend::Impl::init(std::string& error)
             extensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
         if (!(core || listed) || !floatControls.shaderSignedZeroInfNanPreserveFloat32)
             floatReason = "the device can't keep NaN, infinities and signed zeros in shaders";
+
+        // AMD's GPUs cache the status words, and only write them back or see the host's writes once the run ends: a run
+        // couldn't be asked to stop. Memory the GPU doesn't cache is what lets it see them as they change
+        bool coherentListed = false;
+        for (const VkExtensionProperties& e : available)
+            coherentListed |= strcmp(e.extensionName, VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME) == 0;
+        if (coherentListed)
+        {
+            VkPhysicalDeviceFeatures2 features2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            features2.pNext = &coherentMemory;
+            vkGetPhysicalDeviceFeatures2(physical, &features2);
+            if (coherentMemory.deviceCoherentMemory)
+                extensions.push_back(VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME);
+        }
     }
 
     float priority = 1.0f;
@@ -722,6 +737,8 @@ bool VulkanBackend::Impl::init(std::string& error)
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = uint32_t(extensions.size());
     dci.ppEnabledExtensionNames = extensions.data();
+    if (coherentMemory.deviceCoherentMemory)
+        dci.pNext = &coherentMemory;
     VK_CHECK(vkCreateDevice(physical, &dci, nullptr, &device));
     vkGetDeviceQueue(device, queueFamily, 0, &queue);
 
@@ -761,7 +778,7 @@ bool VulkanBackend::Impl::init(std::string& error)
         VK_CHECK(vkCreatePipelineCache(device, &pcci, nullptr, &pipelineCache));
     }
 
-    if (!createHostWords(3, status))
+    if (!createHostWords(3, status, false, true))
     {
         error = "no host visible memory for the status words";
         return false;
@@ -789,7 +806,7 @@ bool VulkanBackend::Impl::init(std::string& error)
 // the status words are read by every invocation and written by the host while a run is going on, and kernels read and set
 // the words of written parts, so both live in device memory the host can map when there is some (resizable BAR), and in
 // host memory otherwise
-bool VulkanBackend::Impl::createHostWords(uint32_t words, HostWords& result, bool cached)
+bool VulkanBackend::Impl::createHostWords(uint32_t words, HostWords& result, bool cached, bool uncached)
 {
     HostWords w;
     w.words = words;
@@ -805,7 +822,9 @@ bool VulkanBackend::Impl::createHostWords(uint32_t words, HostWords& result, boo
     int type = findMemory(
         req.memoryTypeBits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        cached ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+        cached                                            ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT
+        : uncached && coherentMemory.deviceCoherentMemory ? VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD
+                                                          : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
     );
 
     VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -843,17 +862,21 @@ layout(push_constant) uniform PC { uint n; uint budget; uint len[1]; uint writte
 void main()
 {
     st.started = 1u;
+    // results are precise, as in kernels, which keeps compilers from folding inf - inf to 0
     float z = uintBitsToFloat(b0.d[0]), h = uintBitsToFloat(b0.d[1]);
-    b0.d[2] = floatBitsToUint(h - h);
-    b0.d[3] = floatBitsToUint(z / z);
-    b0.d[4] = floatBitsToUint(z * -1.0);
-    b0.d[5] = floatBitsToUint(1.0 / (z * -1.0));
-    b0.d[7] = floatBitsToUint(uintBitsToFloat(b0.d[1] - 0x7f000000u) * 0.5);
-    b0.d[8] = floatBitsToUint(uintBitsToFloat(b0.d[1] - 0x7f7fffffu) + uintBitsToFloat(b0.d[1] - 0x7f7ffffeu));
+    precise float d = h - h, q = z / z, n = z * -1.0, r = 1.0 / n;
+    precise float halfMin = uintBitsToFloat(b0.d[1] - 0x7f000000u) * 0.5;
+    precise float sum = uintBitsToFloat(b0.d[1] - 0x7f7fffffu) + uintBitsToFloat(b0.d[1] - 0x7f7ffffeu);
+    b0.d[2] = floatBitsToUint(d);
+    b0.d[3] = floatBitsToUint(q);
+    b0.d[4] = floatBitsToUint(n);
+    b0.d[5] = floatBitsToUint(r);
+    b0.d[7] = floatBitsToUint(halfMin);
+    b0.d[8] = floatBitsToUint(sum);
     uint i = 0u;
     for (; i < 0x40000000u; i++)
     {
-        if ((i & 255u) == 0u && st.stop != 0)
+        if ((i & 255u) == 0u && atomicAdd(st.stop, 0) != 0)
             break;
     }
     b0.d[6] = i < 0x40000000u ? 1u : 0u;
@@ -952,9 +975,18 @@ std::string VulkanBackend::Impl::probe()
     };
     if (reason.empty())
     {
-        // half the smallest normal number is denormal
-        if (!nan(words[2]) || !nan(words[3]) || words[4] != 0x80000000 || words[5] != 0xff800000 || words[7] != 0x00400000 || words[8] != 0x00000003)
-            reason = "its shaders don't keep NaN, infinities, signed zeros and denormal numbers";
+        // half the smallest normal number is denormal, and so is the sum of two denormal numbers here
+        std::vector<std::string> lost;
+        if (!nan(words[2]) || !nan(words[3]))
+            lost.push_back("NaN (inf - inf, 0 / 0)");
+        if (words[4] != 0x80000000)
+            lost.push_back("signed zeros (0 * -1)");
+        if (words[5] != 0xff800000)
+            lost.push_back("infinities (1 / -0)");
+        if (words[7] != 0x00400000 || words[8] != 0x00000003)
+            lost.push_back("denormal numbers (FLT_MIN * 0.5, a sum of denormals)");
+        for (size_t i = 0; i < lost.size(); ++i)
+            reason += (i == 0 ? "its shaders don't keep " : i + 1 == lost.size() ? " and " : ", ") + lost[i];
         if (words[6] != 1)
             reason += std::string(reason.empty() ? "its" : ", and its") + " shaders don't see the host asking a running kernel to stop";
     }
@@ -1035,12 +1067,17 @@ void VulkanBackend::Impl::savePipelineCache()
 
 int VulkanBackend::Impl::findMemory(uint32_t typeBits, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred)
 {
+    // memory the GPU doesn't cache is slow, and needs its feature: only the status words use it
+    VkMemoryPropertyFlags uncached = VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
     for (int pass = 0; pass < 2; ++pass)
     {
         VkMemoryPropertyFlags flags = pass == 0 ? required | preferred : required;
         for (uint32_t i = 0; i < memory.memoryTypeCount; ++i)
         {
-            if ((typeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & flags) == flags)
+            VkMemoryPropertyFlags has = memory.memoryTypes[i].propertyFlags;
+            if ((has & uncached) && !((required | preferred) & uncached))
+                continue;
+            if ((typeBits & (1u << i)) && (has & flags) == flags)
                 return int(i);
         }
     }

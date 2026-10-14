@@ -66,6 +66,9 @@ void l_fail(uint kind) { if (l_err == 0u) l_err = (kind << 24) | l_at; }
 bool l_flag = false;
 void l_fail(uint kind) { if (kind < 8u) l_flag = true; else if (l_err == 0u) l_err = (kind << 24) | l_at; }
 #endif
+// the host's stop word is read with an atomic, which goes to memory on GPUs whose plain loads of a coherent buffer can keep
+// seeing a cached copy
+bool l_stopped() { return atomicAdd(st.stop, 0) != 0; }
 bool l_bad(int off, int b) { return off < 0 || (off & 3) != 0 || uint(off) + 4u > pc.len[b]; }
 int l_chk(bool bad, int r) { if (bad) l_fail(2u); return r; }
 uint l_chk(bool bad, uint r) { if (bad) l_fail(2u); return r; }
@@ -2561,8 +2564,9 @@ struct GlslLowering
             // native code checks for interrupts here, at every loop iteration and before returning
             // and every 256 iterations, whether the host asked a run that takes too long to stop
             line(
-                "if ((++l_steps > pc.budget && pc.budget != 0u) || ((l_steps & 255u) == 0u && st.stop != 0)) { l_fail(st.stop != 0 ? " +
-                std::to_string(int(GpuFailure::Stopped)) + "u : " + std::to_string(int(GpuFailure::LoopBudget)) + "u); return; }"
+                "if ((++l_steps > pc.budget && pc.budget != 0u) || ((l_steps & 255u) == 0u && l_stopped())) { l_fail(l_steps > pc.budget && "
+                "pc.budget != 0u ? " +
+                std::to_string(int(GpuFailure::LoopBudget)) + "u : " + std::to_string(int(GpuFailure::Stopped)) + "u); return; }"
             );
             break;
         case IrCmd::RETURN:
@@ -2917,7 +2921,7 @@ struct GlslLowering
         glsl +=
             "    uint gid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * " + std::to_string(kGpuWorkgroupSize) + "u;\n";
         // invocations that start after the host asked the run to stop give up at once
-        glsl += "    if (gid >= pc.n) return;\n    if (gid == 0u) st.started = 1u;\n    if (st.stop != 0)\n        l_fail(9u);\n    else\n        "
+        glsl += "    if (gid >= pc.n) return;\n    if (gid == 0u) st.started = 1u;\n    if (l_stopped())\n        l_fail(9u);\n    else\n        "
                 "l_kernel(int(gid));\n"
                 "    if (l_ovf != 0u && l_err == 0u)\n        l_err = (6u << 24) | (l_ovf - 1u);\n"
                 "#ifndef L_EXACT\n    if (l_flag)\n        l_err = 11u << 24;\n#endif\n"

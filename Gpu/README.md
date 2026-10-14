@@ -120,10 +120,13 @@ A kernel can only touch the buffer it's given, and a run either completes cleanl
 - lowering, GLSL to SPIR-V compilation, SPIR-V validation, pipeline creation, device limits (storage buffer range,
   workgroup count, push constant size), allocation, submission and a zero status word must all succeed
 - devices are checked when the backend is created: a probe kernel must keep NaN, infinities, signed zeros and denormal
-  numbers, and see the host asking it to stop. Feature bits aren't trusted either way: llvmpipe reports
-  SignedZeroInfNanPreserve and folds `inf - inf` to 0, and NVIDIA reports no DenormPreserve for f32 yet keeps denormal
-  numbers when shaders declare it (and flushes them when they don't). Shaders always declare both modes, and a device
-  whose probe doesn't behave as they require is refused
+  numbers in precise operations, as kernels use them, and see the host asking it to stop; the refusal tells which.
+  Feature bits aren't trusted either way: NVIDIA and llvmpipe both report no DenormPreserve for f32, but NVIDIA keeps
+  denormal numbers when shaders declare it (and flushes them when they don't) while llvmpipe flushes them, and RADV
+  folds `inf - inf` to 0 outside precise operations. Shaders always declare both modes, and a device whose probe
+  doesn't behave as they require is refused. The status words are in memory the GPU doesn't cache where the device has
+  some (`VK_AMD_device_coherent_memory`), and kernels read the stop word with an atomic: AMD's GPUs otherwise keep
+  cached copies of them until the run ends, and runs couldn't be asked to stop
 - a run that doesn't finish within `VulkanOptions::timeoutMs` (5 s by default) or a lost device disables the backend for
   good: its results are never copied back and every later run fails
 - the backend is thread-safe
