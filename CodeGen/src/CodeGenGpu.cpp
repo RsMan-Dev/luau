@@ -6,6 +6,8 @@
 #include "lapi.h"
 #include "ldebug.h"
 
+#include <algorithm>
+
 #include <math.h>
 #include <stdio.h>
 
@@ -39,6 +41,9 @@ const char* const kPrelude = R"(
 uint l_steps = 0u;
 void l_fail() { atomicOr(st.err, 1u); }
 bool l_bad(int off, int b) { return off < 0 || (off & 3) != 0 || uint(off) + 4u > pc.len[b]; }
+int l_chk(bool bad, int r) { if (bad) l_fail(); return r; }
+uint l_chk(bool bad, uint r) { if (bad) l_fail(); return r; }
+int l_idivk(int a, int k) { int q = a / k; if (q * k != a && a < 0) q -= 1; return q; }
 int l_addi(int a, int b) { int r = a + b; if (((a ^ r) & (b ^ r)) < 0) l_fail(); return r; }
 int l_subi(int a, int b) { int r = a - b; if (((a ^ b) & (a ^ r)) < 0) l_fail(); return r; }
 int l_muli(int a, int b) { int hi, lo; imulExtended(a, b, hi, lo); if (hi != (lo >> 31)) l_fail(); return lo; }
@@ -225,6 +230,7 @@ struct RegState
     NumClass cls = NumClass::None; // class of its number, which lives in the variable of that class
     int buffer = -1;               // binding of its buffer, -1 for none, -2 when it isn't known statically
     GpuCall call = GpuCall::None;  // import it holds
+    int tag = -1;                  // its tag, -1 when it isn't known statically
 };
 
 struct GlslLowering
@@ -237,12 +243,40 @@ struct GlslLowering
     std::vector<NumClass> instClass; // per instruction producing a double, or the number of a loaded TValue
     std::vector<int> instBuffer;     // per instruction producing a buffer pointer or TValue
     std::vector<GpuCall> instCall;   // per instruction loading a TValue: the import it holds
+    std::vector<int> instTag;        // per instruction loading a tag or TValue: the tag, -1 when it isn't known statically
+
+    // bounds of the integer an instruction produces, which spare overflow checks when they fit its class
+    struct Range
+    {
+        double lo = -INFINITY;
+        double hi = INFINITY;
+    };
+    std::vector<Range> instRange;
 
     // registers are reused for values of different types, so what they hold is tracked along the control flow
     std::vector<std::vector<RegState>> entry; // per block, when it starts
     std::vector<bool> reached;
     std::vector<RegState> cur; // at the instruction being analyzed or lowered
     bool changed = false;
+
+    // structured control flow, as in "Beyond Relooper" (Ramsey, 2022): the IR of Luau code is reducible, so each block is
+    // emitted once, in its immediate dominator, inside a loop if it's a loop header, after the blocks that end where the
+    // block's dominator tree children with several predecessors start. Jumps across constructs go through l_jmp.
+    struct Construct
+    {
+        uint32_t block; // loop header, or block that follows
+        bool loop;
+        uint32_t exit = ~0u;    // for a loop: the block that follows it
+        bool exited = false;    // some jump from a nested construct ends after this one
+        bool restarted = false; // some jump from a nested construct restarts this loop
+        bool passed = false;    // some jump from a nested construct ends further out
+    };
+    std::vector<Construct> constructs;
+    std::vector<int> order; // reverse postorder index of reached blocks
+    std::vector<int> forwardPreds;
+    std::vector<std::vector<uint32_t>> children; // in the dominator tree of the reached blocks
+    uint32_t current = 0;                        // block being lowered
+    uint32_t fallsTo = ~0u;                      // block that runs next when the code being emitted completes without jumping, if known
 
     std::vector<bool> readBuffers;
     std::vector<uint8_t> atomics; // per buffer, a bit per atomic operation used
@@ -326,6 +360,128 @@ struct GlslLowering
         }
     }
 
+    // the value of a constant operand that is an integer of the class
+    bool constInt(IrOp op, NumClass c, int64_t& k)
+    {
+        double v;
+        if (op.kind == IrOpKind::Constant && function.constOp(op).kind == IrConstKind::Double)
+            v = function.doubleOp(op);
+        else if (op.kind == IrOpKind::VmConst && ttisnumber(&proto->k[vmConstOp(op)]))
+            v = nvalue(&proto->k[vmConstOp(op)]);
+        else
+            return false;
+
+        if (v != floor(v) || v < (c == NumClass::Uint ? 0.0 : -2147483648.0) || v > (c == NumClass::Uint ? 4294967295.0 : 2147483647.0))
+            return false;
+
+        k = int64_t(v);
+        return true;
+    }
+
+    // integer arithmetic with a constant operand needs simpler checks, and none for divisions by positive constants; the
+    // classes of the operands bound them further: a NonNeg value is at least 0
+    std::string intArith(uint32_t index, IrCmd cmd, IrOp opa, IrOp opb, NumClass c)
+    {
+        std::string a = num(opa, c), b = num(opb, c);
+
+        // results that fit the class can't overflow
+        Range r = instRange[index], domain = classRange(c);
+        if (r.lo >= domain.lo && r.hi <= domain.hi && (cmd == IrCmd::ADD_NUM || cmd == IrCmd::SUB_NUM || cmd == IrCmd::MUL_NUM))
+            return "(" + a + (cmd == IrCmd::ADD_NUM ? " + " : cmd == IrCmd::SUB_NUM ? " - " : " * ") + b + ")";
+
+        bool uns = c == NumClass::Uint;
+        bool nonneg = c == NumClass::NonNeg;
+        std::string u = uns ? "u" : "";
+        int64_t max = uns ? 4294967295ll : 2147483647ll, min = uns ? 0 : -2147483648ll;
+
+        int64_t k;
+        bool constB = constInt(opb, c, k);
+        if (!constB && (cmd == IrCmd::ADD_NUM || cmd == IrCmd::MUL_NUM) && constInt(opa, c, k))
+        {
+            std::swap(a, b);
+            constB = true;
+        }
+
+        auto lit = [&](int64_t v)
+        {
+            return v == -2147483648ll ? std::string("int(0x80000000u)") : "(" + std::to_string(v) + u + ")";
+        };
+
+        switch (cmd)
+        {
+        case IrCmd::ADD_NUM:
+        case IrCmd::SUB_NUM:
+        {
+            bool add = cmd == IrCmd::ADD_NUM;
+            if (constB && (add || k != min))
+            {
+                int64_t d = add ? k : -k;
+                if (d == 0)
+                    return a;
+                std::string r = a + (add ? " + " : " - ") + b;
+                if (d > 0)
+                    return "l_chk(" + a + " > " + lit(max - d) + ", " + r + ")";
+                if (uns)
+                    break;
+                return "l_chk(" + a + " < " + lit(min - d) + ", " + r + ")";
+            }
+            if (add && nonneg)
+                return "l_chk((" + a + " + " + b + ") < 0, " + a + " + " + b + ")";
+            break;
+        }
+        case IrCmd::MUL_NUM:
+            if (constB && k > 0)
+            {
+                if (k == 1)
+                    return a;
+                std::string r = a + " * " + b;
+                if (uns || nonneg)
+                    return "l_chk(" + a + " > " + lit(max / k) + ", " + r + ")";
+                return "l_chk(" + a + " > " + lit(max / k) + " || " + a + " < " + lit(-(2147483648ll / k)) + ", " + r + ")";
+            }
+            break;
+        case IrCmd::IDIV_NUM:
+        case IrCmd::MOD_NUM:
+            if (constB && k > 0)
+            {
+                bool idiv = cmd == IrCmd::IDIV_NUM;
+                bool pow2 = (k & (k - 1)) == 0;
+                int shift = 0;
+                while ((int64_t(1) << shift) < k)
+                    shift++;
+
+                // shifting a two's complement value right rounds down, like Luau's floor division
+                if (pow2 && !uns)
+                    return idiv ? "(" + a + " >> " + std::to_string(shift) + ")" : "(" + a + " & " + lit(k - 1) + ")";
+                if (uns || nonneg || range(opa).lo >= 0)
+                    return "(" + a + (idiv ? " / " : " % ") + b + ")";
+                return idiv ? "l_idivk(" + a + ", " + b + ")" : "(" + a + " - l_idivk(" + a + ", " + b + ") * " + b + ")";
+            }
+            break;
+        default:
+            break;
+        }
+
+        a = num(opa, c);
+        b = num(opb, c);
+        switch (cmd)
+        {
+        case IrCmd::ADD_NUM:
+            return (uns ? "l_addu(" : "l_addi(") + a + ", " + b + ")";
+        case IrCmd::SUB_NUM:
+            return "l_subi(" + a + ", " + b + ")";
+        case IrCmd::MUL_NUM:
+            return (uns ? "l_mulu(" : "l_muli(") + a + ", " + b + ")";
+        case IrCmd::IDIV_NUM:
+            return (uns ? "l_idivu(" : "l_idivi(") + a + ", " + b + ")";
+        case IrCmd::MOD_NUM:
+            return (uns ? "l_modu(" : "l_modi(") + a + ", " + b + ")";
+        default:
+            CODEGEN_ASSERT(!"not an integer operation");
+            return "0";
+        }
+    }
+
     std::string num(IrOp op, NumClass to, bool exact = false)
     {
         Num n = num(op);
@@ -368,8 +524,37 @@ struct GlslLowering
         return op.kind == IrOpKind::Inst && getCmdValueKind(function.instOp(op).cmd) == IrValueKind::Tvalue;
     }
 
+    // tags known statically spare the checks that loop iterations would otherwise repeat
+    int knownTag(IrOp op)
+    {
+        if (op.kind == IrOpKind::Constant)
+            return function.tagOp(op);
+        if (op.kind == IrOpKind::VmReg)
+            return cur[vmRegOp(op)].tag;
+        if (op.kind == IrOpKind::VmConst)
+            return ttype(&proto->k[vmConstOp(op)]);
+        if (op.kind == IrOpKind::Inst)
+            return instTag[op.index];
+        return -1;
+    }
+
+    // the target a tag check or comparison always takes, if known statically
+    IrOp knownTarget(IrInst& inst)
+    {
+        int a = knownTag(OP_A(inst)), b = knownTag(OP_B(inst));
+        if (a < 0 || b < 0)
+            return {};
+        if (inst.cmd == IrCmd::JUMP_EQ_TAG)
+            return a == b ? OP_C(inst) : OP_D(inst);
+        if (inst.cmd == IrCmd::CHECK_TAG && a != b)
+            return OP_C(inst);
+        return {};
+    }
+
     std::string tag(IrOp op)
     {
+        if (int k = knownTag(op); k >= 0)
+            return std::to_string(k) + "u";
         if (op.kind == IrOpKind::Constant)
             return std::to_string(function.tagOp(op)) + "u";
         if (op.kind == IrOpKind::VmReg)
@@ -457,14 +642,121 @@ struct GlslLowering
         }
     }
 
+    static Range classRange(NumClass c)
+    {
+        switch (c)
+        {
+        case NumClass::NonNeg:
+            return {0, 2147483647.0};
+        case NumClass::Uint:
+            return {0, 4294967295.0};
+        case NumClass::Int:
+            return {-2147483648.0, 2147483647.0};
+        default:
+            return {};
+        }
+    }
+
+    Range range(IrOp op)
+    {
+        if (op.kind == IrOpKind::Inst)
+            return instRange[op.index];
+        if (op.kind == IrOpKind::Constant)
+        {
+            IrConst& k = function.constOp(op);
+            double v = k.kind == IrConstKind::Double ? k.valueDouble : k.kind == IrConstKind::Uint ? double(k.valueUint) : double(k.valueInt);
+            return v == floor(v) ? Range{v, v} : Range{};
+        }
+        if (op.kind == IrOpKind::VmConst && ttisnumber(&proto->k[vmConstOp(op)]))
+        {
+            double v = nvalue(&proto->k[vmConstOp(op)]);
+            return v == floor(v) ? Range{v, v} : Range{};
+        }
+        return classRange(cls(op));
+    }
+
+    Range resultRange(IrInst& inst)
+    {
+        Range a = range(OP_A(inst)), b = inst.ops.size() > 1 ? range(OP_B(inst)) : Range();
+        Range r;
+
+        switch (inst.cmd)
+        {
+        case IrCmd::LOAD_DOUBLE:
+            return a;
+        case IrCmd::ADD_NUM:
+        case IrCmd::ADD_INT:
+            r = {a.lo + b.lo, a.hi + b.hi};
+            break;
+        case IrCmd::SUB_NUM:
+        case IrCmd::SUB_INT:
+            r = {a.lo - b.hi, a.hi - b.lo};
+            break;
+        case IrCmd::MUL_NUM:
+        {
+            double p[] = {a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi};
+            r = {std::min(std::min(p[0], p[1]), std::min(p[2], p[3])), std::max(std::max(p[0], p[1]), std::max(p[2], p[3]))};
+            break;
+        }
+        case IrCmd::IDIV_NUM:
+            if (b.lo == b.hi && b.lo > 0)
+                r = {floor(a.lo / b.lo), floor(a.hi / b.lo)};
+            break;
+        case IrCmd::MOD_NUM:
+            if (b.lo == b.hi && b.lo > 0)
+                r = a.lo >= 0 && a.hi < b.lo ? a : Range{0, b.lo - 1};
+            break;
+        case IrCmd::MIN_NUM:
+            r = {std::min(a.lo, b.lo), std::min(a.hi, b.hi)};
+            break;
+        case IrCmd::MAX_NUM:
+            r = {std::max(a.lo, b.lo), std::max(a.hi, b.hi)};
+            break;
+        case IrCmd::UNM_NUM:
+            r = {-a.hi, -a.lo};
+            break;
+        case IrCmd::FLOOR_NUM:
+        case IrCmd::CEIL_NUM:
+        case IrCmd::ROUND_NUM:
+            r = {floor(a.lo), ceil(a.hi)};
+            break;
+        case IrCmd::INT_TO_NUM:
+        case IrCmd::NUM_TO_INT:
+            r = a;
+            break;
+        case IrCmd::UINT_TO_NUM:
+            r = a.lo >= 0 ? a : Range{0, 4294967295.0};
+            break;
+        case IrCmd::BITAND_UINT:
+            if (a.lo >= 0 || b.lo >= 0)
+                r = {0, std::min(a.lo >= 0 ? a.hi : INFINITY, b.lo >= 0 ? b.hi : INFINITY)};
+            break;
+        default:
+            break;
+        }
+
+        // NaN from infinite bounds
+        if (!(r.lo <= r.hi))
+            return {};
+        return r;
+    }
+
     // facts about the value an instruction produces, from what registers hold before it
     void facts(IrInst& inst, uint32_t index)
     {
         if (getCmdValueKind(inst.cmd) == IrValueKind::Double)
             instClass[index] = resultClass(inst);
 
+        // only integers computed exactly have bounds; f32 rounding would move those of floats
+        if ((getCmdValueKind(inst.cmd) == IrValueKind::Double && instClass[index] != NumClass::Float) ||
+            getCmdValueKind(inst.cmd) == IrValueKind::Int)
+            instRange[index] = resultRange(inst);
+
         if (inst.cmd == IrCmd::LOAD_POINTER || inst.cmd == IrCmd::LOAD_TVALUE)
             instBuffer[index] = buffer(OP_A(inst));
+
+        if (inst.cmd == IrCmd::LOAD_TAG || inst.cmd == IrCmd::LOAD_TVALUE)
+            instTag[index] = knownTag(OP_A(inst));
 
         if (inst.cmd == IrCmd::LOAD_TVALUE)
         {
@@ -476,6 +768,14 @@ struct GlslLowering
     // what registers hold after an instruction
     void effects(IrInst& inst, uint32_t index)
     {
+        // past a tag check, the register it loaded the tag of holds that tag
+        if (inst.cmd == IrCmd::CHECK_TAG && OP_A(inst).kind == IrOpKind::Inst && OP_B(inst).kind == IrOpKind::Constant && index > 0)
+        {
+            IrInst& load = function.instOp(OP_A(inst));
+            if (load.cmd == IrCmd::LOAD_TAG && OP_A(load).kind == IrOpKind::VmReg && OP_A(inst).index == index - 1)
+                cur[vmRegOp(OP_A(load))].tag = function.tagOp(OP_B(inst));
+        }
+
         if (!writesRegister(inst) && inst.cmd != IrCmd::GET_CACHED_IMPORT)
             return;
 
@@ -490,21 +790,28 @@ struct GlslLowering
             s.call = GpuCall::Unknown;
             if (OP_B(inst).kind != IrOpKind::Constant || function.tagOp(OP_B(inst)) != LUA_TBUFFER)
                 s.buffer = -1;
+            s.tag = knownTag(OP_B(inst));
             break;
         case IrCmd::STORE_DOUBLE:
             s.cls = cls(OP_B(inst));
+            s.tag = cur[r].tag;
             break;
         case IrCmd::STORE_INT:
             s.cls = cur[r].cls;
+            s.tag = cur[r].tag;
+            break;
+        case IrCmd::STORE_VECTOR:
+            s.tag = OP_E(inst).kind != IrOpKind::None ? knownTag(OP_E(inst)) : cur[r].tag;
             break;
         case IrCmd::STORE_TVALUE:
         {
             IrOp src = OP_B(inst);
             if (src.kind == IrOpKind::Inst && function.instOp(src).cmd == IrCmd::LOAD_TVALUE)
-                s = {instClass[src.index], instBuffer[src.index] >= 0 ? instBuffer[src.index] : -1, instCall[src.index]};
+                s = {instClass[src.index], instBuffer[src.index] >= 0 ? instBuffer[src.index] : -1, instCall[src.index], instTag[src.index]};
             break;
         }
         case IrCmd::STORE_SPLIT_TVALUE:
+            s.tag = knownTag(OP_B(inst));
             if (function.tagOp(OP_B(inst)) == LUA_TNUMBER)
                 s.cls = cls(OP_C(inst));
             else if (function.tagOp(OP_B(inst)) == LUA_TBUFFER)
@@ -512,6 +819,7 @@ struct GlslLowering
             break;
         case IrCmd::STORE_POINTER:
             s.buffer = buffer(OP_B(inst));
+            s.tag = cur[r].tag;
             break;
         case IrCmd::GET_CACHED_IMPORT:
             s.call = importCall(function.importOp(OP_C(inst)));
@@ -558,9 +866,10 @@ struct GlslLowering
             RegState m = {
                 join(to[r].cls, cur[r].cls),
                 to[r].buffer == cur[r].buffer ? to[r].buffer : -2,
-                to[r].call == cur[r].call ? to[r].call : GpuCall::Unknown
+                to[r].call == cur[r].call ? to[r].call : GpuCall::Unknown,
+                to[r].tag == cur[r].tag ? to[r].tag : -1
             };
-            changed |= m.cls != to[r].cls || m.buffer != to[r].buffer || m.call != to[r].call;
+            changed |= m.cls != to[r].cls || m.buffer != to[r].buffer || m.call != to[r].call || m.tag != to[r].tag;
             to[r] = m;
         }
     }
@@ -573,6 +882,17 @@ struct GlslLowering
 
     void reachTargets(IrInst& inst)
     {
+        // a tag check that always passes doesn't reach its fallback, nor a tag comparison known statically its other target
+        if (inst.cmd == IrCmd::CHECK_TAG || inst.cmd == IrCmd::JUMP_EQ_TAG)
+        {
+            int a = knownTag(OP_A(inst)), b = knownTag(OP_B(inst));
+            if (a >= 0 && b >= 0)
+            {
+                reach(knownTarget(inst));
+                return;
+            }
+        }
+
         for (IrOp op : inst.ops)
             reach(op);
     }
@@ -584,11 +904,17 @@ struct GlslLowering
         instClass.assign(size, NumClass::None);
         instBuffer.assign(size, -1);
         instCall.assign(size, GpuCall::None);
+        instTag.assign(size, -1);
+        instRange.assign(size, Range());
 
         std::vector<RegState> start(proto->maxstacksize);
         start[0].cls = NumClass::NonNeg;
+        start[0].tag = LUA_TNUMBER;
         for (int i = 1; i < proto->numparams; i++)
+        {
             start[i].buffer = i - 1;
+            start[i].tag = LUA_TBUFFER;
+        }
 
         entry.assign(function.blocks.size(), std::vector<RegState>(proto->maxstacksize));
         reached.assign(function.blocks.size(), false);
@@ -619,9 +945,13 @@ struct GlslLowering
                         OP_A(inst).kind != IrOpKind::VmReg)
                         return reject(index, "a store outside of the stack");
 
+                    // a failing tag check leaves with what registers held before it
                     facts(inst, index);
+                    if (inst.cmd == IrCmd::CHECK_TAG)
+                        reachTargets(inst);
                     effects(inst, index);
-                    reachTargets(inst);
+                    if (inst.cmd != IrCmd::CHECK_TAG)
+                        reachTargets(inst);
                 }
             }
         }
@@ -657,16 +987,323 @@ struct GlslLowering
                     moves += dst + " = " + value + "; ";
             }
 
-            return "{ " + moves + "l_block = " + std::to_string(target.index) + "; continue; }";
+            return "{ " + moves + branch(target.index) + " }";
         }
 
         // fallbacks, exits to the VM and aborts: the host reruns the dispatch in the VM
         return "{ l_fail(); return; }";
     }
 
+    bool backward(uint32_t from, uint32_t to)
+    {
+        return order[to] <= order[from];
+    }
+
+    bool merge(uint32_t block)
+    {
+        return forwardPreds[block] > 1;
+    }
+
+    static std::string breakCode(uint32_t block)
+    {
+        return std::to_string(block * 2 + 2);
+    }
+
+    static std::string continueCode(uint32_t block)
+    {
+        return std::to_string(block * 2 + 3);
+    }
+
+    // leaves the constructs up to the one that restarts 'block' (a loop) or that 'block' follows
+    std::string leave(uint32_t block, bool loop)
+    {
+        for (size_t i = constructs.size(); i > 0; i--)
+        {
+            Construct& c = constructs[i - 1];
+            if (loop ? !c.loop || c.block != block : (c.loop ? c.exit : c.block) != block)
+                continue;
+
+            if (i == constructs.size())
+                return loop ? "continue;" : "break;";
+
+            (loop ? c.restarted : c.exited) = true;
+            for (size_t j = i; j < constructs.size(); j++)
+                constructs[j].passed = true;
+            return "l_jmp = " + (loop ? continueCode(block) : breakCode(block)) + "; break;";
+        }
+
+        CODEGEN_ASSERT(!"jump to a construct that doesn't enclose it");
+        return "l_fail(); return;";
+    }
+
+    std::string branch(uint32_t target)
+    {
+        if (backward(current, target))
+            return leave(target, true);
+        if (merge(target))
+            return leave(target, false);
+
+        // the only way into the target: it's emitted right here
+        uint32_t from = current;
+        std::vector<RegState> state = cur;
+        std::string code = tree(target);
+        current = from;
+        cur = state;
+        return code;
+    }
+
+    // after a construct closes: a jump that ends here stops, one to a construct further out keeps leaving
+    std::string landing(const Construct& closed)
+    {
+        std::string code;
+        if (closed.exited)
+            code += "if (l_jmp == " + breakCode(closed.loop ? closed.exit : closed.block) + ") l_jmp = 0;\n";
+
+        if (closed.passed)
+        {
+            const Construct& parent = constructs.back();
+            code += "if (l_jmp != 0) { ";
+            if (parent.loop && parent.restarted)
+                code += "if (l_jmp == " + continueCode(parent.block) + ") { l_jmp = 0; continue; } ";
+            code += "break; }\n";
+        }
+
+        return code;
+    }
+
+    // the blocks of the loop that 'header' starts: those that reach it again without going through it
+    std::vector<bool> loopBody(uint32_t header)
+    {
+        std::vector<bool> body(function.blocks.size(), false);
+        body[header] = true;
+
+        std::vector<uint32_t> stack;
+        for (uint32_t pred : predecessors(function.cfg, header))
+        {
+            if (lowered[pred] && reached[pred] && backward(pred, header) && !body[pred])
+            {
+                body[pred] = true;
+                stack.push_back(pred);
+            }
+        }
+
+        while (!stack.empty())
+        {
+            uint32_t block = stack.back();
+            stack.pop_back();
+
+            for (uint32_t pred : predecessors(function.cfg, block))
+            {
+                if (lowered[pred] && reached[pred] && !body[pred])
+                {
+                    body[pred] = true;
+                    stack.push_back(pred);
+                }
+            }
+        }
+
+        return body;
+    }
+
+    std::string tree(uint32_t block)
+    {
+        std::vector<uint32_t> merges;
+        for (uint32_t child : children[block])
+        {
+            if (merge(child))
+                merges.push_back(child);
+        }
+
+        // the merge reached last ends outermost
+        std::sort(
+            merges.begin(),
+            merges.end(),
+            [&](uint32_t a, uint32_t b)
+            {
+                return order[a] > order[b];
+            }
+        );
+
+        bool header = false;
+        for (uint32_t pred : predecessors(function.cfg, block))
+            header |= lowered[pred] && reached[pred] && backward(pred, block);
+
+        if (!header)
+            return within(block, merges, 0);
+
+        // the merges outside of the loop follow it, so that leaving the loop for the nearest one is a plain break
+        std::vector<bool> body = loopBody(block);
+        std::vector<uint32_t> inner, exits;
+        for (uint32_t m : merges)
+            (body[m] ? inner : exits).push_back(m);
+
+        return around(block, exits, 0, inner);
+    }
+
+    std::string around(uint32_t header, const std::vector<uint32_t>& exits, size_t i, const std::vector<uint32_t>& inner)
+    {
+        if (i + 1 < exits.size())
+        {
+            constructs.push_back({exits[i], false});
+            uint32_t after = fallsTo;
+            fallsTo = exits[i];
+            std::string code = "for (;;)\n{\n" + around(header, exits, i + 1, inner) + "break;\n}\n";
+            fallsTo = after;
+            Construct region = constructs.back();
+            constructs.pop_back();
+            return code + landing(region) + tree(exits[i]);
+        }
+
+        // without a merge of its own after it, the loop can still be left with a plain break for the block that runs once the
+        // code around it completes
+        constructs.push_back({header, true, i < exits.size() ? exits[i] : fallsTo});
+        uint32_t after = fallsTo;
+        fallsTo = ~0u;
+        std::string code = "for (;;)\n{\n" + within(header, inner, 0) + "}\n";
+        fallsTo = after;
+        Construct loop = constructs.back();
+        constructs.pop_back();
+        code += landing(loop);
+        return i < exits.size() ? code + tree(exits[i]) : code;
+    }
+
+    std::string within(uint32_t block, const std::vector<uint32_t>& merges, size_t i)
+    {
+        if (i == merges.size())
+            return blockCode(block);
+
+        constructs.push_back({merges[i], false});
+        uint32_t after = fallsTo;
+        fallsTo = merges[i];
+        std::string code = "for (;;)\n{\n" + within(block, merges, i + 1) + "break;\n}\n";
+        fallsTo = after;
+        Construct region = constructs.back();
+        constructs.pop_back();
+        return code + landing(region) + tree(merges[i]);
+    }
+
+    std::string blockCode(uint32_t blockIndex)
+    {
+        current = blockIndex;
+        cur = entry[blockIndex];
+
+        std::string saved;
+        saved.swap(out);
+
+        IrBlock& block = function.blocks[blockIndex];
+        for (uint32_t index = block.start; index <= block.finish && !failed; index++)
+        {
+            IrInst& inst = function.instructions[index];
+            if (isPseudo(inst.cmd))
+                continue;
+
+            facts(inst, index);
+            if (!lowerInst(inst, index))
+                break;
+            effects(inst, index);
+        }
+
+        saved.swap(out);
+        return saved;
+    }
+
+    // reverse postorder of the reached blocks, and their predecessors along forward edges
+    void orderBlocks()
+    {
+        order.assign(function.blocks.size(), 0);
+        forwardPreds.assign(function.blocks.size(), 0);
+
+        std::vector<uint32_t> postorder;
+        std::vector<uint8_t> visited(function.blocks.size(), 0);
+        std::vector<std::pair<uint32_t, bool>> stack = {{function.entryBlock, false}};
+        while (!stack.empty())
+        {
+            auto [block, done] = stack.back();
+            stack.pop_back();
+
+            if (done)
+            {
+                postorder.push_back(block);
+                continue;
+            }
+            if (visited[block])
+                continue;
+
+            visited[block] = 1;
+            stack.push_back({block, true});
+            for (uint32_t succ : successors(function.cfg, block))
+            {
+                if (lowered[succ] && reached[succ] && !visited[succ])
+                    stack.push_back({succ, false});
+            }
+        }
+
+        for (size_t i = 0; i < postorder.size(); i++)
+            order[postorder[i]] = int(postorder.size() - 1 - i);
+
+        for (uint32_t block : postorder)
+        {
+            for (uint32_t pred : predecessors(function.cfg, block))
+            {
+                if (lowered[pred] && reached[pred] && !backward(pred, block))
+                    forwardPreds[block]++;
+            }
+        }
+
+        // dominators of the blocks that are actually lowered, which jumps to fallbacks don't change ("A Simple, Fast Dominance
+        // Algorithm", Cooper, Harvey and Kennedy)
+        std::vector<uint32_t> rpo(postorder.rbegin(), postorder.rend());
+        std::vector<int> idom(function.blocks.size(), -1);
+        idom[function.entryBlock] = int(function.entryBlock);
+
+        for (bool progress = true; progress;)
+        {
+            progress = false;
+            for (size_t i = 1; i < rpo.size(); i++)
+            {
+                int dom = -1;
+                for (uint32_t pred : predecessors(function.cfg, rpo[i]))
+                {
+                    if (!lowered[pred] || !reached[pred] || idom[pred] < 0)
+                        continue;
+
+                    if (dom < 0)
+                    {
+                        dom = int(pred);
+                        continue;
+                    }
+
+                    int a = int(pred), b = dom;
+                    while (a != b)
+                    {
+                        while (order[a] > order[b])
+                            a = idom[a];
+                        while (order[b] > order[a])
+                            b = idom[b];
+                    }
+                    dom = a;
+                }
+
+                if (dom != idom[rpo[i]])
+                {
+                    idom[rpo[i]] = dom;
+                    progress = true;
+                }
+            }
+        }
+
+        children.assign(function.blocks.size(), {});
+        for (size_t i = 1; i < rpo.size(); i++)
+            children[idom[rpo[i]]].push_back(rpo[i]);
+    }
+
     void guard(const std::string& ok, IrOp target)
     {
+        // the rest of the block follows the code jumped to
+        uint32_t after = fallsTo;
+        fallsTo = ~0u;
         line("if (!" + ok + ") " + jump(target));
+        fallsTo = after;
     }
 
     std::string truthy(IrOp reg)
@@ -940,17 +1577,14 @@ struct GlslLowering
             if (c == NumClass::Float)
                 line(v + " = " + a + (add ? " + " : " * ") + b + ";");
             else
-                line(
-                    v + " = " + (add ? (c == NumClass::Uint ? "l_addu(" : "l_addi(") : (c == NumClass::Uint ? "l_mulu(" : "l_muli(")) + a + ", " + b +
-                    ");"
-                );
+                line(v + " = " + intArith(index, inst.cmd, OP_A(inst), OP_B(inst), c) + ";");
             break;
         }
         case IrCmd::SUB_NUM:
             if (c == NumClass::Float)
                 line(v + " = " + num(OP_A(inst), c) + " - " + num(OP_B(inst), c) + ";");
             else
-                line(v + " = l_subi(" + num(OP_A(inst), c) + ", " + num(OP_B(inst), c) + ");");
+                line(v + " = " + intArith(index, inst.cmd, OP_A(inst), OP_B(inst), c) + ";");
             break;
         case IrCmd::MULADD_NUM:
             if (c == NumClass::Float)
@@ -971,10 +1605,7 @@ struct GlslLowering
             if (c == NumClass::Float)
                 line(v + " = " + (idiv ? "floor(" + a + " / " + b + ")" : a + " - floor(" + a + " / " + b + ") * " + b) + ";");
             else
-                line(
-                    v + " = " + (idiv ? (c == NumClass::Uint ? "l_idivu(" : "l_idivi(") : (c == NumClass::Uint ? "l_modu(" : "l_modi(")) + a + ", " +
-                    b + ");"
-                );
+                line(v + " = " + intArith(index, inst.cmd, OP_A(inst), OP_B(inst), c) + ";");
             break;
         }
         case IrCmd::MIN_NUM:
@@ -1068,6 +1699,11 @@ struct GlslLowering
             );
             break;
         case IrCmd::JUMP_EQ_TAG:
+            if (IrOp known = knownTarget(inst); known.kind != IrOpKind::None)
+            {
+                line(jump(known));
+                break;
+            }
             line("if (" + tag(OP_A(inst)) + " == " + tag(OP_B(inst)) + ") " + jump(OP_C(inst)) + " else " + jump(OP_D(inst)));
             break;
         case IrCmd::JUMP_CMP_INT:
@@ -1116,6 +1752,13 @@ struct GlslLowering
             line(v + " = " + num(OP_A(inst), NumClass::Float) + ";");
             break;
         case IrCmd::CHECK_TAG:
+            if (knownTag(OP_A(inst)) >= 0 && knownTag(OP_A(inst)) == knownTag(OP_B(inst)))
+                break;
+            if (IrOp known = knownTarget(inst); known.kind != IrOpKind::None)
+            {
+                guard("false", known);
+                break;
+            }
             guard("(" + tag(OP_A(inst)) + " == " + tag(OP_B(inst)) + ")", OP_C(inst));
             break;
         case IrCmd::CHECK_CMP_NUM:
@@ -1426,32 +2069,10 @@ struct GlslLowering
         if (!analyze(sortedBlocks))
             return false;
 
-        for (uint32_t blockIndex : sortedBlocks)
-        {
-            if (!lowered[blockIndex])
-                continue;
-
-            if (!reached[blockIndex])
-                continue;
-
-            IrBlock& block = function.blocks[blockIndex];
-            out += "    case " + std::to_string(blockIndex) + ":\n    {\n";
-            cur = entry[blockIndex];
-
-            for (uint32_t index = block.start; index <= block.finish; index++)
-            {
-                IrInst& inst = function.instructions[index];
-                if (isPseudo(inst.cmd))
-                    continue;
-
-                facts(inst, index);
-                if (!lowerInst(inst, index))
-                    return false;
-                effects(inst, index);
-            }
-
-            out += "    }\n";
-        }
+        orderBlocks();
+        std::string body = tree(function.entryBlock);
+        if (failed)
+            return false;
 
         std::string& glsl = build.glsl;
         // like the VM, shaders keep NaN, infinities and signed zeros (SignedZeroInfNanPreserve for 32-bit floats)
@@ -1473,10 +2094,11 @@ struct GlslLowering
         for (int i = 0; i < buffers; i++)
         {
             std::string b = std::to_string(i);
+            // reads and writes follow a CHECK_BUFFER_LEN that covers their bounds, as in native code; words must be aligned
             if (readBuffers[i])
-                glsl += "uint l_rd" + b + "(int off) { if (l_bad(off, " + b + ")) { l_fail(); return 0u; } return b" + b + ".d[off >> 2]; }\n";
+                glsl += "uint l_rd" + b + "(int off) { if ((off & 3) != 0) { l_fail(); return 0u; } return b" + b + ".d[off >> 2]; }\n";
             if (build.bufferWritten[i])
-                glsl += "void l_wr" + b + "(int off, uint v) { if (l_bad(off, " + b + ")) { l_fail(); return; } b" + b + ".d[off >> 2] = v; }\n";
+                glsl += "void l_wr" + b + "(int off, uint v) { if ((off & 3) != 0) { l_fail(); return; } b" + b + ".d[off >> 2] = v; }\n";
 
             static const char* const kAtomics[][2] = {{"add", "atomicAdd"}, {"min", "atomicMin"}, {"max", "atomicMax"}};
             for (int op = 0; op < 3; op++)
@@ -1492,9 +2114,9 @@ struct GlslLowering
         for (int i = 1; i <= buffers; i++)
             glsl += "    r" + std::to_string(i) + "t = " + std::to_string(LUA_TBUFFER) + "u;\n";
 
-        glsl += "    int l_block = " + std::to_string(function.entryBlock) + ";\n    for (;;)\n    {\n    switch (l_block)\n    {\n";
-        glsl += out;
-        glsl += "    }\n    return;\n    }\n}\n\n";
+        glsl += "    int l_jmp = 0;\n";
+        glsl += body;
+        glsl += "}\n\n";
         glsl += "void main()\n{\n";
         glsl +=
             "    uint gid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * " + std::to_string(kGpuWorkgroupSize) + "u;\n";
