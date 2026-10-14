@@ -157,6 +157,17 @@ do
     end
 end
 
+-- fields of their own: bytes and 16-bit values, each invocation writing next to the others, after its 8-byte record
+@gpu
+local function fields(b: buffer, i: number)
+    local o = i * 8
+    local v = buffer.readu16(b, o) + buffer.readi8(b, o + 2)
+    buffer.writeu8(b, o + 3, v)
+    buffer.writei16(b, o + 4, buffer.readi16(b, o + 5) - v)
+    buffer.writei8(b, N * 8 + i, -i)
+end
+check("8 and 16-bit fields", fields, N, filled(N * 2, function(i) return (i * 2654435761) % 16777216 end, false, N + 1))
+
 @gpu
 local function control(b: buffer, i: number)
     local sum = 0

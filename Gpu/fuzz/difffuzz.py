@@ -181,7 +181,11 @@ class Gen:
             g, r = e()
             if not VARIABLE.search(g):
                 g = r = self.rng.choice(self.vars)
-            return f"buffer.readu32(buf, (bit32.band({g}, 63)) * 4)", f"F(buffer.readu32(buf, (bit32.band({r}, 63)) * 4))"
+            # words, or 8 and 16-bit values at any offset of the integer inputs (a 16-bit one can span two words)
+            kind = self.rng.choice(["u32", "u32", "u8", "i8", "u16", "i16"])
+            if kind == "u32":
+                return f"buffer.readu32(buf, (bit32.band({g}, 63)) * 4)", f"F(buffer.readu32(buf, (bit32.band({r}, 63)) * 4))"
+            return f"buffer.read{kind}(buf, bit32.band({g}, 253))", f"buffer.read{kind}(buf, bit32.band({r}, 253))"
         raise AssertionError(op)
 
     def statement(self, out, ref, indent):

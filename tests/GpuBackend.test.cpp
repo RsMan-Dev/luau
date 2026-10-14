@@ -619,6 +619,59 @@ assert(buffer.readu32(b, 48) == 0 and buffer.readi32(b, 52) == -1)
 )") == "");
 }
 
+TEST_CASE("8_and_16_bit_accesses_match_luau_and_neighbors_dont_race")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // every invocation writes its own byte, next to those of others in the same word, and a 16-bit value at an odd offset,
+    // half of them across two words; values out of the field's range are truncated as in the VM, signed reads extend the
+    // sign, and the buffer's length is odd, its last byte written by the last invocation
+    CHECK(run(*backend, std::string(kSquare) + R"(
+local N = 200
+
+@gpu
+local function narrow(b: buffer, i: number)
+    buffer.writef32(b, i * 12, buffer.readi8(b, 2400 + i))
+    buffer.writef32(b, i * 12 + 4, buffer.readu16(b, 2401 + i * 2 - (i // 199)))
+    buffer.writef32(b, i * 12 + 8, buffer.readi16(b, 2400 + i * 2 - (i // 199)) + buffer.readu8(b, 2799 - i))
+    buffer.writeu8(b, 2800 + i, i * 37 + 3)
+    buffer.writei16(b, 3001 + i * 2, i * 1001 - 70000)
+end
+
+local onGpu = buffer.create(3401)
+for o = 2400, 2799 do
+    buffer.writeu8(onGpu, o, (o * 101) % 256)
+end
+buffer.writeu8(onGpu, 3000, 0x5a)
+local inLuau = copy(onGpu)
+
+assert(gpu.run(narrow, { onGpu }, N))
+for i = 0, N - 1 do
+    narrow(inLuau, i)
+end
+for o = 0, 3400 do
+    assert(buffer.readu8(onGpu, o) == buffer.readu8(inLuau, o), `byte {o}: gpu {buffer.readu8(onGpu, o)} vm {buffer.readu8(inLuau, o)}`)
+end
+
+-- and the bounds: the last byte is in the buffer, a 16-bit access at it isn't
+@gpu
+local function last(b: buffer, i: number)
+    if i == 0 then
+        buffer.writeu8(b, 3400, buffer.readu8(b, 3400) + 1)
+    else
+        buffer.writeu16(b, 3400, 1)
+    end
+end
+local before = copy(onGpu)
+assert(gpu.run(last, { onGpu }, 1))
+assert(buffer.readu8(onGpu, 3400) == (buffer.readu8(before, 3400) + 1) % 256)
+local ok, err = gpu.run(last, { onGpu }, 2)
+assert(not ok and string.find(err, "out of bounds", 1, true), err)
+)") == "");
+}
+
 TEST_CASE("failures_give_their_kind_and_source_line")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();

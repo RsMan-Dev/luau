@@ -494,6 +494,7 @@ struct GlslLowering
 
     std::vector<bool> readBuffers;
     std::vector<uint8_t> atomics; // per buffer, a bit per atomic operation used
+    std::vector<uint8_t> narrow;  // per buffer: 1, 2 for 8 and 16-bit reads, 4, 8 for 8 and 16-bit writes
     std::vector<int> pcOfInst;
 
     std::string out;
@@ -1740,6 +1741,38 @@ struct GlslLowering
             line(v + " = " + (inst.cmd == IrCmd::BUFFER_READF32 ? "uintBitsToFloat(" + raw + ")" : "int(" + raw + ")") + ";");
             break;
         }
+        case IrCmd::BUFFER_READI8:
+        case IrCmd::BUFFER_READU8:
+        case IrCmd::BUFFER_READI16:
+        case IrCmd::BUFFER_READU16:
+        {
+            int b;
+            if (!binding(index, OP_A(inst), b))
+                return false;
+
+            bool half = inst.cmd == IrCmd::BUFFER_READI16 || inst.cmd == IrCmd::BUFFER_READU16;
+            narrow[b] |= half ? 2 : 1;
+            std::string raw = std::string(half ? "l_rdh" : "l_rdb") + std::to_string(b) + "(" + intv(OP_B(inst)) + ")";
+            std::string shift = half ? "16" : "24";
+            if (inst.cmd == IrCmd::BUFFER_READI8 || inst.cmd == IrCmd::BUFFER_READI16)
+                line(v + " = int(" + raw + " << " + shift + "u) >> " + shift + ";");
+            else
+                line(v + " = int(" + raw + ");");
+            break;
+        }
+        case IrCmd::BUFFER_WRITEI8:
+        case IrCmd::BUFFER_WRITEI16:
+        {
+            int b;
+            if (!binding(index, OP_A(inst), b))
+                return false;
+
+            bool half = inst.cmd == IrCmd::BUFFER_WRITEI16;
+            narrow[b] |= half ? 8 : 4;
+            build.bufferWritten[b] = true;
+            line(std::string(half ? "l_wrh" : "l_wrb") + std::to_string(b) + "(" + intv(OP_B(inst)) + ", uint(" + intv(OP_C(inst)) + "));");
+            break;
+        }
         case IrCmd::BUFFER_WRITEI32:
         case IrCmd::BUFFER_WRITEF32:
         {
@@ -1988,6 +2021,7 @@ struct GlslLowering
         build.bufferWritten.assign(buffers, false);
         readBuffers.assign(buffers, false);
         atomics.assign(buffers, 0);
+        narrow.assign(buffers, 0);
 
         // which registers each block reads, on the IR after the optimizations
         computeCfgInfo(function);
@@ -2034,6 +2068,24 @@ struct GlslLowering
             if (build.bufferWritten[i])
                 glsl += "void l_wr" + b + "(int off, uint v) { if ((off & 3) != 0) { l_fail(1u); return; } b" + b +
                         ".d[off >> 2] = v; l_mark(off); }\n" + "void l_wra" + b + "(int off, uint v) { b" + b + ".d[off >> 2] = v; l_mark(off); }\n";
+
+            // 8 and 16-bit accesses are parts of a word: a 16-bit one at a byte offset of 3 is also in the next word, which the
+            // device copy has, since it's a whole number of words. Writes only change their bits, with atomics: the other
+            // bytes of the word can be written concurrently by other invocations
+            std::string d = "b" + b + ".d";
+            if (narrow[i] & 1)
+                glsl += "uint l_rdb" + b + "(int off) { return (" + d + "[off >> 2] >> (uint(off & 3) * 8u)) & 0xffu; }\n";
+            if (narrow[i] & 2)
+                glsl += "uint l_rdh" + b + "(int off) { uint s = uint(off & 3) * 8u, w = " + d + "[off >> 2] >> s; if (s == 24u) w |= " + d +
+                        "[(off >> 2) + 1] << 8u; return w & 0xffffu; }\n";
+            if (narrow[i] & 12)
+                glsl += "void l_wrm" + b + "(int off, uint v, uint m) { uint s = uint(off & 3) * 8u; atomicAnd(" + d +
+                        "[off >> 2], ~(m << s)); atomicOr(" + d + "[off >> 2], (v & m) << s); l_mark(off); }\n";
+            if (narrow[i] & 4)
+                glsl += "void l_wrb" + b + "(int off, uint v) { l_wrm" + b + "(off, v, 0xffu); }\n";
+            if (narrow[i] & 8)
+                glsl += "void l_wrh" + b + "(int off, uint v) { if ((off & 3) == 3) { l_wrm" + b + "(off, v, 0xffu); l_wrm" + b +
+                        "(off + 1, v >> 8u, 0xffu); } else l_wrm" + b + "(off, v, 0xffffu); }\n";
 
             static const char* const kAtomics[][2] = {{"add", "atomicAdd"}, {"min", "atomicMin"}};
             for (int op = 0; op < 2; op++)

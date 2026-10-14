@@ -81,7 +81,7 @@ A buffer listed several times runs several times, in the order of the list; diff
 
 ## Contract
 
-- Each invocation must only write words of its buffer that no other invocation of the run reads or writes, unless it
+- Each invocation must only write bytes of its buffer that no other invocation of the run reads or writes, unless it
   uses the atomics: invocations run concurrently, and plain writes that race give an unspecified result on the GPU.
   Atomics are what kernels use to combine results from several invocations: counters, histograms, depth tests. Called
   from Luau, they are plain reads and writes.
@@ -105,16 +105,17 @@ A buffer listed several times runs several times, in the order of the list; diff
   - vectors give the VM's bits: the VM computes them in f32 too, and the GPU in the same order
   - `math` functions that native code calls in libm (`sin`, `exp`, `^`, ...) use the GPU's, which Vulkan doesn't require
     to be correctly rounded: results can be off by a few ulps (`pow` by about 1e-4 relative)
-  - buffer accesses are 4-byte words: an unaligned offset fails the run, where the VM would read the unaligned word
-
+  - 32-bit buffer accesses are words: an unaligned offset fails the run, where the VM would read the unaligned word
   - buffer methods that need 64 bits (`buffer.readf64`, `buffer.writef64`) make the function unable to run on the GPU:
     `gpu.run` returns `false, "Function cannot run in GPU"`
 
   Data beyond f32's precision is lost by design: packing several fields into a 32-bit word above 2^24 (a color with
   its alpha byte, flags in the top bits, ids shifted by 16, `0xffffffff` as a marker) loses its low bits on the GPU, as
   it would in Luau with f32 numbers. Compacting everything into one number is a CPU optimization a GPU doesn't need:
-  scripts store the fields separately, one word each (kernels only access 32-bit words), or keep every word they
-  compute with below 2^24, as `Gpu/examples/rasterizer.luau` does.
+  scripts store the fields separately (`writeu8`, `writeu16` or a word each), or keep every word they compute with below
+  2^24, as `Gpu/examples/rasterizer.luau` does. 8 and 16-bit fields can be written by different invocations next to
+  each other: their writes change the containing word with `atomicAnd` and `atomicOr`, which leave its other bytes as
+  they are.
 - Buffers stay on the GPU between runs. A run only uploads the 64 KB parts of a buffer that changed since the GPU last had
   it, and only downloads the parts its kernel wrote: kernels mark each part they write to, and the parts they don't are
   still those of the Luau buffer.
@@ -167,13 +168,14 @@ Inside `@gpu` functions, and the functions they call, which the compiler inlines
 
 - locals, assignments, `if`, `while`, `repeat`, numeric `for`, `break`, `continue`, `return`, if-expressions
 - numbers, booleans and `vector`s; arithmetic, comparisons, `and`/`or`/`not`
-- `buffer.readf32/readu32/readi32`, `buffer.writef32/writeu32/writei32` on 4-byte aligned offsets, `buffer.len`
+- `buffer.readf32/readu32/readi32`, `buffer.writef32/writeu32/writei32` on 4-byte aligned offsets,
+  `buffer.readu8/readi8/readu16/readi16`, `buffer.writeu8/writei8/writeu16/writei16` at any offset, `buffer.len`
 - the `math`, `bit32` and `vector` builtins native code generation inlines
 - `gpu.atomicadd`, `gpu.atomicmin`
 - top-level `local` numeric constants
 
-Not supported: tables, strings, upvalues other than constants, calls that aren't inlined, 8/16-bit buffer accesses,
-and the 64-bit ones (`readf64`, `writef64`), since numbers are f32. `luau-gpu --emit=glsl` reports why each function can't run.
+Not supported: tables, strings, upvalues other than constants, calls that aren't inlined, and the 64-bit buffer
+accesses (`readf64`, `writef64`), since numbers are f32. `luau-gpu --emit=glsl` reports why each function can't run.
 
 ## Embedding
 

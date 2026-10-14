@@ -217,14 +217,15 @@ return k
     // the first level of the recursion is inlined, the recursive reference to 'fib' isn't
     CHECK(call.reason == "GET_UPVALUE is not supported on the GPU (line 3)");
 
-    GpuKernel atomic = lowerGpu(R"(
+    // numbers are f32: 64-bit accesses can't run on the GPU
+    GpuKernel wide = lowerGpu(R"(
 @gpu
 local function k(b: buffer, i: number)
-    buffer.writeu8(b, i, 1)
+    buffer.writef64(b, i * 8, 1)
 end
 return k
 )");
-    CHECK(contains(atomic.reason, "BUFFER_WRITEI8 is not supported on the GPU (line 4)"));
+    CHECK(contains(wide.reason, "BUFFER_WRITEF64 is not supported on the GPU (line 4)"));
 
     CHECK(
         lowerGpu(R"(
