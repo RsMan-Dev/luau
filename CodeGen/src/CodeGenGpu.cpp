@@ -278,6 +278,15 @@ struct GlslLowering
     uint32_t current = 0;                        // block being lowered
     uint32_t fallsTo = ~0u;                      // block that runs next when the code being emitted completes without jumping, if known
 
+    // blocks emitted where the block being lowered jumps to them, once it's lowered; this keeps the recursion that nests
+    // blocks out of the lowering of instructions, whose frames are large
+    struct Inlined
+    {
+        uint32_t block;
+        uint32_t fallsTo;
+    };
+    std::vector<Inlined>* inlined = nullptr;
+
     std::vector<bool> readBuffers;
     std::vector<uint8_t> atomics; // per buffer, a bit per atomic operation used
     std::vector<int> pcOfInst;
@@ -1044,12 +1053,8 @@ struct GlslLowering
             return leave(target, false);
 
         // the only way into the target: it's emitted right here
-        uint32_t from = current;
-        std::vector<RegState> state = cur;
-        std::string code = tree(target);
-        current = from;
-        cur = state;
-        return code;
+        inlined->push_back({target, fallsTo});
+        return "\x01" + std::to_string(inlined->size() - 1) + "\x01";
     }
 
     // after a construct closes: a jump that ends here stops, one to a construct further out keeps leaving
@@ -1190,6 +1195,10 @@ struct GlslLowering
         std::string saved;
         saved.swap(out);
 
+        std::vector<Inlined> targets;
+        std::vector<Inlined>* outer = inlined;
+        inlined = &targets;
+
         IrBlock& block = function.blocks[blockIndex];
         for (uint32_t index = block.start; index <= block.finish && !failed; index++)
         {
@@ -1203,8 +1212,32 @@ struct GlslLowering
             effects(inst, index);
         }
 
+        inlined = outer;
         saved.swap(out);
-        return saved;
+
+        if (targets.empty())
+            return saved;
+
+        std::string code;
+        uint32_t after = fallsTo;
+        for (size_t pos = 0;;)
+        {
+            size_t start = saved.find('\x01', pos);
+            if (start == std::string::npos)
+            {
+                code.append(saved, pos, std::string::npos);
+                break;
+            }
+
+            size_t end = saved.find('\x01', start + 1);
+            const Inlined& target = targets[std::stoul(saved.substr(start + 1, end - start - 1))];
+            code.append(saved, pos, start - pos);
+            fallsTo = target.fallsTo;
+            code += tree(target.block);
+            pos = end + 1;
+        }
+        fallsTo = after;
+        return code;
     }
 
     // reverse postorder of the reached blocks, and their predecessors along forward edges
