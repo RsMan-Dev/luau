@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 
-# Differential fuzzer for @gpu kernels: generates random kernels in the translator's subset, runs each one on the GPU
-# and in the VM through luau-gpu, and reports every output that differs.
+# Differential fuzzer for @gpu kernels: generates random kernels in the GPU subset, runs each one with gpu.run and by
+# calling it from Luau through luau-gpu, and reports every output that differs.
 #
 # usage: difffuzz.py [--luau-gpu build/luau-gpu] [--seed N] [--rounds R] [--kernels K] [--family int|float|both]
 #
 # Two families of kernels:
 #   int    only integer sources, literals and operations: outputs must be bit-exact
-#   float  floats too: f32 outputs are compared with a relative tolerance, since the GPU computes in f32 and the VM in
+#   float  floats too: f32 outputs are compared with a relative tolerance, since the GPU computes in f32 and Luau in
 #          f64; integer outputs derived from floats may then differ by rounding, which is reported separately as
 #          "precision" and not counted as a failure
+#
+# A kernel gets one buffer: 64 integer inputs, 20 float inputs, then its outputs, SLOTS words per index.
 
 import argparse
 import math
@@ -34,7 +36,7 @@ U32_INPUTS = [0, 1, 2, 3, 7, 255, 0x7fff, 0x8000, 0xffff, 0x7fffffff, 0x80000000
 F32_INPUTS = ["0", "-0.0", "0.5", "-0.5", "1", "-1", "1.5", "-2.75", "3e9", "-3e9", "2147483648", "-2147483648",
               "4294967296", "1e10", "-1e10", "16777217", "0.1", "1e-30", "123.456", "-0.999"]
 
-# the "tame" profile keeps values small so that kernels run on the GPU; there, a fallback is suspicious (a check that
+# the "tame" profile keeps values small so that kernels run on the GPU; there, a failed run is suspicious (a check that
 # fires although the value fits) and is reported
 TAME_INT_LITERALS = ["0", "1", "2", "3", "5", "7", "10", "100", "255", "-1", "-3", "-10", "1000"]
 TAME_FLOAT_LITERALS = ["0.5", "-0.5", "1.5", "-2.25", "0.25", "3.75", "10.5"]
@@ -43,7 +45,11 @@ TAME_F32_INPUTS = ["0", "0.5", "-0.5", "1", "-1", "1.5", "-2.75", "3.25", "10", 
 
 SLOTS = 8
 
-# every generated loop counts its iterations against this; it behaves the same on the GPU and in the VM
+# where the parts of the buffer start
+FSRC = 64 * 4
+OUT = FSRC + 20 * 4
+
+# every generated loop counts its iterations against this; it behaves the same on the GPU and in Luau
 GUARD = "guard += 1 if guard > 4096 then break end"
 N = 64
 
@@ -119,7 +125,7 @@ class Gen:
             # helpers are specialized per argument types, so mixing int, uint and float arguments matters
             return self.rng.choice([f"h1({e()}, {e()})", f"h2({e()})"])
         if op == "read":
-            return f"buffer.readu32(src, (bit32.band({e()}, 63)) * 4)"
+            return f"buffer.readu32(buf, (bit32.band({e()}, 63)) * 4)"
         raise AssertionError(op)
 
     def statement(self, out, indent):
@@ -162,7 +168,7 @@ class Gen:
                 out.append(f"{pad}until {n} >= i % 4")
         elif indent < 3 and r < 0.9 and self.family == "float":
             var = self.rng.choice(self.vars[1:])
-            # starts are literals: a start computed from d can be -inf, which loops forever in the VM too
+            # starts are literals: a start computed from d can be -inf, which loops forever in Luau too
             out.append(f"{pad}for x = {self.rng.choice(['0.5', '-1.25', '0', '-3.5'])}, {self.rng.choice(['3', '2.5', 'i % 4'])}, {self.rng.choice(['0.5', '0.25', '1', '0.75'])} do")
             out.append(f"{pad}    {GUARD}")
             out.append(f"{pad}    {var} += x")
@@ -185,16 +191,16 @@ class Gen:
         self.counter = 0
         lines = [
             "@gpu",
-            f"local function k{index}(i: number, src: buffer, fsrc: buffer, out: buffer)",
-            "    local a = buffer.readu32(src, (i % 19) * 4)",
-            "    local b = buffer.readi32(src, ((i * 7 + 3) % 19) * 4)",
+            f"local function k{index}(buf: buffer, i: number)",
+            "    local a = buffer.readu32(buf, (i % 19) * 4)",
+            "    local b = buffer.readi32(buf, ((i * 7 + 3) % 19) * 4)",
             "    local c = i - 32",
             "    local guard = 0",
         ]
         if self.family == "float":
-            lines.append("    local d = buffer.readf32(fsrc, (i % 20) * 4)")
+            lines.append(f"    local d = buffer.readf32(buf, {FSRC} + (i % 20) * 4)")
         else:
-            lines.append("    local d = buffer.readu32(src, ((i + 11) % 19) * 4) // 3")
+            lines.append("    local d = buffer.readu32(buf, ((i + 11) % 19) * 4) // 3")
         for _ in range(self.rng.randint(2, 8)):
             self.statement(lines, 1)
         writes = []
@@ -202,7 +208,7 @@ class Gen:
             kind = self.rng.choice(["u32", "i32"] + (["f32", "f32"] if self.family == "float" else []))
             value = self.rng.choice(self.vars) if self.rng.random() < 0.7 else self.expr(1)
             writes.append(kind)
-            lines.append(f"    buffer.write{kind}(out, (i * {SLOTS} + {s}) * 4, {value})")
+            lines.append(f"    buffer.write{kind}(buf, {OUT} + (i * {SLOTS} + {s}) * 4, {value})")
         lines.append("end")
         return lines, writes
 
@@ -212,7 +218,7 @@ VEC_OPS = ["add", "sub", "mul", "div", "scale", "neg", "dot", "cross", "normaliz
 
 
 class VecGen:
-    """kernels over vectors: the VM computes vector math in f32 too, so results should agree closely"""
+    """kernels over vectors: Luau computes vector math in f32 too, so results should agree closely"""
 
     def __init__(self, rng):
         self.rng = rng
@@ -245,10 +251,10 @@ class VecGen:
     def kernel(self, index):
         lines = [
             "@gpu",
-            f"local function k{index}(i: number, src: buffer, fsrc: buffer, out: buffer)",
-            "    local o = (i % 20) * 4",
-            "    local s = buffer.readf32(fsrc, o)",
-            "    local t = buffer.readf32(fsrc, ((i * 3 + 1) % 20) * 4)",
+            f"local function k{index}(buf: buffer, i: number)",
+            f"    local o = {FSRC} + (i % 20) * 4",
+            "    local s = buffer.readf32(buf, o)",
+            f"    local t = buffer.readf32(buf, {FSRC} + ((i * 3 + 1) % 20) * 4)",
             "    local p = vector.create(s, t, s * t)",
             "    local q = vector.create(t, 1.5, -s)",
             "    local r = vector.create(0.25, s - t, 2)",
@@ -258,8 +264,8 @@ class VecGen:
             name = f"w{slot}"
             lines.append(f"    local {name} = {self.vec()}")
             for c, comp in enumerate(["x", "y", "z"]):
-                lines.append(f"    buffer.writef32(out, (i * {SLOTS} + {slot + c}) * 4, {name}.{comp})")
-            lines.append(f"    buffer.writef32(out, (i * {SLOTS} + {slot + 3}) * 4, {self.num()})")
+                lines.append(f"    buffer.writef32(buf, {OUT} + (i * {SLOTS} + {slot + c}) * 4, {name}.{comp})")
+            lines.append(f"    buffer.writef32(buf, {OUT} + (i * {SLOTS} + {slot + 3}) * 4, {self.num()})")
             writes += ["f32"] * 4
         lines.append("end")
         return lines, writes
@@ -299,44 +305,45 @@ do
     end
 end
 
--- runs each kernel on the GPU and in the VM and prints the words that differ
+-- runs each kernel with gpu.run and by calling it from Luau, on copies of the inputs, and prints the words that differ; a
+-- run that returns false must leave its buffer as it was
 local function check(round: number, kernels: {{ any }})
     for j, k in kernels do
         if round < startRound or (round == startRound and j - 1 < startKernel) then
             continue
         end
 
-        local where, why = gpu.status(k)
-        if where ~= "gpu" then
-            print("REFUSED", round, j - 1, oneLine(why))
-            continue
-        end
+        local onGpu, inLuau = buffer.create({size}), buffer.create({size})
+        buffer.copy(onGpu, 0, inputs)
+        buffer.copy(inLuau, 0, inputs)
 
-        local onGpu = buffer.create({words} * 4)
-        local inVm = buffer.create({words} * 4)
+        local okGpu, errGpu = gpu.run(k, {{ onGpu }}, {n})
+        local okLuau, errLuau = pcall(function()
+            for i = 0, {n} - 1 do
+                k(inLuau, i)
+            end
+        end)
 
-        local before = host.stats()
-        host.setgpu(true)
-        local okGpu, errGpu = pcall(gpu.dispatch, k, {n}, src, fsrc, onGpu)
-        local after = host.stats()
-        host.setgpu(false)
-        local okVm, errVm = pcall(gpu.dispatch, k, {n}, src, fsrc, inVm)
-        host.setgpu(true)
-
-        local fellBack = after.fallbacks > before.fallbacks
-        if okGpu ~= okVm then
-            print("ERRDIFF", round, j - 1, oneLine(errGpu), oneLine(errVm))
-        elseif not okVm then
-            print("BOTHERR", round, j - 1, oneLine(errVm))
+        if not okGpu and buffer.tostring(onGpu) ~= buffer.tostring(inputs) then
+            print("TOUCHED", round, j - 1, oneLine(errGpu))
+        elseif errGpu == "Function cannot run in GPU" then
+            print("REFUSED", round, j - 1, oneLine(errGpu))
+        elseif okGpu and not okLuau then
+            print("ERRDIFF", round, j - 1, "ran on the GPU", oneLine(errLuau))
+        elseif not okLuau then
+            print("BOTHERR", round, j - 1, oneLine(errLuau))
+        elseif not okGpu then
+            print("RESULT", round, j - 1, "failed", "")
         else
             local diffs = {{}}
             for o = 0, {words} - 1 do
-                local x, y = buffer.readu32(onGpu, o * 4), buffer.readu32(inVm, o * 4)
+                local p = {out} + o * 4
+                local x, y = buffer.readu32(onGpu, p), buffer.readu32(inLuau, p)
                 if x ~= y then
-                    table.insert(diffs, string.format("%d:%08x:%08x:%.17g:%.17g", o, x, y, buffer.readf32(onGpu, o * 4), buffer.readf32(inVm, o * 4)))
+                    table.insert(diffs, string.format("%d:%08x:%08x:%.17g:%.17g", o, x, y, buffer.readf32(onGpu, p), buffer.readf32(inLuau, p)))
                 end
             end
-            print("RESULT", round, j - 1, if fellBack then "fallback" else "gpu", table.concat(diffs, " "))
+            print("RESULT", round, j - 1, "gpu", table.concat(diffs, " "))
         end
     end
 end
@@ -351,23 +358,22 @@ def generate(seed, family, count, tame):
 
 def build_campaign(rounds, tame):
     """one script for the whole campaign: each round's kernels live in their own block, so one luau-gpu process with
-    one Vulkan device runs every dispatch, the way a game would"""
+    one Vulkan device runs every kernel, the way a game would"""
     u32 = ", ".join(str(v) for v in (TAME_U32_INPUTS if tame else U32_INPUTS))
     f32 = ", ".join(TAME_F32_INPUTS if tame else F32_INPUTS)
     out = ["-- generated by Gpu/fuzz/difffuzz.py", "", HELPERS]
     out.append(f"""
--- 64 words, cycling through the inputs, so that any index masked with 63 is valid
-local inputs = {{ {u32} }}
-local src = buffer.create(64 * 4)
+-- 64 integer words, cycling through the inputs, so that any index masked with 63 is valid, then 20 floats
+local integers = {{ {u32} }}
+local inputs = buffer.create({OUT} + {N * SLOTS * 4})
 for j = 0, 63 do
-    buffer.writeu32(src, j * 4, inputs[j % #inputs + 1])
+    buffer.writeu32(inputs, j * 4, integers[j % #integers + 1])
 end
-local fsrc = buffer.create(20 * 4)
 for j, v in {{ {f32} }} do
-    buffer.writef32(fsrc, (j - 1) * 4, v)
+    buffer.writef32(inputs, {FSRC} + (j - 1) * 4, v)
 end
 """)
-    out.append(CHECK.format(words=N * SLOTS, n=N))
+    out.append(CHECK.format(words=N * SLOTS, n=N, out=OUT, size=OUT + N * SLOTS * 4))
     for index, (seed, family, kernels) in enumerate(rounds):
         out.append(f"do -- round {index}: seed {seed}, {family}")
         for lines, _ in kernels:
@@ -394,7 +400,7 @@ def classify(family, lines, writes, diffs):
     for d in diffs:
         o, xg, xv, fg, fv = d.split(":")
         kind = writes[int(o) % SLOTS]
-        # a NaN on one side only isn't rounding: the GPU lost Luau's NaN semantics (or produced a NaN the VM doesn't)
+        # a NaN on one side only isn't rounding: the GPU lost Luau's NaN semantics (or produced a NaN Luau doesn't)
         if kind == "f32" and math.isnan(float(fg)) != math.isnan(float(fv)):
             hard.append(d)
             continue
@@ -428,7 +434,7 @@ def main():
     parser.add_argument("--show", type=int, default=3, help="number of failing kernels to print")
     parser.add_argument("--timeout", type=int, default=1800, help="seconds after which the campaign counts as hung")
     parser.add_argument("--show-precision", action="store_true", help="print kernels whose outputs only differ by f32 rounding")
-    parser.add_argument("--show-fallbacks", type=int, default=0, help="tame profile: print this many kernels that fell back")
+    parser.add_argument("--show-failed", type=int, default=0, help="tame profile: print this many kernels whose run failed")
     args = parser.parse_args()
 
     tame = args.profile == "tame"
@@ -439,10 +445,10 @@ def main():
         f.write(build_campaign(rounds, tame))
         path = f.name
 
-    stats = {"cases": 0, "gpu": 0, "fallback": 0, "refused": 0, "bad": 0, "precision": 0, "both_error": 0}
+    stats = {"cases": 0, "gpu": 0, "failed": 0, "refused": 0, "bad": 0, "precision": 0, "both_error": 0}
     reasons = {}
     reports = []
-    fallbacks = []
+    failed = []
 
     # the output is line buffered, so a crash (a shader compiler bug can take the process down) points at the case
     # after the last one printed; that case is reported and the campaign resumes after it in a new process
@@ -458,7 +464,7 @@ def main():
         except subprocess.TimeoutExpired as e:
             # kernels bound their loops, so this means something else is stuck; the partial output says where
             partial = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-            last = [l for l in partial.splitlines() if l.split("\t")[0] in ("RESULT", "REFUSED", "ERRDIFF", "BOTHERR")]
+            last = [l for l in partial.splitlines() if l.split("\t")[0] in ("RESULT", "REFUSED", "ERRDIFF", "BOTHERR", "TOUCHED")]
             print(f"campaign didn't finish within {args.timeout} s; last case: {last[-1][:80] if last else 'none'}; script: {path}")
             sys.exit(1)
 
@@ -468,7 +474,7 @@ def main():
             returncode, stderr = proc.returncode, proc.stderr
             break
 
-        cases = [l.split("\t") for l in lines if l.split("\t")[0] in ("RESULT", "REFUSED", "ERRDIFF", "BOTHERR")]
+        cases = [l.split("\t") for l in lines if l.split("\t")[0] in ("RESULT", "REFUSED", "ERRDIFF", "BOTHERR", "TOUCHED")]
         r, j = (int(cases[-1][1]), int(cases[-1][2]) + 1) if cases else (resume or (0, 0))
         if j >= len(rounds[r][2]):
             r, j = r + 1, 0
@@ -482,7 +488,7 @@ def main():
     for line in output:
         parts = line.split("\t", 4) if line.startswith("RESULT") else line.split("\t", 3)
         tag = parts[0]
-        if tag not in ("RESULT", "REFUSED", "ERRDIFF", "BOTHERR"):
+        if tag not in ("RESULT", "REFUSED", "ERRDIFF", "BOTHERR", "TOUCHED"):
             continue
         r, j = int(parts[1]), int(parts[2])
         seed, family, kernels = rounds[r]
@@ -495,13 +501,14 @@ def main():
             reasons[reason] = reasons.get(reason, 0) + 1
         elif tag == "BOTHERR":
             stats["both_error"] += 1
-        elif tag == "ERRDIFF":
+        elif tag in ("ERRDIFF", "TOUCHED"):
+            # gpu.run succeeded where Luau raises an error, or changed a buffer although it returned false
             stats["bad"] += 1
             reports.append((r, j, line))
         else:
             stats[parts[3]] += 1
-            if parts[3] == "fallback" and tame:
-                fallbacks.append((r, j))
+            if parts[3] == "failed" and tame:
+                failed.append((r, j))
             hard, soft = classify(family, lines, writes, parts[4].split() if len(parts) > 4 else [])
             if hard:
                 stats["bad"] += 1
@@ -520,7 +527,7 @@ def main():
         stats["bad"] += 1
         reports.append((None, None, "luau-gpu failed: " + stderr[-1000:]))
 
-    shown = reports[: args.show] + [(r, j, "fell back to the VM") for r, j in fallbacks[: args.show_fallbacks]]
+    shown = reports[: args.show] + [(r, j, "gpu.run failed") for r, j in failed[: args.show_failed]]
     for r, j, what in shown:
         if r is None:
             print(what)
