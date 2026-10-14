@@ -1633,27 +1633,29 @@ TEST_CASE("divisions_by_powers_of_two_are_exact_multiplications")
     if (!backend)
         return;
 
-    // x / 4 is x * 0.25, which rounds the same quotient, denormal ones included; one that overflows still fails the run
+    // x / 4 is x * 0.25, which rounds the same quotient, denormal ones included, and so are x // 16 and x % 256
     CHECK(run(*backend, std::string(kSquare) + R"(
 @gpu
 local function k(b: buffer, i: number)
-    local x = buffer.readf32(b, i * 16)
-    buffer.writef32(b, i * 16 + 4, x / 4)
-    buffer.writef32(b, i * 16 + 8, x / -0.5)
-    buffer.writef32(b, i * 16 + 12, x / 1024)
+    local x = buffer.readf32(b, i * 24)
+    buffer.writef32(b, i * 24 + 4, x / 4)
+    buffer.writef32(b, i * 24 + 8, x / -0.5)
+    buffer.writef32(b, i * 24 + 12, x / 1024)
+    buffer.writef32(b, i * 24 + 16, x // 16)
+    buffer.writef32(b, i * 24 + 20, x % 256)
 end
 
-local values = { 0, -0, 1, 3, 1 / 0, 0 / 0, 1e-38, 3e-39, 1.4e-45, 1e38, -2.5e37 }
-local b = buffer.create(#values * 16)
+local values = { 0, -0, 1, 3, -37.5, 1 / 0, 0 / 0, 1e-38, 3e-39, 1.4e-45, 1e38, -2.5e37 }
+local b = buffer.create(#values * 24)
 for i, x in values do
-    buffer.writef32(b, (i - 1) * 16, x)
+    buffer.writef32(b, (i - 1) * 24, x)
 end
 local vm = copy(b)
 for i = 0, #values - 1 do
     k(vm, i)
 end
 assert(gpu.run(k, { b }, #values))
-for i = 0, #values * 4 - 1 do
+for i = 0, #values * 6 - 1 do
     local g, v = buffer.readu32(b, i * 4), buffer.readu32(vm, i * 4)
     local nan = bit32.band(g, 0x7f800000) == 0x7f800000 and bit32.band(g, 0x7fffff) ~= 0
     assert(g == v or nan, `{i}: {g} vs {v}`)

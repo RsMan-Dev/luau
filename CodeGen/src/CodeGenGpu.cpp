@@ -546,6 +546,15 @@ struct GlslLowering
         return false;
     }
 
+    // a / b correctly rounded, so that quotients the VM gets exactly, like 37 / 37, are exact here too; dividing by a power of
+    // two is multiplying by its inverse, which is one too: both round the same quotient
+    std::string quotient(IrOp a, IrOp b)
+    {
+        if (double k; constNumber(b, k) && powerOfTwo(k) && fabs(k) >= 0x1p-126 && fabs(k) <= 0x1p126)
+            return num(a) + " * " + literal(1 / k);
+        return "l_fdiv(" + num(a) + ", " + num(b) + ")";
+    }
+
     static bool powerOfTwo(double k)
     {
         int e;
@@ -1567,21 +1576,16 @@ struct GlslLowering
             line(v + " = " + num(OP_A(inst)) + " * " + num(OP_B(inst)) + " + " + num(OP_C(inst)) + ";");
             break;
         case IrCmd::DIV_NUM:
-            // correctly rounded, so that quotients the VM gets exactly, like 37 / 37, are exact here too; dividing by a power of
-            // two is multiplying by its inverse, which is one too: both round the same quotient
-            if (double k; constNumber(OP_B(inst), k) && powerOfTwo(k) && fabs(k) >= 0x1p-126 && fabs(k) <= 0x1p126)
-                line(v + " = " + num(OP_A(inst)) + " * " + literal(1 / k) + ";");
-            else
-                line(v + " = l_fdiv(" + num(OP_A(inst)) + ", " + num(OP_B(inst)) + ");");
+            line(v + " = " + quotient(OP_A(inst), OP_B(inst)) + ";");
             break;
         case IrCmd::IDIV_NUM:
             // floor(a / b) and a - floor(a / b) * b, as the VM computes them
-            line(v + " = floor(l_fdiv(" + num(OP_A(inst)) + ", " + num(OP_B(inst)) + "));");
+            line(v + " = floor(" + quotient(OP_A(inst), OP_B(inst)) + ");");
             break;
         case IrCmd::MOD_NUM:
         {
-            std::string a = num(OP_A(inst)), b = num(OP_B(inst));
-            line(v + " = " + a + " - floor(l_fdiv(" + a + ", " + b + ")) * " + b + ";");
+            std::string b = num(OP_B(inst));
+            line(v + " = " + num(OP_A(inst)) + " - floor(" + quotient(OP_A(inst), OP_B(inst)) + ") * " + b + ";");
             break;
         }
         case IrCmd::MIN_NUM:
