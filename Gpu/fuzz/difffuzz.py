@@ -90,6 +90,13 @@ class Gen:
         v = self.rng.choice(self.vars)
         return v, v
 
+    def operands(self, depth):
+        """two operands of a comparison, not both constants: the compiler would fold the comparison in f64"""
+        (g1, r1), (g2, r2) = self.expr(depth), self.expr(depth)
+        if not VARIABLE.search(g1 + " " + g2):
+            g1 = r1 = self.rng.choice(self.vars)
+        return (g1, r1), (g2, r2)
+
     def compound(self, depth):
         if depth >= 3 or self.rng.random() < 0.3:
             return self.leaf()
@@ -123,7 +130,8 @@ class Gen:
             return f"(-({g}))", f"(-({r}))"
         if op == "if":
             cmp = self.rng.choice(["<", "<=", ">", ">=", "==", "~="])
-            (g1, r1), (g2, r2), (g3, r3), (g4, r4) = e(), e(), e(), e()
+            (g1, r1), (g2, r2) = self.operands(depth + 1)
+            (g3, r3), (g4, r4) = e(), e()
             return f"(if {g1} {cmp} {g2} then {g3} else {g4})", f"(if {r1} {cmp} {r2} then {r3} else {r4})"
         if op in ("floor", "ceil", "round", "abs"):
             g, r = e()
@@ -226,7 +234,8 @@ class Gen:
             update(var, op, value)
         elif r < 0.8 and indent < 3:
             var = self.rng.choice(self.vars[1:])
-            (g1, r1), (g2, r2), (g3, r3), (g4, r4) = self.expr(1), self.expr(1), self.expr(1), self.expr(1)
+            (g1, r1), (g2, r2) = self.operands(1)
+            (g3, r3), (g4, r4) = self.expr(1), self.expr(1)
             both(f"if {g1} < {g2} then", f"if {r1} < {r2} then")
             both(f"    {var} = {g3}", f"    {var} = {r3}")
             both("else")
