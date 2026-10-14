@@ -42,7 +42,7 @@ RelWithDebInfo build, scripts sandboxed with native code generation (as `luau --
 | saxpy | 1000000 floats | 14.715 | 1.072 | 13.7x | yes |
 | tiny saxpy | 64 floats | 0.001 | 0.037 | 0.03x | yes |
 | mandelbrot | 1024x1024, 256 iterations | 254.000 | 0.781 | 325x | yes |
-| n-body | 4096 bodies | 340.761 | 0.578 | 590x | yes |
+| n-body | 4096 bodies | 340.761 | 3.686 | 92x | yes |
 | game of life | 1024x1024, 10 steps | 422.471 | 7.855 | 53.8x | yes |
 | histogram | 4000000 values, 256 bins | 120.938 | 2.811 | 43.0x | yes |
 | particles | 1000000 particles | 28.626 | 4.466 | 6.4x | yes |
@@ -53,7 +53,8 @@ RelWithDebInfo build, scripts sandboxed with native code generation (as `luau --
 What it shows:
 
 - **Compute bound kernels win by two orders of magnitude** (Mandelbrot, n-body, blur): the transfers are small next to
-  the work.
+  the work. n-body divides vectors 3 times per pair of bodies: divisions and square roots give the VM's bits, which
+  costs about 6 times what the hardware's approximate ones do (0.6 ms with them).
 - **Memory bound kernels win much less** (saxpy, particles): most of the GPU time is copying what the kernel wrote back.
   Only the 64 KB parts a kernel writes come back, so inputs in the same buffer stay on the GPU: saxpy downloads y and not
   x, the histogram its 1 KB of bins and not its 16 MB of values, the game of life the grid each step writes.
