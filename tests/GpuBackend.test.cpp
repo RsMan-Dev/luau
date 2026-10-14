@@ -595,12 +595,16 @@ local function k(b: buffer, i: number)
     local x = buffer.readf32(b, 8) -- 1e8
     buffer.writef32(b, 40, x // 3)
     buffer.writef32(b, 44, x % 3)
+    -- a word holding -1, copied as a u32 and as an i32: readu32 gives 4294967295, which rounds to 2^32, written as 0
+    buffer.writeu32(b, 48, buffer.readu32(b, 12))
+    buffer.writei32(b, 52, buffer.readi32(b, 12))
 end
 
-local b = buffer.create(48)
+local b = buffer.create(56)
 buffer.writeu32(b, 0, 0xffffffff)
 buffer.writeu32(b, 4, 16777219)
 buffer.writef32(b, 8, 1e8)
+buffer.writei32(b, 12, -1)
 assert(gpu.run(k, { b }, 1))
 assert(buffer.readf32(b, 16) == 4294967296) -- 0xffffffff rounds to 2^32
 assert(buffer.readu32(b, 20) == 0) -- which converts back to 0, modulo 2^32
@@ -611,6 +615,7 @@ assert(buffer.readi32(b, 36) == -2)
 assert(buffer.readf32(b, 40) == F(math.floor(F(F(1e8) / 3))))
 assert(buffer.readf32(b, 44) == F(F(1e8) - F(math.floor(F(F(1e8) / 3)) * 3)))
 assert(buffer.readf32(b, 44) ~= 1e8 % 3) -- what f64 gives
+assert(buffer.readu32(b, 48) == 0 and buffer.readi32(b, 52) == -1)
 )") == "");
 }
 

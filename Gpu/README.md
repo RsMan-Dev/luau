@@ -94,7 +94,9 @@ A buffer listed several times runs several times, in the order of the list; diff
   - literals round to f32 (`0.1`, `1e30`; `1e39` is an infinity). The Luau compiler folds constant expressions in f64
     before the kernel sees them, so `2^24 + 1` written with constants only is folded to 16777217 and rounded once, to
     16777216, where the GPU would round each step: the same in this case, but not always
-  - `buffer.readu32`, `readi32` give the number rounded to f32 (`readu32` of `0xffffffff` is 4294967296)
+  - `buffer.readu32`, `readi32` give the number rounded to f32 (`readu32` of `0xffffffff` is 4294967296). A word copied
+    with `writeu32(b, to, readu32(b, from))` is only the same word below 2^24: a word holding -1 becomes 0. Signed
+    values are copied with `readi32` and `writei32`
   - what needs an integer converts the number as the VM does: buffer offsets as `luaL_checkinteger`, truncated, an
     offset outside the 32-bit range being out of bounds; `bit32` arguments as `luaL_checkunsigned`, the truncated value
     modulo 2^32; `writeu32`, `writei32` and the atomics' values the same way. A `bit32` result is a number, rounded to f32
