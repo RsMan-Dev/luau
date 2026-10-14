@@ -239,6 +239,7 @@ struct VulkanBackend::Impl
     ~Impl();
 
     bool init(std::string& error);
+    std::string probe();
     int findMemory(uint32_t typeBits, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred);
     bool allocate(const VkMemoryRequirements& req, uint32_t type, bool map, Memory& mem);
     void release(Memory& mem);
@@ -440,10 +441,159 @@ bool VulkanBackend::Impl::init(std::string& error)
             lua_pushnil(L);
     };
 
+    // feature bits aren't enough: kernels must compute what the VM does, and runaway ones must stop when asked
+    if (!floatReason.empty())
+    {
+        error = deviceName + " is refused: " + floatReason;
+        return false;
+    }
+
+    std::string refusal = probe();
+    if (!refusal.empty())
+    {
+        error = deviceName + " is refused: " + refusal;
+        return false;
+    }
+
     return true;
 }
 
 #undef VK_CHECK
+
+// runs a kernel that checks what the shaders the lowering produces rely on: NaN, infinities and signed zeros are kept, and
+// a loop sees the stop word the host writes while it runs
+static const char* const kProbe = R"(#version 450
+#extension GL_EXT_spirv_intrinsics : require
+spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4466], 4461, 32);
+layout(local_size_x = 1) in;
+layout(std430, set = 0, binding = 0) buffer B0 { uint d[]; } b0;
+layout(std430, set = 0, binding = 1) coherent volatile buffer BS { uint err; int stop; uint started; } st;
+layout(push_constant) uniform PC { uint n; uint budget; uint len[15]; } pc;
+
+void main()
+{
+    st.started = 1u;
+    float z = uintBitsToFloat(b0.d[0]), h = uintBitsToFloat(b0.d[1]);
+    b0.d[2] = floatBitsToUint(h - h);
+    b0.d[3] = floatBitsToUint(z / z);
+    b0.d[4] = floatBitsToUint(z * -1.0);
+    b0.d[5] = floatBitsToUint(1.0 / (z * -1.0));
+    uint i = 0u;
+    for (; i < 0x40000000u; i++)
+    {
+        if ((i & 255u) == 0u && st.stop != 0)
+            break;
+    }
+    b0.d[6] = i < 0x40000000u ? 1u : 0u;
+}
+)";
+
+std::string VulkanBackend::Impl::probe()
+{
+    KernelEntry kernel;
+    kernel.name = "probe";
+    kernel.written = {true};
+    std::string reason = buildPipeline(kernel, kProbe);
+    if (!reason.empty())
+        return "the probe kernel failed to build: " + reason;
+
+    BufferEntry buffer;
+    buffer.deviceSize = 32;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+    VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets = 1;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes = &poolSize;
+    if (vkCreateDescriptorPool(device, &dpci, nullptr, &pool) != VK_SUCCESS)
+        pool = VK_NULL_HANDLE;
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsai.descriptorPool = pool;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts = &kernel.setLayout;
+
+    if (!pool || vkAllocateDescriptorSets(device, &dsai, &set) != VK_SUCCESS ||
+        !createBuffer(32, true, buffer.device, buffer.deviceMemory, nullptr) ||
+        !createBuffer(32, false, buffer.staging, buffer.stagingMemory, &buffer.mapped))
+        reason = "not enough memory for the probe kernel";
+
+    uint32_t* words = static_cast<uint32_t*>(buffer.mapped);
+    if (reason.empty())
+    {
+        memset(words, 0, 32);
+        words[1] = 0x7f800000; // infinity; the kernel reads its inputs, so the compiler can't fold them
+
+        VkDescriptorBufferInfo infos[2] = {{buffer.device, 0, VK_WHOLE_SIZE}, {status.buffer, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet writes[2] = {};
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[i].dstSet = set;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &infos[i];
+        }
+        vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+
+        VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkResetCommandBuffer(commandBuffer, 0);
+        vkBeginCommandBuffer(commandBuffer, &begin);
+        copyBuffer(commandBuffer, buffer.staging, buffer.device, 32);
+        barrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+        );
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipelineLayout, 0, 1, &set, 0, nullptr);
+        PushConstants push = {};
+        vkCmdPushConstants(commandBuffer, kernel.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer, 1, 1, 1);
+        barrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT
+        );
+        copyBuffer(commandBuffer, buffer.device, buffer.staging, 32);
+        barrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+        vkEndCommandBuffer(commandBuffer);
+
+        // the host asks the kernel to stop as soon as it runs; the probe isn't bound by the time limit of dispatches
+        VulkanOptions saved = options;
+        options.abortMs = 0;
+        options.timeoutMs = saved.timeoutMs > 5000 ? saved.timeoutMs : 5000;
+        reason = submit();
+        options = saved;
+    }
+
+    auto nan = [](uint32_t w)
+    {
+        return (w & 0x7f800000) == 0x7f800000 && (w & 0x007fffff) != 0;
+    };
+    if (reason.empty())
+    {
+        if (!nan(words[2]) || !nan(words[3]) || words[4] != 0x80000000 || words[5] != 0xff800000)
+            reason = "its shaders don't keep NaN, infinities and signed zeros";
+        if (words[6] != 1)
+            reason += std::string(reason.empty() ? "its" : ", and its") + " shaders don't see the host asking a running dispatch to stop";
+    }
+
+    if (!deviceBusy)
+    {
+        vkDestroyDescriptorPool(device, pool, nullptr);
+        destroyBuffer(buffer);
+        destroyPipeline(kernel);
+    }
+    return reason;
+}
 
 VulkanBackend::Impl::~Impl()
 {
@@ -812,8 +962,6 @@ KernelEntry* VulkanBackend::Impl::kernelFor(lua_State* L, int fn)
 
         if (!kernel.reason.empty())
             entry->reason = kernel.reason;
-        else if (!floatReason.empty())
-            entry->reason = floatReason;
         else if (!disabledReason.empty())
             entry->reason = disabledReason;
         else

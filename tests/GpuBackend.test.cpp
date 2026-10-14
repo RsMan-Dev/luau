@@ -807,6 +807,57 @@ assert(buffer.readu32(b, 12) == 9 and gpu.status(square) == "gpu")
 )") == "");
 }
 
+TEST_CASE("devices_that_break_the_kernel_contract_are_refused")
+{
+#if !defined(_WIN32)
+    // llvmpipe, Mesa's CPU implementation, reports SignedZeroInfNanPreserve but folds inf - inf to 0; the loader picks it when
+    // it's the only driver listed
+    const char* const kDirs[] = {"/run/opengl-driver/share/vulkan/icd.d", "/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d"};
+    std::string icd;
+    for (const char* dir : kDirs)
+    {
+        std::error_code ec;
+        for (const std::filesystem::directory_entry& e : std::filesystem::directory_iterator(dir, ec))
+        {
+            if (e.path().filename().string().rfind("lvp_icd", 0) == 0)
+                icd = e.path().string();
+        }
+    }
+
+    if (icd.empty())
+    {
+        MESSAGE("skipped, llvmpipe isn't installed");
+        return;
+    }
+
+    const char* previous = getenv("VK_DRIVER_FILES");
+    std::string saved = previous ? previous : "";
+    setenv("VK_DRIVER_FILES", icd.c_str(), 1);
+
+    std::string error;
+    std::unique_ptr<VulkanBackend> backend = VulkanBackend::create(error);
+
+    if (previous)
+        setenv("VK_DRIVER_FILES", saved.c_str(), 1);
+    else
+        unsetenv("VK_DRIVER_FILES");
+
+    CHECK(!backend);
+    CHECK_MESSAGE(error.find("is refused: its shaders don't keep NaN, infinities and signed zeros") != std::string::npos, error);
+#endif
+
+    // a device that keeps its contract is accepted, and runs kernels
+    std::unique_ptr<VulkanBackend> accepted = createBackend();
+    if (!accepted)
+        return;
+
+    CHECK(run(*accepted, std::string(kSquare) + R"(
+local b = buffer.create(16)
+gpu.dispatch(square, 4, b)
+assert(buffer.readu32(b, 12) == 9 and gpu.status(square) == "gpu")
+)") == "");
+}
+
 TEST_CASE("kernels_keep_nan_infinities_and_signed_zeros")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();
