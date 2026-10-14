@@ -215,6 +215,10 @@ bool l_fdivfast(float a, float b, out float result)
 {
     float q = a / b;
     uint ua = floatBitsToUint(a), ub = floatBitsToUint(b), uq = floatBitsToUint(q);
+    // a power of two is moved to the float below it, the side its binade's rounding is finer on: the exact quotient is then
+    // reached upward, where crossing to the next binade is handled
+    if ((uq & 0x7fffffu) == 0u && ((uq >> 23) & 0xffu) > 1u && ((uq >> 23) & 0xffu) < 255u)
+        uq -= 1u;
     uint ea = (ua >> 23) & 0xffu, eb = (ub >> 23) & 0xffu, eq = (uq >> 23) & 0xffu;
     // a / b = q * 2^(s - 23) * (ma * 2^s) / (qm * mb), so the exact quotient minus q, in units of q's last bit, is r / mb
     int s = int(ea) - int(eb) + 150 - int(eq);
@@ -222,15 +226,49 @@ bool l_fdivfast(float a, float b, out float result)
     int r = int((ma << (s & 31)) - qm * mb);
     int k = int(floor(float(r) * (1.0 / float(mb)) + 0.5));
     r -= k * int(mb);
-    bool close = abs(float(ma) * (s == 23 ? 8388608.0 : 16777216.0) - float(qm) * float(mb)) < 536870912.0;
-    bool normal = ea - 1u < 254u && eb - 1u < 254u && eq - 1u < 254u && uint(s - 23) <= 1u && close;
-    // the significand stays in its binade, where the remainder's scale holds
+    // the estimate of k can be off by one near a tie
+    if (2 * r >= int(mb))
+    {
+        k++;
+        r -= int(mb);
+    }
+    else if (2 * r <= -int(mb))
+    {
+        k--;
+        r += int(mb);
+    }
+    bool close = abs(float(ma) * float(1u << uint(s & 31)) - float(qm) * float(mb)) < 536870912.0;
+    bool normal = ea - 1u < 254u && eb - 1u < 254u && eq - 1u < 254u && uint(s - 23) <= 2u && close;
+    // the significand stays in its binade, where the remainder's scale holds, or reaches the next power of two P, as when
+    // the hardware gives 0.99999994 for x / x: past P units are twice as large, so the result is P or the float above it
+    uint m = qm + uint(k);
+    bool fits = false;
+    if (m - 0x800000u < 0x800000u)
+        fits = uint(abs(r)) * 2u < mb;
+    else if (m - 0x1000000u < 4u && eq < 254u)
+    {
+        int above = int(m - 0x1000000u), rp = r + above * int(mb), rc = rp - 2 * int(mb);
+        if (rp >= 0 ? rp < int(mb) : -2 * rp < int(mb))
+        {
+            k -= above;
+            fits = true;
+        }
+        else if (abs(rc) < int(mb))
+        {
+            k -= above - 1;
+            fits = true;
+        }
+    }
     result = uintBitsToFloat(uq + uint(k));
-    if (normal && qm + uint(k) - 0x800000u < 0x800000u && uint(abs(r)) * 2u < mb)
+    if (normal && fits)
         return true;
-    // zero divided by a normal number, as when a vector has a zero component
-    result = uintBitsToFloat((ua ^ ub) & 0x80000000u);
-    return (ua & 0x7fffffffu) == 0u && eb - 1u < 254u;
+    // zeros, infinities and NaN, which IEEE defines whatever the other operand, as when a vector has a zero component; only
+    // denormal numbers and results the hardware got too far off are left
+    uint sign = (ua ^ ub) & 0x80000000u, xa = ua & 0x7fffffffu, xb = ub & 0x7fffffffu;
+    result = uintBitsToFloat(xa > 0x7f800000u || xb > 0x7f800000u || (xa == xb && (xa == 0u || xa == 0x7f800000u)) ? 0x7fc00000u
+                             : xa == 0x7f800000u || xb == 0u                                                       ? sign | 0x7f800000u
+                                                                                                                   : sign);
+    return xa == 0u || xb == 0u || xa >= 0x7f800000u || xb >= 0x7f800000u;
 }
 float l_fdiv(float a, float b)
 {
@@ -253,6 +291,9 @@ float l_fsqrt(float a)
 {
     float q = sqrt(a);
     uint ua = floatBitsToUint(a), uq = floatBitsToUint(q);
+    // as for quotients, a power of two is moved to the float below it
+    if ((uq & 0x7fffffu) == 0u && ((uq >> 23) & 0xffu) > 1u && ((uq >> 23) & 0xffu) < 255u)
+        uq -= 1u;
     uint ea = (ua >> 23) & 0xffu, eq = (uq >> 23) & 0xffu;
     // a = q^2 * 2^(t - 23 * 2) * (m * 2^t) / qm^2: the root is correctly rounded when m * 2^t - qm^2 is in (-qm, qm]
     int t = int(ea) + 150 - 2 * int(eq);
@@ -261,10 +302,30 @@ float l_fsqrt(float a)
     int k = int(floor(float(int(x - qm * qm)) * (0.5 / float(qm)) + 0.5));
     uint root = qm + uint(k);
     int r = int(x - root * root);
-    bool close = abs(float(m) * (t == 23 ? 8388608.0 : 16777216.0) - float(qm) * float(qm)) < 536870912.0;
-    bool normal = ua - 0x00800000u < 0x7f000000u && uint(t - 23) <= 1u && close;
+    // the estimate of k can be off by one near a tie
+    if (r <= -int(root))
+        root -= 1u;
+    else if (r > int(root))
+        root += 1u;
+    r = int(x - root * root);
+    // t is 25 or 26 when the root is in the binade below the exact one, as a power of two moved below is
+    bool close = abs(float(m) * float(1u << uint(t & 31)) - float(qm) * float(qm)) < 536870912.0;
+    bool normal = ua - 0x00800000u < 0x7f000000u && uint(t - 23) <= 3u && close;
+    // as for quotients, past the next power of two P units are twice as large: the root is P or the float above it, each
+    // correctly rounded when it's within half of the units around it
     if (normal && root - 0x800000u < 0x800000u && r > -int(root) && r <= int(root))
-        return uintBitsToFloat(uq + uint(k));
+        return uintBitsToFloat(uq + (root - qm));
+    uint p = 0x1000000u, c = 0x1000002u;
+    int rp = int(x - p * p), rc = int(x - c * c);
+    if (normal && root - p < 4u && rp > -int(p) && rp <= 2 * int(p))
+        return uintBitsToFloat(uq + (p - qm));
+    if (normal && root - p < 4u && rc > 1 - 2 * int(c) && rc <= 2 * int(c))
+        return uintBitsToFloat(uq + (p - qm) + 1u);
+    // zeros and infinities are their roots, and negative numbers and NaN have none
+    if ((ua & 0x7fffffffu) == 0u || ua == 0x7f800000u)
+        return a;
+    if (ua > 0x7f800000u)
+        return uintBitsToFloat(0x7fc00000u);
     return l_fsqrtexact(a);
 }
 // scalar math is f32 where the VM's is f64, so results are rounded more, but f32's narrower range would also change what they

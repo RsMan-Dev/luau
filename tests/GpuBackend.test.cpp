@@ -1386,6 +1386,75 @@ end
 )") == "");
 }
 
+TEST_CASE("common_divisions_and_square_roots_take_the_fast_path")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // the exact computations, left out here, cost kernels time and size even when they don't run: what kernels commonly
+    // compute takes the fast path, from quotients and roots that are powers of two (x / x, 255 / 255, the length of a unit
+    // vector) or near a tie, to zeros, infinities and NaN
+    backend->setLowering(
+        [](lua_State* L, int idx)
+        {
+            CodeGen::GpuKernel kernel = CodeGen::compileGpu(L, idx);
+            for (std::string from : {"l_fdivfast(a, b, q) ? q : l_fdivexact(a, b)", "    return l_fsqrtexact(a);"})
+            {
+                size_t at = kernel.glsl.find(from);
+                REQUIRE(at != std::string::npos);
+                kernel.glsl.replace(
+                    at, from.size(), from[0] == 'l' ? "l_fdivfast(a, b, q) ? q : (l_fail(10u), q)" : "    l_fail(10u);\n    return q;"
+                );
+            }
+            return kernel;
+        }
+    );
+
+    CHECK(run(*backend, std::string(kSquare) + R"(
+@gpu
+local function k(b: buffer, i: number)
+    local x, y = buffer.readf32(b, i * 16), buffer.readf32(b, i * 16 + 4)
+    buffer.writef32(b, i * 16 + 8, x / y)
+    buffer.writef32(b, i * 16 + 12, math.sqrt(x))
+end
+
+local values = { 0, -0, 1, 4, 0.25, 2, 0.5, 255, 1 / 0, -1 / 0, 0 / 0, -1, 1.0000001, 0.24999999, 0.99999994, 3, 7, 1e-30 }
+local pairs = {}
+for _, x in values do
+    for _, y in values do
+        table.insert(pairs, { x, y })
+    end
+end
+for n = 0, 255 do
+    table.insert(pairs, { n, 255 })
+end
+for n = 1, 2000 do
+    local x = (math.random() + 0.5) * 2 ^ math.random(-60, 60)
+    table.insert(pairs, { x, x })
+    table.insert(pairs, { x * x, x })
+end
+
+local b = buffer.create(#pairs * 16)
+for i, p in pairs do
+    buffer.writef32(b, (i - 1) * 16, p[1])
+    buffer.writef32(b, (i - 1) * 16 + 4, p[2])
+end
+local vm = copy(b)
+local ok, err = gpu.run(k, { b }, #pairs)
+assert(ok, err)
+for i = 0, #pairs - 1 do
+    k(vm, i)
+end
+for i = 0, #pairs * 4 - 1 do
+    local g, v = buffer.readu32(b, i * 4), buffer.readu32(vm, i * 4)
+    -- NaN's payload is the hardware's
+    local nan = bit32.band(g, 0x7f800000) == 0x7f800000 and bit32.band(g, 0x7fffff) ~= 0
+    assert(g == v or (nan and bit32.band(v, 0x7f800000) == 0x7f800000 and bit32.band(v, 0x7fffff) ~= 0), `{i // 4}: {g} vs {v}`)
+end
+)") == "");
+}
+
 TEST_CASE("division_and_square_roots_stay_exact_whatever_the_hardware_gives")
 {
     // the hardware's division and square root only seed the exact ones: shaders whose seeds are a few units off, or hundreds
