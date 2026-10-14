@@ -1319,6 +1319,46 @@ end
 )") == "");
 }
 
+TEST_CASE("powers_give_the_vm_results_for_special_operands")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // the GPU's pow is exp2(b * log2(a)), which gives NaN for (-1) ^ inf, where C gives 1: every pair of special operands
+    // (zeros, ones, infinities, NaN) must give the VM's result
+    CHECK(run(*backend, R"(
+@gpu
+local function k(b: buffer, i: number)
+    buffer.writef32(b, 800 + i * 4, buffer.readf32(b, i * 8) ^ buffer.readf32(b, i * 8 + 4))
+end
+
+local specials = { 0, -0.0, 1, -1, 2, -2, 0.5, math.huge, -math.huge, 0 / 0, 3, -3 }
+local onGpu = buffer.create(800 + 100 * 4)
+local n = 0
+for _, x in specials do
+    for _, y in specials do
+        -- one of them special, so that the result is exact
+        if n < 100 and (x ~= x or y ~= y or math.abs(x) == math.huge or math.abs(y) == math.huge or x == 0 or y == 0 or math.abs(x) == 1) then
+            buffer.writef32(onGpu, n * 8, x)
+            buffer.writef32(onGpu, n * 8 + 4, y)
+            n += 1
+        end
+    end
+end
+local inLuau = buffer.create(buffer.len(onGpu))
+buffer.copy(inLuau, 0, onGpu)
+
+assert(gpu.run(k, { onGpu }, n))
+for i = 0, n - 1 do
+    k(inLuau, i)
+    local x, y = buffer.readf32(onGpu, 800 + i * 4), buffer.readf32(inLuau, 800 + i * 4)
+    local same = if x ~= x then y ~= y else buffer.readu32(onGpu, 800 + i * 4) == buffer.readu32(inLuau, 800 + i * 4)
+    assert(same, `{buffer.readf32(onGpu, i * 8)} ^ {buffer.readf32(onGpu, i * 8 + 4)}: gpu {x} vm {y}`)
+end
+)") == "");
+}
+
 TEST_CASE("vector_math_matches_luau_bit_for_bit")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();

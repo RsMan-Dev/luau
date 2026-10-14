@@ -78,9 +78,10 @@ float l_acos(float a) { return abs(a) > 1.0 ? uintBitsToFloat(0x7fc00000u) : aco
 bool l_odd(float b) { return abs(b) < 16777216.0 && mod(b, 2.0) == 1.0; }
 float l_pow(float a, float b)
 {
-    if (b == 0.0 || a == 1.0) return 1.0;
+    if (b == 0.0 || a == 1.0 || (a == -1.0 && isinf(b))) return 1.0;
     if (isnan(a) || isnan(b)) return uintBitsToFloat(0x7fc00000u);
     if (a == 0.0) return b > 0.0 ? (l_odd(b) ? a : 0.0) : (l_odd(b) && floatBitsToUint(a) != 0u ? uintBitsToFloat(0xff800000u) : uintBitsToFloat(0x7f800000u));
+    if (isinf(a) && a < 0.0) return b > 0.0 ? (l_odd(b) ? a : -a) : (l_odd(b) ? uintBitsToFloat(0x80000000u) : 0.0);
     if (a < 0.0) { if (b != floor(b)) return uintBitsToFloat(0x7fc00000u); float r = pow(-a, b); return l_odd(b) ? -r : r; }
     return pow(a, b);
 }
