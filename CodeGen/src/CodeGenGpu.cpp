@@ -76,14 +76,37 @@ float l_log2(float a) { return a < 0.0 ? uintBitsToFloat(0x7fc00000u) : a == 0.0
 float l_asin(float a) { return abs(a) > 1.0 ? uintBitsToFloat(0x7fc00000u) : asin(a); }
 float l_acos(float a) { return abs(a) > 1.0 ? uintBitsToFloat(0x7fc00000u) : acos(a); }
 bool l_odd(float b) { return abs(b) < 16777216.0 && mod(b, 2.0) == 1.0; }
+// the GPU's exp and pow flush results below the normal range to 0: those are computed 2^64 times larger, then scaled down,
+// which rounds them once
+float l_exp(float a) { return a < -87.0 ? exp(a + 44.36141955583650) * uintBitsToFloat(0x1f800000u) : exp(a); }
+float l_powe(float a, float b) { float l = b * log2(a); return l < -125.0 ? exp2(l + 64.0) * uintBitsToFloat(0x1f800000u) : pow(a, b); }
+float l_fdiv(float a, float b);
+// the GPU's pow is exp2(b * log2(a)), a few ulps off even where the result is exact (3 ^ 3): integer exponents up to 32
+// multiply instead, which is exact whenever each product is, unless a product overflows or underflows
+float l_powp(float a, float b)
+{
+    if (b != floor(b) || abs(b) > 32.0)
+        return l_powe(a, b);
+    float r = 1.0, x = a;
+    for (uint n = uint(abs(b)); n != 0u; n >>= 1)
+    {
+        if ((n & 1u) != 0u)
+            r *= x;
+        if (n > 1u)
+            x *= x;
+    }
+    if (isinf(r) || r < 1.17549435e-38 || isinf(x) || x < 1.17549435e-38)
+        return l_powe(a, b);
+    return b < 0.0 ? l_fdiv(1.0, r) : r;
+}
 float l_pow(float a, float b)
 {
     if (b == 0.0 || a == 1.0 || (a == -1.0 && isinf(b))) return 1.0;
     if (isnan(a) || isnan(b)) return uintBitsToFloat(0x7fc00000u);
     if (a == 0.0) return b > 0.0 ? (l_odd(b) ? a : 0.0) : (l_odd(b) && floatBitsToUint(a) != 0u ? uintBitsToFloat(0xff800000u) : uintBitsToFloat(0x7f800000u));
     if (isinf(a) && a < 0.0) return b > 0.0 ? (l_odd(b) ? a : -a) : (l_odd(b) ? uintBitsToFloat(0x80000000u) : 0.0);
-    if (a < 0.0) { if (b != floor(b)) return uintBitsToFloat(0x7fc00000u); float r = pow(-a, b); return l_odd(b) ? -r : r; }
-    return pow(a, b);
+    if (a < 0.0) { if (b != floor(b)) return uintBitsToFloat(0x7fc00000u); float r = l_powp(-a, b); return l_odd(b) ? -r : r; }
+    return l_powp(a, b);
 }
 vec3 l_minv(vec3 a, vec3 b) { return mix(b, a, lessThan(a, b)); }
 vec3 l_maxv(vec3 a, vec3 b) { return mix(b, a, greaterThan(a, b)); }
@@ -1835,7 +1858,7 @@ struct GlslLowering
         switch (function.uintOp(OP_A(inst)))
         {
         case LBF_MATH_EXP:
-            line(v + " = exp(" + a + ");");
+            line(v + " = l_exp(" + a + ");");
             return true;
         case LBF_MATH_LOG:
             line(v + " = l_log(" + a + ");");

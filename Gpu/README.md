@@ -104,7 +104,9 @@ A buffer listed several times runs several times, in the order of the list; diff
   - `//` and `%` follow the VM's formulas, `floor(a / b)` and `a - floor(a / b) * b`, each step rounded to f32
   - vectors give the VM's bits: the VM computes them in f32 too, and the GPU in the same order
   - `math` functions that native code calls in libm (`sin`, `exp`, `^`, ...) use the GPU's, which Vulkan doesn't require
-    to be correctly rounded: results can be off by a few ulps (`pow` by about 1e-4 relative)
+    to be correctly rounded: results can be off by a few ulps (`pow` by about 1e-4 relative). Their special cases are
+    C's, and their denormal results are kept (the GPU's flush them to 0). `x ^ n` for an integer `n` up to 32 multiplies
+    instead, which is exact where every product is (`3 ^ 3` is 27, not 27.000002)
   - 32-bit buffer accesses are words: an unaligned offset fails the run, where the VM would read the unaligned word
   - buffer methods that need 64 bits (`buffer.readf64`, `buffer.writef64`) make the function unable to run on the GPU:
     `gpu.run` returns `false, "Function cannot run in GPU"`

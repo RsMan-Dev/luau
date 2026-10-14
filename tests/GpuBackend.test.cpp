@@ -1417,6 +1417,78 @@ end
 )") == "");
 }
 
+TEST_CASE("exp_and_pow_keep_denormal_results")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // the GPU's exp and pow flush results below the normal range to 0, where the VM's are denormal numbers, which a later
+    // division turns into infinities and NaN: they must stay within the GPU's precision of the VM's
+    CHECK(run(*backend, R"(
+@gpu
+local function k(b: buffer, i: number)
+    local x = buffer.readf32(b, i * 4)
+    buffer.writef32(b, 400 + i * 8, math.exp(x))
+    buffer.writef32(b, 404 + i * 8, (-x / 39) ^ (x / 2))
+end
+
+local N = 60
+local onGpu = buffer.create(400 + N * 8)
+for i = 0, N - 1 do
+    buffer.writef32(onGpu, i * 4, -80 - i * 0.5)
+end
+local inLuau = buffer.create(buffer.len(onGpu))
+buffer.copy(inLuau, 0, onGpu)
+assert(gpu.run(k, { onGpu }, N))
+for i = 0, N - 1 do
+    k(inLuau, i)
+end
+for o = 400, 400 + N * 8 - 4, 4 do
+    local x, y = buffer.readf32(onGpu, o), buffer.readf32(inLuau, o)
+    -- the scale of the smallest denormal, 2^-149, is the precision left at the end of the range
+    assert(math.abs(x - y) <= 1e-3 * y + 2 ^ -148, `offset {o}: gpu {x} vm {y}`)
+    assert(y == 0 or x ~= 0, `offset {o}: gpu 0 vm {y}`)
+end
+)") == "");
+}
+
+TEST_CASE("integer_powers_give_the_vm_bits_where_the_result_is_exact")
+{
+    std::unique_ptr<VulkanBackend> backend = createBackend();
+    if (!backend)
+        return;
+
+    // the GPU's pow gives 27.000002 for 3 ^ 3; a later step can then turn the ulp into a NaN, as (3 - 3 ^ 3) ^ -24 does
+    CHECK(run(*backend, R"(
+@gpu
+local function k(b: buffer, i: number)
+    local a, n = buffer.readf32(b, i * 8), buffer.readf32(b, i * 8 + 4)
+    buffer.writef32(b, 800 + i * 4, a ^ n)
+end
+
+local cases = { { 3, 3 }, { 7, 5 }, { -3, 3 }, { -3, -3 }, { 2, -10 }, { 10, -2 }, { 1.5, 4 }, { -24, -24 }, { 0.5, 20 }, { 9, 7 }, { 3, 32 }, { -2, 31 } }
+local onGpu = buffer.create(800 + #cases * 4)
+for i, c in cases do
+    buffer.writef32(onGpu, (i - 1) * 8, c[1])
+    buffer.writef32(onGpu, (i - 1) * 8 + 4, c[2])
+end
+local inLuau = buffer.create(buffer.len(onGpu))
+buffer.copy(inLuau, 0, onGpu)
+assert(gpu.run(k, { onGpu }, #cases))
+for i, c in cases do
+    k(inLuau, i - 1)
+    local x, y = buffer.readf32(onGpu, 800 + (i - 1) * 4), buffer.readf32(inLuau, 800 + (i - 1) * 4)
+    -- exact results, and 1 / x correctly rounded: the VM's bits; other products a few ulps at most
+    if math.abs(y) == math.floor(math.abs(y)) and math.abs(y) < 2 ^ 24 or c[2] < 0 and c[2] >= -10 then
+        assert(x == y, `{c[1]} ^ {c[2]}: gpu {x} vm {y}`)
+    else
+        assert(math.abs(x - y) <= 1e-6 * math.abs(y), `{c[1]} ^ {c[2]}: gpu {x} vm {y}`)
+    end
+end
+)") == "");
+}
+
 TEST_CASE("vector_math_matches_luau_bit_for_bit")
 {
     std::unique_ptr<VulkanBackend> backend = createBackend();
