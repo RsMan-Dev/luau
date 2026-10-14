@@ -515,9 +515,19 @@ bool VulkanBackend::Impl::allocate(const VkMemoryRequirements& req, uint32_t typ
         return false;
     };
 
+    // device copies and host mirrors share a memory type on devices with unified memory, so blocks are mapped when needed
     for (std::unique_ptr<MemoryBlock>& block : blocks)
     {
-        if (block->type == type && take(*block))
+        if (block->type != type)
+            continue;
+
+        void* mapped = nullptr;
+        if (map && !block->mapped && vkMapMemory(device, block->memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS)
+            continue;
+        if (mapped)
+            block->mapped = static_cast<uint8_t*>(mapped);
+
+        if (take(*block))
             return true;
     }
 
